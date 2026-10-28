@@ -114,7 +114,6 @@
         "ackTimeout": 30000,
         "compression": "gzip",
         "partitioner": "default",
-        "idempotent": false,
         "allowAutoTopicCreation": true,
         "batchSize": 100,
         "queueMode": "disk",

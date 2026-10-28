@@ -35,8 +35,10 @@ messages that can be sent. After that, the producer is in one of two modes:
 
 The producer switches from live to backlog when:
 
-- **a send fails because of the connection** (broker down, timeout, network, authentication): the failed batch
-  and every message waiting behind it move to the queue, in order, and the node reconnects;
+- **a send fails because of the connection** (broker down, timeout, network, authentication), or a Kafka error that
+  usually clears by itself (a leader moving, a request timeout) is still there after the node resent the whole
+  request 3 times: the failed batch and every message waiting behind it move to the queue, in order, and the node
+  reconnects;
 - **Kafka is slow**: a request has been in flight for more than 3 s, or more than 10000 messages wait in memory.
   New messages then go to the queue instead of piling up in memory. The batch in flight is written to the queue as
   well, ahead of them; if Kafka acknowledges it after all, those records are taken out of the queue again so they
@@ -91,21 +93,22 @@ So a producer with id `3f2a9c1e5b7d4a10` and default settings uses
 `~/.node-red/kafkajs-nc-queue/3f2a9c1e5b7d4a10/`. The `queue-status` action shows the full path in
 `msg.payload.queueDir`.
 
-A `${VAR}` reference in *Directory* or *Queue name* whose variable is not set makes the queue unavailable (the log
-says which variable). When the queue cannot be opened at all (permissions, a read-only file system, the same queue
-name used by another producer), the producer logs `Offline queue unavailable (<dir>): <reason> — messages cannot be
-stored while Kafka is unreachable` and works without a queue: status `connected · queue unavailable` while
-connected, and messages fail with `done(err)` while not connected.
+A `${VAR}` reference in *Directory* or *Queue name* whose variable is not set, a reference inside a longer path
+(`${HOME}/queues`, which Node-RED never replaces) and a `~user/...` path make the queue unavailable (the log says
+why), instead of creating a directory with that literal name. When the queue cannot be opened at all (permissions, a
+read-only file system, the same queue name used by another producer), the producer logs `Offline queue unavailable
+(<dir>): <reason> — messages cannot be stored while Kafka is unreachable` and works without a queue: status
+`connected · queue unavailable` while connected, and messages fail with `done(err)` while not connected.
 
 ## On-disk format
 
 | File | Content |
 |---|---|
 | `seg-<16 digits>.jsonl` | **Segments**: the queued records, one JSON object per line, each line ending with `\n`. The number is a sequence number, so the files sort in queue order. A new segment is started when the current one would grow beyond 4 MiB; a single record larger than that gets a segment of its own. |
-| `cursor.json` | `{"seg":<segment number>,"off":<byte offset>}`: the position of the oldest record that has not been sent yet. Missing means "the start of the oldest segment". |
+| `cursor.json` | `{"seg":<segment number>,"off":<byte offset>}`: the position of the oldest record that has not been sent yet. Missing means "the start of the oldest segment". `{"seg":...,"off":...,"drained":true}` marks a queue that was sent completely: it is written just before the segments are deleted, and stays while a segment could not be deleted, so that segment is not sent again after a restart. |
 | `cursor.json.tmp` | Only exists for a moment while the cursor is replaced; a leftover one is deleted on the next start. |
 | `dead-letter.jsonl` | Records that could not be delivered, one JSON object per line (see [dead letters](#dead-letters)). |
-| `dead-letter.1.jsonl` | The previous dead-letter file, after it reached 50 MiB. A second rotation replaces it. |
+| `dead-letter.1.jsonl` | The previous dead-letter file, after it reached 50 MiB. A second rotation replaces it and logs how much it deleted (`dead-letter.jsonl reached N bytes and replaced dead-letter.1.jsonl: M bytes of older dead letters were deleted`). |
 
 When the queue becomes empty, the segments and `cursor.json` are deleted; the directory and the dead-letter files
 stay.
@@ -183,9 +186,11 @@ Each line of `dead-letter.jsonl` is one record that could not be delivered:
 After the reconnect, the flusher repeats: read the oldest records from the cursor onwards, send them in one
 request, then **acknowledge** them. Acknowledging moves the cursor behind the last record handled and writes
 `cursor.json` atomically (write `cursor.json.tmp`, sync it, rename it over `cursor.json`, sync the directory).
-Segments that lie completely before the cursor are deleted. When nothing is left, the segments and the cursor file
-are deleted and the producer returns to live mode, logging `Sent N queued message(s) to Kafka; the offline queue is
-empty`.
+Segments that lie completely before the cursor are deleted. When nothing is left, a cursor marked `drained` is
+written, the segments and then the cursor file are deleted, and the producer returns to live mode, logging `Sent N
+queued message(s) to Kafka; the offline queue is empty`. If a segment cannot be deleted (a file locked by a virus
+scanner, a flaky network drive), the `drained` cursor stays, so the leftover is not sent again after a restart, and
+the next time the queue is emptied the leftover is deleted too.
 
 Records that Kafka refuses for good are appended to the dead-letter file, acknowledged like sent records, and
 sending continues with the next one (see [dead letters](#limits-overflow-expiry-and-dead-letters)). If the queue
@@ -200,11 +205,12 @@ When a producer starts, the queue is opened and repaired:
 2. A leftover `cursor.json.tmp` is deleted: the rename never happened, so the old `cursor.json` is still valid.
 3. A **torn last line** in the newest segment (a write interrupted by a crash, without its `\n`) is cut off. That
    message had not been reported `queued` yet, so nobody was told it was safe.
-4. The cursor is checked. A missing cursor means the start of the oldest segment. A cursor that cannot be read, that
-   points past the newest segment, or whose offset is not at the start of a line is not trusted: the queue logs a
-   warning and sends the affected segment(s) again from the start (`messages may be sent twice`). A cursor beyond
-   the end of its segment is moved to the end. A cursor naming a segment that no longer exists means the start of
-   the next one.
+4. The cursor is checked. A missing cursor means the start of the oldest segment. A `drained` cursor at or past the
+   newest segment means everything was sent: the leftover segments are deleted, not sent again. A cursor that cannot
+   be read, that points past the newest segment without the `drained` mark, or whose offset is not at the start of a
+   line is not trusted: the queue logs a warning and sends the affected segment(s) again from the start (`messages
+   may be sent twice`). A cursor beyond the end of its segment is moved to the end. A cursor naming a segment that
+   no longer exists means the start of the next one.
 5. Segments before the cursor, left behind by a crash during their deletion, are deleted.
 6. The waiting records are counted (streaming, in 64 KiB chunks), and the producer logs `The offline queue holds N
    message(s) from earlier; they are sent first once Kafka is reachable`.
@@ -233,8 +239,10 @@ a message reported `queued` is stored. Messages are sent again, so a consumer ca
   write them;
 - Kafka was slow, the batch in flight was copied to the queue, and removing it again failed (rare);
 - the cursor file was damaged and a segment is sent again from its start;
-- kafkajs retried a request internally within one connection (the *Idempotent producer* option prevents only this
-  last case).
+- the node resent a request after a Kafka error that usually clears by itself (a leader moving, a request timeout),
+  and Kafka had already written part or all of it. The node always resends the **whole** request: kafkajs' own
+  produce retry is switched off, because in kafkajs 2.2.4 it can report success without having written the messages
+  of a partition whose leader moved. For the same reason there is no idempotent mode, which needs that retry.
 
 Consumers that must not process a message twice should de-duplicate, for example by a unique id in a header.
 
@@ -286,8 +294,10 @@ Consumers that must not process a message twice should de-duplicate, for example
 - Nothing survives a redeploy, a restart or a crash. On close the queue logs `Memory queue closed with N unsent
   message(s); they are discarded`, and messages still waiting for the connection fail with `done(err)`.
 - Records are still converted to their JSON form when they are queued, so *Maximum size* means the same as on disk.
-- Dead letters are counted (`deadLettered`) and logged with their reason. The last 100 are kept in memory only;
-  they cannot be read from a flow, so the content of a dead-lettered message is not recoverable.
+- Dead letters are counted (`deadLettered`) and logged with their reason. The last 100 are kept in memory:
+  `queue-status` returns them, oldest first, in `msg.payload.deadLetters`, each in the shape of a line of
+  `dead-letter.jsonl` (`{ ts, error, record }`). They are lost on a redeploy or restart, so read them from a flow if
+  you need them.
 - *Directory*, *Queue name* and *Sync every write to disk* do not apply.
 
 Use it for short outages, read-only file systems, or data that must not be written to disk.
@@ -334,7 +344,7 @@ Recommendations:
 
 From a flow, send `msg.action = "queue-status"` to the producer. It answers with `msg.payload` = `{ size, bytes,
 segments, droppedTotal, deadLettered, oldestTs, state, mode, queueMode, queueDir, pending }` (plus `queueError` and
-`lastError` after a problem); the fields are explained in the
+`lastError` after a problem, and `deadLetters` in memory mode); the fields are explained in the
 [README](../README.md#monitoring-the-queue).
 
 On the file system, the files are plain JSON lines, so standard tools work:
@@ -435,9 +445,9 @@ queued messages when the node changes:
 
 | You... | The node id | What happens to the queue |
 |---|---|---|
-| deploy (full, modified flows or modified nodes), or restart Node-RED | stays the same | The old instance stores everything unsent and closes the queue; the new instance waits for that (up to 12 s), opens the same directory and sends the backlog first. |
-| change *Directory* or *Queue name* | stays the same | The node uses the new directory. The old one is **not** sent; set the old values again to send it. |
-| change *Offline queue* to *In memory* or *Off* | stays the same | The disk queue is no longer read; its files stay. |
+| deploy (full, modified flows or modified nodes), or restart Node-RED | stays the same | The old instance stores everything unsent and closes the queue, and only then releases the directory. The new instance waits for that, opens the same directory and sends the backlog first. If the old one is still writing after 12 s (a very slow disk), the new one runs without the queue and opens it as soon as the old one is done; the two never write the directory at the same time. |
+| change *Directory* or *Queue name* | stays the same | The node uses the new directory. The old one is **not** sent: a warning names it (`N unsent message(s) are left in the offline queue <dir>, which this node no longer uses ...`); set the old values again to send it. |
+| change *Offline queue* to *In memory* or *Off* | stays the same | The disk queue is no longer read; its files stay, and the same warning names them. |
 | copy and paste, import, or duplicate the node | **new id** | Without a *Queue name*, the copy gets a new, empty queue named after its new id. With a *Queue name*, the copy has the same name: give it its own, or it runs without a queue while the original exists (see the last row). |
 | delete the node | – | The files stay on disk. If messages were left, a warning names the directory: `Node removed with N unsent message(s) left in <dir>`. |
 | give two producers the same *Queue name* (and directory) | – | The second one cannot lock the directory, logs `Queue directory ... is already used by node <id>` and runs without a queue. |
@@ -447,6 +457,12 @@ for example deleting it and importing it again. To send an orphaned queue (for e
 node, named after its id), set a producer's *Queue name* to the directory's name and deploy; the messages are sent
 once that producer is connected. Only do this with Node-RED's own queue directories, and only for one producer at a
 time.
+
+**Finding orphaned queues:** about 10 s after its disk queue opened, a producer looks at the other directories next to
+its own and warns once about those that hold messages no running producer uses: `Found N offline queue(s) under
+<directory> with unsent messages that no running producer uses: <name> (<size>), ...`. The scan only lists the
+directories and reads file sizes (at most 1000 directories), and reports each directory once per Node-RED run. A
+producer in a disabled flow counts as not running, so its queue is listed too.
 
 Deleting a queue: send `msg.action = "queue-clear"` to the producer, or stop Node-RED and delete the directory.
 

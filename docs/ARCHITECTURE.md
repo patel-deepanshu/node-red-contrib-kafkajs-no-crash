@@ -33,7 +33,8 @@ So everything here follows from a few rules:
    `done(err)` so that a *catch* node sees it. The only exceptions are the limits the user configures.
 4. **Say what is wrong.** One clear status text and one log line per problem, not hundreds.
 5. **Install anywhere.** Only pure JavaScript dependencies (kafkajs 2.2.4 pinned exactly, kafkajs-snappy, lz4js),
-   Node.js 18.5 or newer, Node-RED 3.0 or newer.
+   Node.js 18.5 or newer, Node-RED 3.1 or newer (3.0 gives nodes inside subflows a new id on every start, and the
+   default queue directory and consumer group are derived from the id).
 
 ## Module map
 
@@ -44,20 +45,20 @@ otherwise. They are used inside timers, event handlers and close handlers, where
 
 | Module | Responsibility | Main exports |
 |---|---|---|
-| [`util.js`](../lib/util.js) | Small helpers: parse numbers and booleans from editor strings, `safeOn()` for kafkajs listeners, `withTimeout()` (never rejects), `once()`, `sanitizeName()`, `resolveDir()`, `truncate()`, `formatDelay()`, `userDir()` | all of these |
-| [`client-config.js`](../lib/client-config.js) | Broker configuration → validated `new Kafka()` options. Collects every problem at once. | `normalizeBrokerConfig`, `validateBrokerConfig`, `buildClientOptions`, `parseBrokers`, `DEFAULTS`, `LIMITS` |
-| [`errors.js`](../lib/errors.js) | Error classes, the classifier, and texts for status and log lines | `ConfigError`, `MessageError`, `QueueFullError`, `ErrorKind`, `classifyError`, `connectionKind`, `topicKind`, `shortMessage`, `problemText`, `describeError`, `toPlainError`, `asConfigError`, `isKafkaJsError` |
+| [`util.js`](../lib/util.js) | Small helpers: parse numbers and booleans from editor strings, `safeOn()` for kafkajs listeners, `withTimeout()` (never rejects), `once()`, `sanitizeName()`, `resolveDir()`, `truncate()`, `formatDelay()`, `userDir()` (mirrors Node-RED's own user directory rules), and the one `${VAR}` rule of every node: `envReference()` / `envProblem()` | all of these |
+| [`client-config.js`](../lib/client-config.js) | Broker configuration → validated `new Kafka()` options. Collects every problem at once; warns about broker prefixes that contradict the TLS/SASL settings. | `normalizeBrokerConfig`, `validateBrokerConfig`, `buildClientOptions`, `parseBrokers`, `schemeWarnings`, `DEFAULTS`, `LIMITS` |
+| [`errors.js`](../lib/errors.js) | Error classes, the classifier, and texts for status and log lines (every fixed reason fits `REASON_MAX`, 32 characters) | `ConfigError`, `MessageError`, `QueueFullError`, `ErrorKind`, `classifyError`, `connectionKind`, `topicKind`, `shortMessage`, `problemText`, `describeError`, `toPlainError`, `asConfigError`, `isKafkaJsError`, `REASON_MAX` |
 | [`backoff.js`](../lib/backoff.js) | Exponential backoff with ±20 % jitter for the reconnect loops | `Backoff` |
-| [`status.js`](../lib/status.js) | Crash-proof `node.status()` with throttling and a `dispose()` for close | `StatusReporter` |
+| [`status.js`](../lib/status.js) | Crash-proof `node.status()` with throttling and a `dispose()` for close | `StatusReporter`, `MAX_TEXT` (48) |
 | [`logger.js`](../lib/logger.js) | kafkajs `logCreator` that writes into the Node-RED log, never throws and suppresses repeated lines | `createLogCreator`, `toKafkaLogLevel` |
 | [`kafka-factory.js`](../lib/kafka-factory.js) | The only place that `require`s kafkajs. Tests inject a fake here. Registers the compression codecs once. | `getKafkajs`, `setKafkajs`, `getCodecSupport` |
-| [`codecs.js`](../lib/codecs.js) | Snappy (kafkajs-snappy) and LZ4 (own frame writer on top of lz4js, so that Java consumers can read it) | `register` |
+| [`codecs.js`](../lib/codecs.js) | Snappy (kafkajs-snappy) and LZ4: its own frame writer on top of lz4js (so that Java consumers can read it) and its own bounded frame and block decoder (block checksums verified; a batch that could decompress to more than 256 MiB is rejected before anything is allocated) | `register`, `lz4CompressFrame`, `lz4DecompressFrame`, `LZ4_MAX_OUTPUT` |
 | [`socket-factory.js`](../lib/socket-factory.js) | kafkajs' default socket factory plus a fix for leaked sockets | `createSocketFactory` |
 | [`serialize.js`](../lib/serialize.js) | `msg` values ↔ kafkajs messages (strings, Buffers, JSON, tombstones, headers, partitions, timestamps), and the JSON-safe encoding used by the queue | `toKafkaValue`, `toKafkaKey`, `toKafkaHeaders`, `toKafkaPartition`, `toKafkaTimestamp`, `decodeValue`, `fromKafkaHeaders`, `encodeMessage`, `decodeMessage` |
 | [`disk-queue.js`](../lib/disk-queue.js) | The durable store-and-forward queue (segments, cursor, group commit, crash recovery, dead letters) | `DiskQueue` |
-| [`memory-queue.js`](../lib/memory-queue.js) | The same interface and overflow rules, in memory | `MemoryQueue` |
-| [`queue-registry.js`](../lib/queue-registry.js) | Process-wide lock so that two producers never write the same queue directory | `acquire`, `isOwned`, `ownerOf` |
-| [`safety-net.js`](../lib/safety-net.js) | The ref-counted, deliberately narrow `unhandledRejection` handler | `acquire`, `handleRejection`, `isPaletteError` |
+| [`memory-queue.js`](../lib/memory-queue.js) | The same interface and overflow rules, in memory; keeps the last 100 dead letters (`getDeadLetters()`) | `MemoryQueue`, `DEAD_LETTER_KEEP` |
+| [`queue-registry.js`](../lib/queue-registry.js) | Process-wide lock so that two producers never write the same queue directory: one holder per directory, a claim can be marked *closing*, and a successor waits for the real close | `acquire`, `whenReleased`, `isOwned`, `ownerOf` |
+| [`safety-net.js`](../lib/safety-net.js) | The ref-counted, deliberately narrow `unhandledRejection` handler | `acquire`, `handleRejection`, `isPaletteError`, `unhandledRejectionsMode`, `RELEASE_GRACE_MS` |
 
 ### `nodes/`: the Node-RED nodes
 
@@ -121,8 +122,11 @@ Every setting is parsed with `toInt` / `toNumber` / `toBool` from `lib/util.js`,
   parsed values plus `errors[]` and `warnings[]`. Errors become `configError`, a `ConfigError` whose `details` list
   every problem, logged once as `Invalid Kafka broker configuration: ...`.
 - A value that is not a number falls back to the default with a warning; a number outside its range is clamped.
-- `${ENV}` references that Node-RED could not resolve (the variable is not set) are detected: in brokers and
-  credentials they are errors, in numeric fields a warning plus the default.
+- `${ENV}` references that Node-RED did not replace are detected with one shared rule (`envProblem()` in
+  `lib/util.js`): a whole-value reference whose variable is not set (`environment variable X is not set`), and a
+  reference inside a longer value, which Node-RED never replaces (`${X} is only replaced by Node-RED when it is the
+  whole value`). In brokers and credentials they are errors, in numeric fields a warning plus the default. The
+  editors use Node-RED's exact pattern (`^\${\S+}$`), so they accept what the runtime replaces and nothing else.
 - The client nodes parse their own settings the same way (`parseConfig()` in each node file). Problems that make
   every message fail (an invalid topic, an unset `${VAR}`) are reported once at start and then per message.
 - A client node checks `broker.configError` before connecting. With an invalid broker configuration the producer
@@ -174,7 +178,7 @@ in lock-step. The broker node provides the numbers (`reconnectMin` 1 s, `reconne
   full speed). For the consumer it is staying in the group for 30 s (`TIMEOUTS.stable`), or a `start` / `restart`
   control message.
 - kafkajs' own retries are kept short (5 retries by default) because they cannot be cancelled; the supervisor
-  retries forever on top of them.
+  retries forever on top of them. The producer's **send** retry is off altogether (see [the producer](#the-producer)).
 
 ### 5. Status and logs
 
@@ -203,8 +207,8 @@ calls it if the graceful path takes too long. The individual steps are bounded t
 |---|---|---|
 | producer | wait for the request in flight / the flush batch | 5 s (`TIMEOUTS.closeSendWait`) |
 | producer | `producer.disconnect()` (kafkajs waits for in-flight requests, up to `requestTimeout`) | 3 s (`TIMEOUTS.disconnect`) |
-| producer | store unsent messages, close the queue | 1.5 s each (`TIMEOUTS.closeQueue`) |
-| producer | a redeployed instance waits for the old one to release the same queue directory | 12 s (`TIMEOUTS.previousClose`), then it continues |
+| producer | store unsent messages, close the queue | 1.5 s each for `done()` (`TIMEOUTS.closeQueue`); the queue directory stays locked until `DiskQueue.close()` has really finished |
+| producer | a redeployed instance waits for the old one to release the same queue directory | 12 s (`TIMEOUTS.previousClose`); then it runs without the queue and opens it as soon as the old instance has released it, never writing the directory at the same time |
 | consumer | `consumer.disconnect()` (waits for the fetch in flight, see *Max wait*) | 5 s (`TIMEOUTS.disconnect`) |
 | admin | `admin.disconnect()`; a running job is failed at once | 3 s |
 | all | the whole close handler | 10 s (`TIMEOUTS.closeTotal`) |
@@ -286,12 +290,36 @@ Details that matter when changing this code:
 - **No racing `send()` against a timer.** A kafkajs `send()` that is still retrying may succeed later. Re-queueing
   it on a timeout and sending it again would create duplicates, so the code always waits for the outcome (except
   during close, which is bounded and documented as a possible duplicate).
+- **Retries: the whole batch, by the node.** kafkajs producers are created with `retry: { retries: 0 }` (the
+  client-level retry used for connecting is unchanged). kafkajs 2.2.4 keeps the per-broker responses of a send across
+  its internal retries; when a partition's leader moves to a broker that has already answered, the retry sends
+  nothing for that partition and `send()` resolves as if everything had been written. `sendWithRetry()` therefore
+  resends the **whole** batch itself, up to `LIMITS.sendRetries` (3) times with a short backoff (about 0.2, 0.6 and
+  1.6 s), when `sendRetriable()` holds: a `transient` Kafka protocol error (leader moved, not enough replicas, ...) or
+  a request timeout. It stops early when the node closes or the connection generation changes. Anything still failing
+  takes the normal failure path (queue and reconnect). A whole-batch resend can only cause duplicates, never a silent
+  loss. This is also why there is no idempotent mode: kafkajs requires retries ≥ 1 for it. A flow that still has the
+  old `idempotent` property loads normally and gets one warning.
 - **Delivery reports.** `locateMessages()` turns kafkajs' `RecordMetadata[]` into partition/offset per message, but
   only when the answer is exact. `missingPartitions()` detects messages for partitions that do not exist, which
-  kafkajs silently skips (see [pitfalls](#kafkajs-pitfalls-we-work-around)).
+  kafkajs silently skips (see [pitfalls](#kafkajs-pitfalls-we-work-around)). kafkajs caches a topic's partitions
+  for `metadataMaxAge` (5 min), so a missing partition is only final on a connection younger than
+  `TIMEOUTS.freshMetadata` (10 s). On an older connection (`metadataMayBeStale()`) the skipped messages are kept
+  (live: in front of the pending list; flush: the records from the skipped one on stay queued) and the node
+  reconnects to fetch fresh metadata.
+- **Queue directory hand-over.** `lib/queue-registry.js` allows one holder per directory. On close the producer marks
+  its claim as closing and releases it only after `DiskQueue.close()` has finished (`closeThenRelease()`), so a
+  redeployed instance (`whenReleased()`) can never append to a directory the old one is still writing.
+- **Messages left behind.** A module-level map remembers, per node id, a queue that still held messages when the node
+  closed; if the next instance uses another directory (Directory or Queue name changed), it warns where they are.
+  After a disk queue opens, one cheap scan (`readdir` and `stat` only, at most 1000 directories, once per directory
+  and process) warns about sibling queue directories with messages that no running producer uses.
 - **Close.** Unsent messages (in flight after 5 s, pending, early) are stored in the disk queue with
-  `Stored N unsent message(s) in the offline queue while closing`; with the memory queue or no queue they fail with
-  `done(err)` and a warning.
+  `Stored N unsent message(s) in the offline queue while closing` (or a warning that counts the ones that could not
+  be stored or are still being written); with the memory queue or no queue they fail with `done(err)` and a warning.
+- **Control actions.** `msg.action` is trimmed and lower-cased before it is matched against `flush`, `reconnect`,
+  `queue-status` and `queue-clear`, as in the consumer and the admin node. These four values are reserved; any other
+  `msg.action` is user data and the message is produced.
 
 The queue itself (formats, guarantees, recovery) is described in [OFFLINE-QUEUE.md](OFFLINE-QUEUE.md).
 
@@ -323,13 +351,36 @@ connect() ─► new Kafka + consumer ─► connect ─► subscribe ─► run
 - With the *Buffer* output formats, values, keys and header values are copied (`Buffer.from`): kafkajs hands out
   slices of the whole fetch response, and keeping a slice would keep the whole response in memory.
 - The default group ID is `node-red-<node id>`, stable across restarts, so the committed offsets are found again.
+- `GROUP_JOIN` records the member's assignment (topic → partitions), reset on every connect. An empty assignment
+  shows `connected · no partitions` (and, for a regex subscription, one warning).
+- **seek.** kafkajs 2.2.4 does not seek to its `-2`/`-1` markers: it treats them as "no position", applies the
+  subscription's `fromBeginning` instead and, in auto-commit mode, commits that. A number outside the partition's
+  offsets makes the next fetch fail with `OffsetOutOfRange`, after which kafkajs commits its default position, also in
+  manual mode. So `seek` first looks up the partition's offsets with a short-lived admin client of the same broker
+  configuration (bounded by `TIMEOUTS.offsetLookup`, always disconnected, also on close), turns `earliest`/`latest`
+  into those numbers, refuses numbers outside them, checks that the partition is assigned to this member (before and
+  after the lookup, and never while rebalancing), and only then calls `consumer.seek()`.
+- **commit.** `parseCommit()` only takes `msg.kafka` as this consumer set it (its `groupId`, a subscribed topic), never
+  mixing fields of `msg.kafka` and `msg`: a producer node replaces `msg.kafka` with its own delivery report. kafkajs'
+  `commitOffsets()` resolves without committing when its runner is stopping, so a commit only succeeds once the
+  `COMMIT_OFFSETS` event has confirmed that topic, partition and offset (one persistent listener per consumer).
 
 ## The admin node
 
 - The admin client is created on the first message and kept. Any failure that is not about the request itself
   (connection, auth, config, unknown, or a timeout) drops it, so the next message starts with a fresh client.
-- Messages run strictly one after another on an internal promise chain. Each one is bounded by the node's
-  *Timeout*, which includes connecting (`withDeadline()`).
+- Messages run strictly one after another on an internal promise chain, and at most `LIMITS.maxQueued` (1000) wait;
+  further ones fail at once. Each message is bounded by the node's *Timeout* counted from its **arrival**, so waiting
+  behind earlier messages and connecting are included (`withDeadline()` gets what is left). A message whose time is
+  used up before it starts fails without connecting.
+- After a failed connection attempt the following messages fail at once until a backoff from the broker's reconnect
+  settings has passed (at least `authRetryMin` for `auth` and `config` errors), instead of each waiting for another
+  slow failure. A successful connect resets it.
+- `resetOffsets` never calls kafkajs' `resetOffsets()`, which stores the `-2`/`-1` markers (the consumers'
+  `fromBeginning` would then decide). It looks up the topic's offsets and calls `setOffsets()` with the real low or
+  high offset of every partition. `setOffsets` checks every partition and offset against `fetchTopicOffsets()` first.
+  Both get a timeout of at least `LIMITS.groupOffsetsTimeoutMs` (15 s), because kafkajs changes group offsets through
+  an internal group member that needs about 5 s.
 - Each action validates `msg.payload` before connecting (`prepare()`), so a missing parameter fails with a helpful
   text and nothing is sent to Kafka.
 - Close fails the running job at once and disconnects with a 3 s bound.
@@ -348,9 +399,13 @@ order, first match wins:
    `LEADER_NOT_AVAILABLE` → `transient`, ...).
 3. A TLS certificate `code` (`DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED`, `ERR_TLS_CERT_ALTNAME_INVALID`, ...)
    → `auth`. kafkajs marks these retriable; they are not.
-4. Error names: `KafkaJSSASLAuthenticationError` → `auth`; `KafkaJSGroupCoordinatorNotFound` → `auth` (it usually
-   hides a missing group ACL); unsupported broker versions and missing codecs → `config`.
-5. Known message texts (wrong credentials, PEM errors, `Invalid topic`, `The producer is disconnected`, ...).
+4. Error names: `KafkaJSSASLAuthenticationError` → `auth`; `KafkaJSGroupCoordinatorNotFound` → `transient` (reason
+   `GROUP_COORDINATOR_NOT_FOUND`): kafkajs throws it both when the coordinator is not available yet (brokers starting,
+   `__consumer_offsets` offline) and for a hidden `GROUP_AUTHORIZATION_FAILED`, so the consumer retries with the normal
+   backoff and its hint names both causes; unsupported broker versions and missing codecs → `config`.
+5. Known message texts (wrong credentials, `Invalid topic`, `The producer is disconnected`, ...). OpenSSL errors
+   thrown while kafkajs builds the TLS context (a key that does not match the certificate, unreadable PEM) →
+   `config` with reason `TLS_CONFIG` (status `TLS: invalid cert, key or CA`).
 6. Node.js network codes (`ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, ...) and kafkajs connectivity errors →
    `transient`.
 7. `TypeError`, `RangeError`, ...: `message` while sending (bad content), `config` otherwise (bad options).
@@ -369,7 +424,7 @@ What each node does with each kind:
 
 | Kind | Producer: connecting | Producer: sending live | Producer: flushing the queue | Consumer | Admin |
 |---|---|---|---|---|---|
-| `transient` | retry with backoff | failed batch and everything behind it → queue (or kept in memory, or `done(err)` with the queue off); reconnect | stop, reconnect; the records stay queued | drop the consumer, retry with backoff | `done(err)`, drop the client |
+| `transient` | retry with backoff | a Kafka protocol error or request timeout is first resent whole up to 3 times (`sendWithRetry()`); then the failed batch and everything behind it → queue (or kept in memory, or `done(err)` with the queue off); reconnect | the same 3 resends, then stop, reconnect; the records stay queued | drop the consumer, retry with backoff | `done(err)`, drop the client |
 | `auth` | slow retry, red | as `transient`, slow retry | as `transient`, slow retry | slow retry, red | `done(err)`, drop the client, red |
 | `config` | slow retry, red | as `auth` | as `auth` | slow retry, red | as `auth` |
 | `message` | treated as `unknown` (`connectionKind()`) | `done(err)` for that input; a batch with several inputs is re-sent one input at a time to find the bad one | dead-letter the record, acknowledge it, continue | treated as `unknown` | `done(err)`, keep the client |
@@ -390,19 +445,32 @@ The nodes handle every promise they create. kafkajs, however, has internal promi
 example the restart of a crashed consumer: if a listener or `restartOnFailure` throws there, the rejection is
 unhandled. As a second line of defence, `lib/safety-net.js` installs **one** process-wide `unhandledRejection`
 listener while at least one broker node with *Crash safety net* enabled (the default) exists. Broker nodes take a
-reference in their constructor and release it in their close handler; the last release removes the listener.
+reference in their constructor and release it in their close handler. After the last release the listener stays for
+`RELEASE_GRACE_MS` (30 s, an `unref()`'d timer): Node-RED closes config nodes in parallel with the client nodes that
+use them, and kafkajs requests abandoned while those disconnect can still fail for up to a request timeout. A new
+reference (the next deploy) cancels the timer. It covers unhandled promise **rejections** only, never uncaught
+exceptions.
 
 The handler only touches rejections that are ours:
 
-- A reason from kafkajs (an error named `KafkaJS*`, or a stack trace through a `kafkajs` folder), one of this
-  palette's error classes (`KafkaNc*`), or an error whose stack runs through this package's `lib/` or `nodes/`
-  files is logged as a warning (`[kafkajs-nc] Prevented a crash: ...`, the same text at most once a minute) and
-  swallowed.
-- Anything else is **re-thrown** when our listener is the only one and Node.js runs in its default
-  `--unhandled-rejections=throw` (or `strict`) mode. The rejection then becomes an uncaught exception, and Node-RED
-  logs it and exits exactly as it would without this palette.
-- When other `unhandledRejection` listeners exist, or Node.js runs in a mode that only warns, the handler leaves
-  the decision to them.
+- A reason from kafkajs (an error named `KafkaJS*`, or a stack trace through the directory of the kafkajs copy this
+  palette loads, `require.resolve('kafkajs/package.json')`, not just any folder named `kafkajs`), one of this
+  palette's error classes (`KafkaNc*`), or an error whose stack runs through this package's `lib/` or `nodes/` files is
+  logged as a warning (`[kafkajs-nc] Prevented a crash: ...`, the same text at most once a minute) and swallowed.
+  kafkajs errors raised by another palette that uses kafkajs cannot be told apart (npm may share one copy), so they
+  are caught too.
+- Anything else is **handed back** to Node.js when our listener is the only one and Node.js runs in `throw` (the
+  default) or `warn-with-error-code` mode: the listener removes itself, rejects a new promise with the same reason and
+  comes back in the next event-loop turn. Node.js then does exactly what it does without this palette: in `throw`
+  mode it raises the uncaught exception (wrapping a non-Error reason in `ERR_UNHANDLED_REJECTION`, origin
+  `unhandledRejection`), and Node-RED logs it and exits; in `warn-with-error-code` mode it prints its warnings and sets
+  the exit code. A re-throw from the listener would differ in subtle ways (a non-Error reason reaches Node-RED's
+  handler unwrapped).
+- When other `unhandledRejection` listeners exist, or Node.js runs in `warn` or `none` mode, the handler leaves the
+  decision to them.
+- With `--unhandled-rejections=strict` Node.js raises the uncaught exception **before** any listener runs, so a
+  listener could not prevent anything. The net is then not installed at all, and the first broker node logs
+  `[kafkajs-nc] The crash safety net is not active: ...`.
 
 Why so narrow: a global handler that swallowed every rejection would hide bugs in other nodes and keep Node-RED
 running in an undefined state. The safety net must never change the behaviour of the rest of the instance. It is
@@ -428,7 +496,13 @@ not handled.
 | **Sockets leak on connection timeouts.** On a connection timeout kafkajs only calls `socket.end()` and `unref()`. A socket still connecting to a black-holed address stays open for minutes. | one leaked file descriptor per reconnect attempt during an outage | `lib/socket-factory.js` destroys the socket if it has not closed 2 s after `end()` |
 | **No reconnect after a failed first `connect()`.** `send()` then rejects at once with `The producer is disconnected` and never connects by itself. A lost connection emits no `DISCONNECT` event either. | a producer that never recovers | the supervisor reconnects; health is judged from send results |
 | **TLS certificate errors are "retriable".** They arrive as `KafkaJSConnectionError` with the Node.js code in `.code`. | fast, endless retries of a configuration problem | the classifier checks codes before `retriable` |
-| **Error details sit on `.cause`.** `type` and `code` are not copied to the wrapping error. A missing group ACL surfaces as `KafkaJSGroupCoordinatorNotFound`. | wrong reactions, useless messages | `flatten()` walks the chain; dedicated rules and hints |
+| **Error details sit on `.cause`.** `type` and `code` are not copied to the wrapping error. A missing group ACL surfaces as `KafkaJSGroupCoordinatorNotFound`, like a coordinator that is not available yet. | wrong reactions, useless messages | `flatten()` walks the chain; dedicated rules and hints; the coordinator case is `transient` with a hint naming both causes |
+| **A retried produce request can skip partitions.** `sendMessages()` keeps the per-broker responses across its retries; when a partition's leader moves to a broker that already answered, nothing more is sent for it and `send()` resolves anyway. | silent loss of keyed and round-robin messages during rolling restarts or leader rebalances; explicit partitions misreported as "does not exist" | producers are created with `retry: { retries: 0 }`; the node resends the whole batch (`sendWithRetry()`); no idempotent mode (it needs retries ≥ 1) |
+| **Metadata is cached for 5 minutes.** A partition added to a topic is unknown to a connection that fetched the metadata before. | messages for the new partition fail as "does not exist" or are dead-lettered | a missing partition is only final on a connection younger than 10 s; otherwise the node reconnects and resends |
+| **`seek()` to `-2`/`-1` and offsets out of range.** kafkajs treats the markers as "no position" and applies `fromBeginning`; an offset outside the partition makes it fall back to its default position. In both cases it commits that position (auto mode, and after `OffsetOutOfRange` even in manual mode). | `seek "earliest"`/`"latest"` goes to the wrong place; a manually committed position is overwritten | the consumer resolves `earliest`/`latest` to real offsets and refuses numbers outside them before calling `seek()` |
+| **`admin.resetOffsets()` stores the `-2`/`-1` markers** instead of offsets. | the next consumer's `fromBeginning` decides where the group starts | the admin node calls `setOffsets()` with the real low/high offsets |
+| **`commitOffsets()` resolves without committing** when the consumer's runner is stopping. | a commit reported as done that Kafka never stored | the consumer waits for the `COMMIT_OFFSETS` event that confirms the offset |
+| **lz4js decompression** sizes its output from what the frame declares (content size or block maximums: up to about 4 GiB from a few bytes), falls back to a plain JavaScript array when that allocation fails, and ignores block checksums. | an uncatchable out-of-memory abort of Node-RED, and a crash loop because the record is fetched again after the restart; wrong bytes without an error | `lib/codecs.js` decodes LZ4 frames itself: bounded output (256 MiB), checksums verified, catchable errors |
 | **Only gzip is built in.** Snappy, LZ4 and zstd throw `KafkaJSNotImplemented`, which stops a consumer for good. | a consumer dies on the first compressed batch | `lib/codecs.js` registers Snappy and LZ4; zstd is documented as unsupported |
 | **Multi-topic sends can be written partially.** A batch over two topics can be rejected while one topic's messages were written. | duplicates on retry | one topic per produce request |
 | **A client without SASL on a SASL listener connects successfully**, then every request fails with `Closed connection`. | looks like a network problem | the producer only resets its backoff after a successful request |
@@ -470,13 +544,16 @@ kafkajs does, and pauses are lost on restart. Behaviour knobs (`fake.behaviour.c
 These run the real nodes with the real kafkajs against Apache Kafka 3.9.1 (KRaft) started by
 [`scripts/kafka/`](../scripts/kafka): a `PLAINTEXT` listener and a `SASL_PLAINTEXT` listener with PLAIN and
 SCRAM-SHA-256/512. They cover round trips with every compression codec, SASL (including a wrong password and
-mismatched listeners), the consumer controls, the admin actions, and outages: the broker killed (`SIGKILL`),
-stopped and frozen (`SIGSTOP`) during continuous produce, a redeploy during an outage, closing with a frozen broker,
-and closing a consumer a few milliseconds after deploy without leaving a zombie group member. Without
-`KAFKA_E2E_BROKERS` every e2e test is skipped.
+mismatched listeners), the consumer controls (`seek` to `earliest`/`latest` in both commit modes, seeks out of range,
+commits behind a producer node), the admin actions (`resetOffsets` and `setOffsets` against the consumers'
+*Read from the beginning*), and outages: the broker killed (`SIGKILL`), stopped and frozen (`SIGSTOP`) during
+continuous produce, a request that times out on a frozen broker and is resent whole by the node, a redeploy during an
+outage, closing with a frozen broker, and closing a consumer a few milliseconds after deploy without leaving a zombie
+group member. Without `KAFKA_E2E_BROKERS` every e2e test is skipped. A single broker cannot move partition leaders, so
+the leader-move case of the produce retry is covered by the node tests with the fake kafkajs.
 
 ### CI
 
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs lint (Node.js 22), `npm test` on Node.js 18 + Node-RED
-3 and 4, Node.js 20 + 4, Node.js 22 + 4 and 5, Node.js 24 + 5, and the e2e suite on Node.js 22 with Java 21 and a
-cached Kafka download.
+3.1 (the oldest supported version) and 4, Node.js 20 + 4, Node.js 22 + 4 and 5, Node.js 24 + 5, and the e2e suite on
+Node.js 22 with Java 21 and a cached Kafka download.

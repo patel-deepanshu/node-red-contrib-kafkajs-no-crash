@@ -28,14 +28,11 @@ module.exports = function (RED) {
     /**
      * Config node constructor.
      *
-     * Public properties (read by the client nodes):
+     * Public API (used by the client nodes):
      *  - configError {ConfigError|null}  every problem found, in `.details`
      *  - warnings {string[]}
-     *  - reconnect {{min, max, authMin}} supervisor backoff in ms (also exposed
-     *    as reconnectMin / reconnectMax / authRetryMin)
-     *  - logLevelName {string} 'off' | 'error' | 'warn' | 'info' | 'debug'
-     *  - summary {string} e.g. 'b1:9092, b2:9092 · SASL/PLAIN · TLS'
-     *  - brokerList {string[]} parsed and normalised broker addresses
+     *  - reconnect {{min, max, authMin}} supervisor backoff in ms
+     *  - createKafka(forNode) a new kafkajs client for one connect attempt
      *
      * @param {object} config
      */
@@ -55,12 +52,6 @@ module.exports = function (RED) {
             max: clientConfig.DEFAULTS.reconnectMax,
             authMin: clientConfig.DEFAULTS.authRetryMin
         };
-        node.reconnectMin = node.reconnect.min;
-        node.reconnectMax = node.reconnect.max;
-        node.authRetryMin = node.reconnect.authMin;
-        node.logLevelName = clientConfig.DEFAULTS.logLevel;
-        node.summary = '';
-        node.brokerList = [];
 
         // Register the close handler before anything can fail: Node-RED never
         // calls it when the constructor throws, which would leak the safety net.
@@ -74,6 +65,8 @@ module.exports = function (RED) {
             });
             try {
                 node._closed = true;
+                // Client nodes may still be closing (Node-RED stops config nodes in parallel with them): the
+                // safety net stays installed for a grace period after the last release (lib/safety-net.js).
                 if (node._releaseSafetyNet) node._releaseSafetyNet();
                 node._releaseSafetyNet = null;
             } catch (_) {
@@ -88,12 +81,6 @@ module.exports = function (RED) {
             const normalized = clientConfig.normalizeBrokerConfig(config, credentials, earlyTlsCheck(config));
 
             node.reconnect = normalized.reconnect;
-            node.reconnectMin = normalized.reconnect.min;
-            node.reconnectMax = normalized.reconnect.max;
-            node.authRetryMin = normalized.reconnect.authMin;
-            node.logLevelName = normalized.logLevelName;
-            node.summary = clientConfig.summarize(normalized);
-            node.brokerList = normalized.brokers.slice();
             node.warnings = normalized.warnings.slice();
 
             if (normalized.errors.length > 0) {
@@ -126,14 +113,19 @@ module.exports = function (RED) {
      * @returns {object|undefined} options for normalizeBrokerConfig
      */
     function earlyTlsCheck(config) {
+        if (!toBool((config || {}).tls, false)) return undefined;
+        const tlsNode = tlsNodeOf(config);
+        return tlsNode ? { tlsNode } : undefined;
+    }
+
+    /** The tls-config node the configuration refers to, or null (none set, or not found). Never throws. */
+    function tlsNodeOf(config) {
         try {
             const c = config || {};
             const id = typeof c.tlsConfig === 'string' ? c.tlsConfig.trim() : '';
-            if (id === '' || !toBool(c.tls, false)) return undefined;
-            const tlsNode = RED.nodes.getNode(id);
-            return tlsNode ? { tlsNode } : undefined;
+            return id === '' ? null : RED.nodes.getNode(id) || null;
         } catch (_) {
-            return undefined;
+            return null;
         }
     }
 
@@ -161,16 +153,8 @@ module.exports = function (RED) {
         if (this.configError) throw this.configError;
 
         const config = this._config || {};
-        let tlsNode = null;
-        try {
-            const id = typeof config.tlsConfig === 'string' ? config.tlsConfig.trim() : '';
-            if (id !== '') tlsNode = RED.nodes.getNode(id) || null;
-        } catch (_) {
-            tlsNode = null;
-        }
-
         const built = clientConfig.buildClientOptions(config, this.credentials || {}, {
-            tlsNode,
+            tlsNode: tlsNodeOf(config),
             socketFactory: createSocketFactory(),
             logCreator: createLogCreator(RED, logLabel(forNode, this))
         });

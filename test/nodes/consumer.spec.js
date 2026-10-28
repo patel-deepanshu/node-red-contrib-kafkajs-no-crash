@@ -23,7 +23,7 @@ const { tmpDir, sleep, waitFor, nextStatus, statusMark } = require('../helpers/c
 
 helper.init(require.resolve('node-red'));
 
-const { parseConfig, parseSeek, parseCommit, parseTopicRegex, fmtDelay } = consumerNode._internals;
+const { parseConfig, parseSeek, seekOffset, parseCommit, parseTopicRegex, fmtDelay } = consumerNode._internals;
 const SAVED_TIMEOUTS = { ...consumerNode.TIMEOUTS };
 
 /** Short backoffs so reconnect tests run fast (authRetryMin cannot go below 1 s). */
@@ -276,8 +276,24 @@ describe('kafkajs-nc-consumer node', function () {
             ['an unset environment variable', { topics: '${KAFKAJS_NC_TEST_UNSET_TOPIC}' }, 'config error',
                 /environment variable KAFKAJS_NC_TEST_UNSET_TOPIC is not set/],
             ['an unset environment variable as group id', { groupId: '${KAFKAJS_NC_TEST_UNSET_GROUP}' }, 'config error',
-                /Group ID: environment variable KAFKAJS_NC_TEST_UNSET_GROUP is not set/]
+                /Group ID: environment variable KAFKAJS_NC_TEST_UNSET_GROUP is not set/],
+            // Node-RED only replaces a reference that is the whole value: a set variable stays literal here,
+            // so "is not set" would send the user after the wrong problem
+            ['an environment variable inside a topic list', { topics: 'orders, ${KAFKAJS_NC_TEST_SET}' }, 'config error',
+                /Topic: \$\{KAFKAJS_NC_TEST_SET\} is only replaced by Node-RED when it is the whole value/],
+            ['an environment variable with a space around it', { topics: ' ${KAFKAJS_NC_TEST_SET}' }, 'config error',
+                /Topic: \$\{KAFKAJS_NC_TEST_SET\} is only replaced by Node-RED when it is the whole value/],
+            ['an environment variable with a space around it as regex', { topics: '${KAFKAJS_NC_TEST_SET} ', topicIsRegex: true },
+                'config error', /Topic: \$\{KAFKAJS_NC_TEST_SET\} is only replaced by Node-RED when it is the whole value/],
+            ['an environment variable inside the group id', { groupId: 'g-${KAFKAJS_NC_TEST_SET}' }, 'config error',
+                /Group ID: \$\{KAFKAJS_NC_TEST_SET\} is only replaced by Node-RED when it is the whole value/]
         ];
+        before(function () {
+            process.env.KAFKAJS_NC_TEST_SET = 'set-topic';
+        });
+        after(function () {
+            delete process.env.KAFKAJS_NC_TEST_SET;
+        });
         for (const [what, props, statusText, logRe] of cases) {
             it(`reports ${what}`, async function () {
                 await helper.load([brokerNode, consumerNode], flow(props));
@@ -593,7 +609,9 @@ describe('kafkajs-nc-consumer node', function () {
             const k1 = helper.getNode('k1');
             const s = await nextStatus(k1, (st) => st.fill === 'yellow' && / · retry /.test(st.text));
             assert.match(s.text, /^unknown topic\/partition · retry /);
-            await waitFor(() => callsOf(k1, 'error').some((e) => /check that the topic exists/.test(e)));
+            // usually temporary (e.g. a producer is about to create it): a warning, not an error
+            await waitFor(() => callsOf(k1, 'warn').some((e) => /Kafka connection failed: .*check that the topic exists/.test(e)));
+            assert.deepEqual(callsOf(k1, 'error').filter((e) => /UNKNOWN_TOPIC|topic exists/.test(e)), []);
             assert.equal(fake.consumers[0].state, 'disconnected');
             // not the slow auth retry (authRetryMin is 1 s here): the next attempt comes quickly
             await waitFor(() => fake.consumers.length >= 2, { timeout: 700 });
@@ -602,13 +620,40 @@ describe('kafkajs-nc-consumer node', function () {
             await nextStatus(k1, (st) => st.fill === 'green', 3000);
         });
 
-        it('a group ACL problem (group coordinator not found) is retried slowly with a hint', async function () {
+        it('group coordinator not found is retried with the normal backoff, with a hint naming both causes', async function () {
+            // kafkajs reports an unavailable coordinator (broker starting, __consumer_offsets offline) and a
+            // missing group ACL the same way: waiting authRetryMin would delay recovery from the first
             fake.behaviour.groupJoinError = () => fake.errors.groupCoordinatorNotFound('node-red-k1');
             await helper.load([brokerNode, consumerNode], flow());
             const k1 = helper.getNode('k1');
+            const s = await nextStatus(k1, (st) => / · retry /.test(st.text));
+            assert.equal(s.fill, 'yellow');
+            assert.match(s.text, /^group coordinator not found · retry /);
+            assert.equal(k1.consumerRuntime.lastKind, 'transient');
+            assert.ok(k1.consumerRuntime.retryInMs < 1000, `normal backoff, not authRetryMin: ${k1.consumerRuntime.retryInMs}`);
+            await waitFor(() => callsOf(k1, 'error').some((e) =>
+                /group coordinator is not available .*or the user is not authorised for the consumer group/.test(e)));
+            // and it recovers at the next retry once the coordinator is there
+            await waitFor(() => fake.consumers.length >= 2, { timeout: 700 });
+            fake.behaviour.groupJoinError = null;
+            await nextStatus(k1, isConnected, 3000);
+        });
+
+        it('a red status shows the whole reason when it fits (not cut at 28 characters, as the producer)', async function () {
+            fake.behaviour.consumerConnectError = () => fake.errors.protocol('ILLEGAL_SASL_STATE');
+            await helper.load([brokerNode, consumerNode], flow());
+            const k1 = helper.getNode('k1');
             const s = await nextStatus(k1, (st) => st.fill === 'red');
-            assert.match(s.text, /retry 1s$/);
-            await waitFor(() => callsOf(k1, 'error').some((e) => /not authorised for the consumer group/.test(e)));
+            assert.equal(s.text, 'SASL not expected by listener · retry 1s');
+        });
+
+        it('10 identical connection failures: one error, then a "still failing" warning (MAINT-10)', async function () {
+            fake.behaviour.consumerConnectError = () => fake.errors.connectionRefused();
+            await helper.load([brokerNode, consumerNode], flow());
+            const k1 = helper.getNode('k1');
+            await waitFor(() => fake.consumers.length >= 11, { timeout: 5000, message: '11 attempts' });
+            assert.equal(callsOf(k1, 'error').filter((e) => /Kafka connection failed/.test(e)).length, 1);
+            assert.equal(callsOf(k1, 'warn').filter((e) => /Kafka still failing after 10 attempts: .*ECONNREFUSED/.test(e)).length, 1);
         });
 
         it('kafka.consumer() throwing synchronously is a config error, retried slowly', async function () {
@@ -675,6 +720,38 @@ describe('kafkajs-nc-consumer node', function () {
             assert.equal((await nextStatus(k1, (s) => s.text === 'rebalancing…')).fill, 'yellow');
             consumer.emit(CONSUMER_EVENTS.GROUP_JOIN, { groupId: 'node-red-k1', memberId: 'm', memberAssignment: { 'test-topic': [0] } });
             await nextStatus(k1, isConnected);
+        });
+
+        it('a topic regex that matches no topic: yellow "no partitions" status and one warning, not a green status', async function () {
+            fake.behaviour.clusterTopics = ['unrelated'];
+            await helper.load([brokerNode, consumerNode], flow({ topics: '^orders-', topicIsRegex: true }));
+            const k1 = helper.getNode('k1');
+            await waitFor(() => fake.consumers.length === 1 && fake.consumers[0].running);
+            const s = await nextStatus(k1, (st) => st.shape === 'dot');
+            assert.deepEqual([s.fill, s.text], ['yellow', 'connected · no partitions']);
+            const warned = () => callsOf(k1, 'warn').filter((w) => /No partition is assigned to this consumer: the topic pattern \/\^orders-\/ matches no topic/.test(w));
+            await waitFor(() => warned().length === 1);
+            assert.match(warned()[0], /only picked up after a restart \(msg\.action "restart"\) or a redeploy/);
+            // logged once per run of empty assignments, not at every rejoin
+            fake.consumers[0].emit(CONSUMER_EVENTS.GROUP_JOIN, { groupId: 'node-red-k1', memberId: 'm', memberAssignment: {} });
+            await sleep(50);
+            assert.equal(warned().length, 1);
+            // a restart after the topic was created picks it up
+            fake.behaviour.clusterTopics = ['unrelated', 'orders-eu'];
+            await expectOk({ action: 'restart' });
+            await nextStatus(k1, (st) => isConnected(st) && st.text === 'connected · /^orders-/', 3000);
+        });
+
+        it('a list subscription without partitions (a standby member) shows it in the status, without a warning', async function () {
+            fake.behaviour.partitionCount = 0;
+            await helper.load([brokerNode, consumerNode], flow());
+            const k1 = helper.getNode('k1');
+            const s = await nextStatus(k1, (st) => st.shape === 'dot');
+            assert.deepEqual([s.fill, s.text], ['yellow', 'connected · no partitions']);
+            await sleep(50);
+            assert.deepEqual(callsOf(k1, 'warn'), []);
+            fake.consumers[0].emit(CONSUMER_EVENTS.GROUP_JOIN, { groupId: 'node-red-k1', memberId: 'm', memberAssignment: { 'test-topic': [0] } });
+            await nextStatus(k1, (st) => isConnected(st) && st.text === 'connected · test-topic');
         });
     });
 
@@ -782,18 +859,99 @@ describe('kafkajs-nc-consumer node', function () {
             assert.equal(k1.consumerRuntime.stopped, false);
         });
 
-        it('seek: explicit or default topic, numeric/string offsets, earliest/latest', async function () {
+        it('seek: explicit or default topic, numeric/string offsets; earliest/latest become real offsets', async function () {
             const { consumer } = await loadConnected();
+            fake.behaviour.adminResults = { fetchTopicOffsets: [{ partition: 0, offset: '10', high: '10', low: '3' }] };
             await expectOk({ action: 'seek', payload: { partition: 0, offset: 5 } });
-            await expectOk({ action: 'seek', payload: { topic: 'test-topic', partition: '0', offset: '9223372036854775807' } });
+            await expectOk({ action: 'seek', payload: { topic: 'test-topic', partition: '0', offset: '10' } });
+            // kafkajs does not seek to its -2/-1 markers (it applies fromBeginning instead): the node resolves them
             await expectOk({ action: 'seek', payload: { partition: 0, offset: 'earliest' } });
-            await expectOk({ action: 'seek', payload: { partition: 0, offset: 'latest' } });
+            await expectOk({ action: 'seek', payload: { partition: 0, offset: ' Latest ' } });
+            await expectOk({ action: 'seek', payload: { partition: 0, offset: -2 } });
             assert.deepEqual(consumer.seeks, [
                 { topic: 'test-topic', partition: 0, offset: '5' },
-                { topic: 'test-topic', partition: 0, offset: '9223372036854775807' },
-                { topic: 'test-topic', partition: 0, offset: '-2' },
-                { topic: 'test-topic', partition: 0, offset: '-1' }
+                { topic: 'test-topic', partition: 0, offset: '10' },
+                { topic: 'test-topic', partition: 0, offset: '3' },
+                { topic: 'test-topic', partition: 0, offset: '10' },
+                { topic: 'test-topic', partition: 0, offset: '3' }
             ]);
+            // one short-lived admin client per seek, always disconnected again
+            assert.equal(fake.admins.length, 5);
+            for (const admin of fake.admins) {
+                assert.deepEqual(admin.calls, [{ method: 'fetchTopicOffsets', args: 'test-topic' }]);
+                await waitFor(() => admin.state === 'disconnected');
+            }
+        });
+
+        it('seek: an offset outside the partition\'s offsets is refused (kafkajs would commit its default position)', async function () {
+            const { consumer } = await loadConnected({ commitMode: 'manual' });
+            fake.behaviour.adminResults = { fetchTopicOffsets: [{ partition: 0, offset: '10', high: '10', low: '3' }] };
+            await expectError({ action: 'seek', payload: { partition: 0, offset: 11 } },
+                /seek: offset 11 is outside the offsets of test-topic\[0\] \(3 to 10\)/);
+            await expectError({ action: 'seek', payload: { partition: 0, offset: '2' } }, /offset 2 is outside/);
+            await expectError({ action: 'seek', payload: { partition: 0, offset: '9223372036854775807' } }, /is outside/);
+            assert.deepEqual(consumer.seeks, []);
+        });
+
+        it('seek: only for a partition assigned to this consumer, never while rebalancing', async function () {
+            fake.behaviour.partitionCount = { 'test-topic': 2, other: 1 };
+            const { k1, consumer } = await loadConnected({ topics: 'test-topic, other' });
+            fake.behaviour.adminResults = { fetchTopicOffsets: [{ partition: 0, high: '4', low: '0' }, { partition: 1, high: '4', low: '0' }] };
+            await expectOk({ action: 'seek', payload: { topic: 'test-topic', partition: 1, offset: 2 } });
+            // a later rebalance gives this member only partition 0 of test-topic
+            consumer.emit(CONSUMER_EVENTS.REBALANCING, { groupId: 'node-red-k1', memberId: 'm' });
+            await nextStatus(k1, (s) => s.text === 'rebalancing…');
+            await expectError({ action: 'seek', payload: { topic: 'test-topic', partition: 0, offset: 1 } }, /Cannot seek: the consumer group is rebalancing/);
+            consumer.emit(CONSUMER_EVENTS.GROUP_JOIN, { groupId: 'node-red-k1', memberId: 'm', memberAssignment: { 'test-topic': [0], other: [] } });
+            await nextStatus(k1, isConnected);
+            // kafkajs would keep this seek and apply it whenever partition 1 is assigned again (maybe hours later)
+            const e = await expectError({ action: 'seek', payload: { topic: 'test-topic', partition: 1, offset: 0 } },
+                /seek: partition 1 of topic "test-topic" is not assigned to this consumer \(assigned: test-topic\[0\]\)/);
+            assert.equal(e.error.source.id, 'k1');
+            await expectError({ action: 'seek', payload: { topic: 'nope', partition: 0, offset: 0 } }, /partition 0 of topic "nope" is not assigned/);
+            await expectOk({ action: 'seek', payload: { topic: 'test-topic', partition: 0, offset: 'latest' } });
+            assert.deepEqual(consumer.seeks, [
+                { topic: 'test-topic', partition: 1, offset: '2' },
+                { topic: 'test-topic', partition: 0, offset: '4' }
+            ]);
+            assert.equal(fake.admins.length, 2, 'refused seeks never connect');
+        });
+
+        it('seek: the offset lookup is bounded and its client is disconnected; a restart meanwhile fails the seek', async function () {
+            consumerNode.TIMEOUTS.offsetLookup = 150;
+            const { consumer } = await loadConnected();
+            fake.behaviour.adminDelayMs = { fetchTopicOffsets: Infinity };
+            await expectError({ action: 'seek', payload: { partition: 0, offset: 'earliest' } },
+                /Cannot seek: looking up the offsets of topic "test-topic" timed out after 150ms/);
+            await waitFor(() => fake.admins[0].state === 'disconnected');
+            // a connect that completes after the timeout is disconnected again (no leftover connection)
+            fake.behaviour.adminDelayMs = null;
+            fake.behaviour.connectDelayMs = (args, client) => (client.kind === 'admin' ? 300 : 0);
+            await expectError({ action: 'seek', payload: { partition: 0, offset: 'earliest' } }, /timed out after 150ms/);
+            await waitFor(() => fake.admins[1].connectCount === 1 && fake.admins[1].state === 'disconnected', { timeout: 2000 });
+            assert.equal(fake.admins[1].calls.length, 0);
+            // the consumer restarts while the offsets are looked up: that seek must not reach the new consumer
+            fake.behaviour.connectDelayMs = (args, client) => (client.kind === 'admin' ? 100 : 0);
+            consumerNode.TIMEOUTS.offsetLookup = 2000;
+            const pending = control({ action: 'seek', payload: { partition: 0, offset: 'earliest' } });
+            await waitFor(() => fake.admins.length === 3);
+            await expectOk({ action: 'restart' });
+            const r = await pending;
+            assert.match(r.error.error.message, /Cannot seek: the Kafka consumer restarted while the offsets were looked up/);
+            assert.deepEqual(consumer.seeks, []);
+            await waitFor(() => fake.consumers.length === 2 && fake.consumers[1].running);
+            assert.deepEqual(fake.consumers[1].seeks, []);
+        });
+
+        it('seek: closing the node during the offset lookup disconnects the lookup client', async function () {
+            await loadConnected();
+            fake.behaviour.adminDelayMs = { fetchTopicOffsets: Infinity };
+            helper.getNode('k1').receive({ action: 'seek', payload: { partition: 0, offset: 'latest' } });
+            await waitFor(() => fake.admins.length === 1 && fake.admins[0].calls.length === 1);
+            const started = Date.now();
+            await helper.unload();
+            assert.ok(Date.now() - started < 1000);
+            assert.equal(fake.admins[0].state, 'disconnected');
         });
 
         it('seek: invalid parameters fail with a helpful error', async function () {
@@ -805,6 +963,7 @@ describe('kafkajs-nc-consumer node', function () {
             await expectError({ action: 'seek', payload: { topic: 'a', partition: 0, offset: -5 } }, /offset must be a whole number >= 0, "earliest" or "latest"/);
             await expectError({ action: 'seek', payload: { topic: 'a', partition: 0, offset: 'soon' } }, /offset must be/);
             await expectError({ action: 'seek', payload: { topic: 'a', partition: 0, offset: '9223372036854775808' } }, /offset must be/);
+            assert.equal(fake.admins.length, 0, 'invalid requests never connect');
         });
 
         it('commit (manual mode) commits offset + 1 as a string, from msg.kafka or msg', async function () {
@@ -815,9 +974,10 @@ describe('kafkajs-nc-consumer node', function () {
             await waitFor(() => out.length === 1);
             // the processed message is sent back with action "commit"
             await expectOk(Object.assign({}, out[0], { action: 'commit' }));
-            await expectOk({ action: 'commit', kafka: { topic: 'test-topic', partition: 0, offset: '9007199254740993' } });
+            const groupId = 'node-red-k1';
+            await expectOk({ action: 'commit', kafka: { groupId, topic: 'test-topic', partition: 0, offset: '9007199254740993' } });
             await expectOk({ action: 'commit', topic: 'test-topic', partition: '0', offset: 7 });
-            await expectOk({ action: 'commit', kafka: { partition: 0, offset: 1n } }); // topic defaults to the only one
+            await expectOk({ action: 'commit', kafka: { groupId, partition: 0, offset: 1n } }); // topic defaults to the only one
             assert.deepEqual(consumer.committed, [
                 { topic: 'test-topic', partition: 0, offset: '42', metadata: null },
                 { topic: 'test-topic', partition: 0, offset: '9007199254740994', metadata: null },
@@ -826,19 +986,65 @@ describe('kafkajs-nc-consumer node', function () {
             ]);
         });
 
+        it('commit after a producer node (msg.kafka replaced by its delivery report) is refused, never committed', async function () {
+            const { consumer } = await loadConnected({ commitMode: 'manual', topics: 'in' });
+            const out = collect('out');
+            await consumer.deliver({ topic: 'in', message: { value: 'job', offset: '41' } });
+            await waitFor(() => out.length === 1);
+            // what a kafkajs-nc-producer (topic "out") sends on: the input record's msg with msg.kafka = its report
+            const afterProducer = Object.assign({}, out[0], {
+                action: 'commit', kafka: { status: 'sent', topic: 'out', partition: 2, offset: '7' }
+            });
+            const e = await expectError(afterProducer, /commit: msg\.kafka is not a message of this consumer \(it has no groupId\)\. A producer node replaces msg\.kafka/);
+            assert.equal(e.error.source.id, 'k1');
+            // nor the fields of msg mixed with a partial msg.kafka (the old code took the topic from one, the offset from the other)
+            await expectError({ action: 'commit', topic: 'in', partition: 0, offset: 41, kafka: { status: 'queued', topic: 'out' } }, /has no groupId/);
+            await expectError({ action: 'commit', kafka: { groupId: 'someone-else', topic: 'in', partition: 0, offset: '41' } },
+                /msg\.kafka is a message of consumer group "someone-else", not of this consumer's group "node-red-k1"/);
+            await expectError({ action: 'commit', kafka: { groupId: 'node-red-k1', topic: 'out', partition: 0, offset: '41' } },
+                /this consumer does not subscribe to topic "out"/);
+            await expectError({ action: 'commit', topic: 'out', partition: 0, offset: 41 }, /does not subscribe to topic "out"/);
+            assert.deepEqual(consumer.committed, []);
+            // keeping a copy of the consumer's msg.kafka (as the help describes) works
+            await expectOk(Object.assign({}, afterProducer, { kafka: out[0].kafka }));
+            assert.deepEqual(consumer.committed, [{ topic: 'in', partition: 0, offset: '42', metadata: null }]);
+        });
+
+        it('commit: a regex subscription accepts the matching topics only', async function () {
+            fake.behaviour.clusterTopics = ['t-a', 't-b', 'other'];
+            await loadConnected({ commitMode: 'manual', topics: '^t-', topicIsRegex: true });
+            await expectOk({ action: 'commit', kafka: { groupId: 'node-red-k1', topic: 't-b', partition: 0, offset: '3' } });
+            await expectError({ action: 'commit', kafka: { groupId: 'node-red-k1', topic: 'other', partition: 0, offset: '3' } },
+                /does not subscribe to topic "other"/);
+        });
+
+        it('commit fails when kafkajs skips it because its consumer is stopping (no false success)', async function () {
+            const { consumer } = await loadConnected({ commitMode: 'manual' });
+            // kafkajs runner.commitOffsets(): "consumer not running, exiting" resolves undefined without committing
+            // while a crash or stop is tearing the consumer down (the node still says connected then)
+            const real = consumer.commitOffsets;
+            consumer.commitOffsets = async () => undefined;
+            await expectError({ action: 'commit', kafka: { groupId: 'node-red-k1', topic: 'test-topic', partition: 0, offset: '5' } },
+                /Commit not stored: the Kafka consumer was stopping/);
+            consumer.commitOffsets = real;
+            await expectOk({ action: 'commit', kafka: { groupId: 'node-red-k1', topic: 'test-topic', partition: 0, offset: '5' } });
+            assert.equal(helper.getNode('k1').consumerRuntime.commitWaiters.size, 0, 'no waiter left behind');
+        });
+
         it('commit failures and invalid commits go to Catch', async function () {
             const { consumer } = await loadConnected({ commitMode: 'manual' });
-            await expectError({ action: 'commit' }, /partition .* is required/);
-            await expectError({ action: 'commit', kafka: { partition: 0 } }, /offset .* is required/);
-            await expectError({ action: 'commit', kafka: { partition: 0, offset: 'x' } }, /offset must be a whole number/);
+            const kafka = (props) => Object.assign({ groupId: 'node-red-k1' }, props);
+            await expectError({ action: 'commit' }, /commit: msg\.partition is required/);
+            await expectError({ action: 'commit', kafka: kafka({ partition: 0 }) }, /commit: msg\.kafka\.offset is required/);
+            await expectError({ action: 'commit', kafka: kafka({ partition: 0, offset: 'x' }) }, /offset must be a whole number/);
             fake.behaviour.commitError = fake.errors.protocol('REBALANCE_IN_PROGRESS');
-            await expectError({ action: 'commit', kafka: { partition: 0, offset: 3 } }, /rebalancing/i);
+            await expectError({ action: 'commit', kafka: kafka({ partition: 0, offset: 3 }) }, /rebalancing/i);
             delete fake.behaviour.commitError;
             // commitOffsets() rejecting (not running in kafkajs terms) also ends in done(err)
             consumer.stop();
-            await expectError({ action: 'commit', kafka: { partition: 0, offset: 3 } }, /not initialized/);
+            await expectError({ action: 'commit', kafka: kafka({ partition: 0, offset: 3 }) }, /not initialized/);
             await expectOk({ action: 'stop' });
-            await expectError({ action: 'commit', kafka: { partition: 0, offset: 3 } }, /Cannot commit: the Kafka consumer is not running/);
+            await expectError({ action: 'commit', kafka: kafka({ partition: 0, offset: 3 }) }, /Cannot commit: the Kafka consumer is not running/);
         });
 
         it('a pause that kafkajs rejects while running fails the control message but stays wanted', async function () {
@@ -1030,22 +1236,45 @@ describe('kafkajs-nc-consumer node', function () {
             assert.throws(() => parseTopicRegex('(['), SyntaxError);
         });
 
-        it('parseSeek / parseCommit', function () {
-            const cfg = parseConfig({ topics: 'only' }, 'n').cfg;
-            assert.deepEqual(parseSeek({ partition: 1, offset: '0' }, cfg), { topic: 'only', partition: 1, offset: '0' });
-            assert.deepEqual(parseSeek({ partition: 1, offset: 'Beginning' }, cfg), { topic: 'only', partition: 1, offset: '-2' });
-            assert.deepEqual(parseSeek({ topic: ' t ', partition: 1, offset: 3n }, cfg), { topic: 't', partition: 1, offset: '3' });
-            assert.throws(() => parseSeek({ partition: 1.5, offset: 0 }, cfg), /partition must be a whole number/);
-            assert.throws(() => parseSeek({ partition: 0, offset: 1.5 }, cfg), /offset must be/);
-            assert.throws(() => parseSeek({ topic: 5, partition: 0, offset: 0 }, cfg), /topic must be a string/);
-            assert.deepEqual(parseCommit({ kafka: { topic: 't', partition: 2, offset: '99' } }, cfg), { topic: 't', partition: 2, offset: '100' });
+        it('parseSeek / seekOffset / parseCommit', function () {
+            const cfg = parseConfig({ topics: 'only, t' }, 'n').cfg;
+            const single = parseConfig({ topics: 'only' }, 'n').cfg;
+            assert.deepEqual(parseSeek({ partition: 1, offset: '0' }, single), { topic: 'only', partition: 1, offset: '0' });
+            assert.deepEqual(parseSeek({ partition: 1, offset: 'Beginning' }, single), { topic: 'only', partition: 1, offset: 'earliest' });
+            assert.deepEqual(parseSeek({ partition: 1, offset: '-1' }, single), { topic: 'only', partition: 1, offset: 'latest' });
+            assert.deepEqual(parseSeek({ topic: ' t ', partition: 1, offset: 3n }, single), { topic: 't', partition: 1, offset: '3' });
+            assert.throws(() => parseSeek({ partition: 1.5, offset: 0 }, single), /partition must be a whole number/);
+            assert.throws(() => parseSeek({ partition: 0, offset: 1.5 }, single), /offset must be/);
+            assert.throws(() => parseSeek({ topic: 5, partition: 0, offset: 0 }, single), /topic must be a string/);
+
+            const offsets = [{ partition: 0, offset: '9', low: '2', high: '9' }, { partition: 1, offset: '0', low: '0', high: '0' }];
+            const target = (offset, partition = 0) => ({ topic: 'only', partition, offset });
+            assert.equal(seekOffset(target('earliest'), offsets), '2');
+            assert.equal(seekOffset(target('latest'), offsets), '9');
+            assert.equal(seekOffset(target('2'), offsets), '2');
+            assert.equal(seekOffset(target('9'), offsets), '9');
+            assert.equal(seekOffset(target('latest', 1), offsets), '0');
+            assert.throws(() => seekOffset(target('1'), offsets), /offset 1 is outside the offsets of only\[0\] \(2 to 9\)/);
+            assert.throws(() => seekOffset(target('10'), offsets), /offset 10 is outside/);
+            assert.throws(() => seekOffset(target('0', 7), offsets), /partition 7 of topic "only" does not exist/);
+            assert.throws(() => seekOffset(target('0'), [{ partition: 0, low: 'x', high: '1' }]), /unusable offsets/);
+
+            const mine = { groupId: 'node-red-n' };
+            assert.deepEqual(parseCommit({ kafka: { ...mine, topic: 't', partition: 2, offset: '99' } }, cfg), { topic: 't', partition: 2, offset: '100' });
             assert.deepEqual(parseCommit({ topic: 'only', partition: 0, offset: 0, kafka: null }, cfg), { topic: 'only', partition: 0, offset: '1' });
+            assert.deepEqual(parseCommit({ partition: 0, offset: 0 }, single), { topic: 'only', partition: 0, offset: '1' });
+            assert.throws(() => parseCommit({ kafka: { topic: 't', partition: 2, offset: '99' } }, cfg), /has no groupId/);
+            assert.throws(() => parseCommit({ kafka: { groupId: 'x', topic: 't', partition: 2, offset: '99' } }, cfg), /consumer group "x"/);
+            assert.throws(() => parseCommit({ kafka: { ...mine, topic: 'z', partition: 2, offset: '99' } }, cfg), /does not subscribe to topic "z"/);
+            // never mixed: a msg.kafka without offset does not take msg.offset
+            assert.throws(() => parseCommit({ offset: 5, kafka: { ...mine, topic: 't', partition: 0 } }, cfg), /msg\.kafka\.offset is required/);
             const regexCfg = parseConfig({ topics: '^x', topicIsRegex: true }, 'n').cfg;
             assert.throws(() => parseCommit({ partition: 0, offset: 0 }, regexCfg),
-                /msg.kafka.topic \(or msg.topic\) is required because the node subscribes to a topic pattern/);
+                /msg\.topic is required because the node subscribes to a topic pattern/);
+            assert.deepEqual(parseCommit({ topic: 'xy', partition: 0, offset: 0 }, regexCfg).topic, 'xy');
             // 2^63-1 is the last valid offset; committing it would need 2^63
-            assert.throws(() => parseCommit({ partition: 0, offset: 9223372036854775807n }, cfg), /offset 9223372036854775807 is too large/);
-            assert.deepEqual(parseCommit({ partition: 0, offset: '9223372036854775806' }, cfg).offset, '9223372036854775807');
+            assert.throws(() => parseCommit({ partition: 0, offset: 9223372036854775807n }, single), /offset 9223372036854775807 is too large/);
+            assert.deepEqual(parseCommit({ partition: 0, offset: '9223372036854775806' }, single).offset, '9223372036854775807');
         });
 
         it('fmtDelay', function () {
@@ -1125,6 +1354,13 @@ describe('kafkajs-nc-consumer node', function () {
             assert.equal(topics.call({}, 'a, b.c_d-e', {}), true);
             assert.match(topics.call({}, 'a, x/y', {}), /invalid topic name "x\/y"/);
             assert.equal(topics.call({}, '${TOPICS}', {}), true);
+            // Node-RED only replaces a whole value without spaces: anything else stays literal at runtime
+            for (const v of [' ${TOPICS}', '${TOPICS} ', 'orders, ${MORE}', '${A}, ${B}']) {
+                assert.match(String(topics.call({}, v, {})), /only replaced when it is the whole value/, v);
+            }
+            assert.match(String(topics.call({ topicIsRegex: true }, ' ${RX}', {})), /only replaced when it is the whole value/);
+            assert.equal(topics.call({ topicIsRegex: true }, '${RX}', {}), true);
+            assert.equal(def.defaults.sessionTimeout.validate(' ${SESSION}', undefined), false);
             assert.equal(topics.call({ topicIsRegex: true }, '^a/b.*', {}), true);
             assert.match(topics.call({ topicIsRegex: true }, '([', {}), /invalid regular expression/);
             assert.equal(topics.call({ topicIsRegex: true }, '/^a$/i', {}), true);
@@ -1136,6 +1372,58 @@ describe('kafkajs-nc-consumer node', function () {
             assert.match(session('500', {}), /from 1000 to 3600000/);
             assert.equal(session('1.5', undefined), false);
             assert.equal(def.defaults.partitionsConsumedConcurrently.validate('101', undefined), false);
+        });
+
+        /** Run oneditprepare with chainable jQuery/RED stubs; returns the placeholder set on the Group ID field. */
+        function groupPlaceholder(node, subflows) {
+            let placeholder = null;
+            const chain = (selector) => {
+                const self = new Proxy({}, {
+                    get(_, name) {
+                        if (name === 'length') return 0;
+                        if (name === 'is') return () => false;
+                        if (name === 'val') return () => '';
+                        if (name === 'attr') {
+                            return (attr, value) => {
+                                if (selector === '#node-input-groupId' && attr === 'placeholder') placeholder = value;
+                                return self;
+                            };
+                        }
+                        return () => self;
+                    }
+                });
+                return self;
+            };
+            let registered = null;
+            const sandbox = {
+                RED: {
+                    nodes: {
+                        registerType(type, def) {
+                            registered = def;
+                        },
+                        subflow: (id) => (subflows.includes(id) ? { id, type: 'subflow' } : null)
+                    },
+                    tabs: { create: () => ({ addTab() {}, resize() {} }) },
+                    popover: { tooltip() {} }
+                },
+                $: chain,
+                setTimeout: () => 0
+            };
+            vm.runInNewContext(scriptBlock('text/javascript'), sandbox, { filename: 'kafka-consumer.html.js' });
+            registered.oneditprepare.call(node);
+            return placeholder;
+        }
+
+        it('the Group ID placeholder shows the runtime default, also inside a subflow', function () {
+            assert.equal(groupPlaceholder({ id: 'abc.12', z: 'flow1' }, []), 'node-red-abc.12');
+            // the runtime id of a node in a subflow instance is "<instance id>-<node id>"
+            assert.equal(groupPlaceholder({ id: 'abc.12', z: 'sf1' }, ['sf1']),
+                'node-red-<subflow instance id>-abc.12 (one group per subflow instance)');
+        });
+
+        it('help property lines have no extra ":" (Node-RED\'s help renderer drops the text before it)', function () {
+            const help = scriptBlock('text/markdown');
+            assert.deepEqual(help.split('\n').filter((l) => /^: .*\(.*\) : .*:/.test(l)), []);
         });
 
         it('the text/javascript block is valid JavaScript (node --check)', function () {
@@ -1150,11 +1438,15 @@ describe('kafkajs-nc-consumer node', function () {
             assert.match(html, /<script type="text\/markdown" data-help-name="kafkajs-nc-consumer">/);
             const lines = help.split('\n').filter((l) => l.trim() !== '');
             assert.ok(lines.every((l) => !/^\s/.test(l) || /^\s{2}\S/.test(l)), 'markdown lines must not be indented (except list continuations)');
-            for (const re of [/### Inputs/, /### Outputs/, /### Details/, /### References/, /at most once/, /at least once/,
+            for (const re of [/### Inputs/, /### Outputs/, /### Details/, /### References/, /at least once/,
                 /offset \+ 1/, /node-red-<node id>/, /topics that\s+exist when the consumer starts/, /zstd is not supported/,
-                /snappy/, /lz4/, /`pause`/, /`resume`/, /`stop`/, /`start`/, /`restart`/, /`seek`/, /`commit`/, /highWatermark/]) {
+                /snappy/, /lz4/, /`pause`/, /`resume`/, /`stop`/, /`start`/, /`restart`/, /`seek`/, /`commit`/, /highWatermark/,
+                /A producer node replaces `msg\.kafka`/, /at the next retry once the topic exists/, /connected · no partitions/,
+                /a number outside them is refused/, /<subflow instance id>-<node id>/]) {
                 assert.match(help, re);
             }
+            // automatic commits re-deliver what was handed over since the last commit: not "at most once"
+            assert.doesNotMatch(html, /at most once/);
             assert.match(html, /data-template-name="kafkajs-nc-consumer"/);
             for (const id of ['topics', 'topicIsRegex', 'groupId', 'fromBeginning', 'autoStart', 'payloadFormat', 'keyFormat',
                 'headersFormat', 'commitMode', 'autoCommitInterval', 'autoCommitThreshold', 'sessionTimeout', 'heartbeatInterval',

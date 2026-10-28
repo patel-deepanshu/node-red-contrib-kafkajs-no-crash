@@ -5,7 +5,8 @@
 const assert = require('node:assert/strict');
 const brokerNode = require('../../nodes/kafka-broker.js');
 const adminNode = require('../../nodes/kafka-admin.js');
-const { nextStatus, waitFor } = require('../helpers/common');
+const consumerNode = require('../../nodes/kafka-consumer.js');
+const { nextStatus, sleep, waitFor } = require('../helpers/common');
 const {
     helper, uniqueName, requireKafka, produceRaw, testClient, withAdmin, useNodeRed, brokerConfig, outcomeNodes, outcome,
     expectOk
@@ -131,15 +132,69 @@ describe('e2e: admin node', function () {
         await expectOk('a1', { action: 'setOffsets', payload: { groupId, topic, partitions: [{ partition: 0, offset: 1 }] } });
         let fetched = await expectOk('a1', { action: 'fetchOffsets', payload: { groupId, topics: [topic] } });
         assert.equal(fetched.payload[0].partitions[0].offset, '1');
-        // kafkajs commits the "earliest" marker (-2); resolveOffsets turns it into the real offset
+        // the real offsets are stored, not kafkajs' "earliest"/"latest" markers (-2/-1)
         await expectOk('a1', { action: 'resetOffsets', payload: { groupId, topic, earliest: true } });
         fetched = await expectOk('a1', { action: 'fetchOffsets', payload: { groupId, topics: [topic] } });
-        assert.equal(fetched.payload[0].partitions[0].offset, '-2');
-        fetched = await expectOk('a1', { action: 'fetchOffsets', payload: { groupId, topics: [topic], resolveOffsets: true } });
         assert.equal(fetched.payload[0].partitions[0].offset, '0');
+        await expectOk('a1', { action: 'resetOffsets', payload: { groupId, topic } });
+        fetched = await expectOk('a1', { action: 'fetchOffsets', payload: { groupId, topics: [topic] } });
+        assert.equal(fetched.payload[0].partitions[0].offset, '3');
 
         const deleted = await expectOk('a1', { action: 'deleteGroups', payload: [groupId] });
         assert.equal(deleted.payload[0].groupId, groupId);
+    });
+
+    it('resetOffsets moves the group where asked, whatever the consumers\' "Read from the beginning" setting', async function () {
+        const topic = uniqueName('admin-reset');
+        const toLatest = uniqueName('admin-reset-latest');
+        const toEarliest = uniqueName('admin-reset-earliest');
+        await helperAdmin('createTopics', { topics: [{ topic }], waitForLeaders: true });
+        await produceRaw(topic, [0, 1, 2, 3, 4].map((i) => ({ value: `m${i}` })));
+        await load();
+        await expectOk('a1', { action: 'resetOffsets', payload: { groupId: toLatest, topic } });
+        await expectOk('a1', { action: 'resetOffsets', payload: { groupId: toEarliest, topic, earliest: true } });
+        await helper.unload();
+
+        /** Run a consumer node of `groupId` for a while; resolve with what it received. */
+        async function consume(groupId, fromBeginning) {
+            await helper.load([brokerNode, consumerNode], [
+                brokerConfig(),
+                {
+                    id: 'k1', type: 'kafkajs-nc-consumer', broker: 'b1', topics: topic, groupId, fromBeginning,
+                    sessionTimeout: '6000', heartbeatInterval: '1000', maxWaitTimeInMs: '200', wires: [['out']]
+                },
+                { id: 'out', type: 'helper' }
+            ]);
+            const out = [];
+            helper.getNode('out').on('input', (msg) => out.push(msg.payload));
+            await nextStatus(helper.getNode('k1'), (s) => s.fill === 'green', 60000);
+            await sleep(2500);
+            await helper.unload();
+            return out;
+        }
+        // with kafkajs' markers, fromBeginning decided: the first re-read everything, the second got nothing
+        assert.deepEqual(await consume(toLatest, true), []);
+        assert.deepEqual(await consume(toEarliest, false), ['m0', 'm1', 'm2', 'm3', 'm4']);
+    });
+
+    it('setOffsets refuses offsets outside the partition and partitions that do not exist; works with a short timeout', async function () {
+        const topic = uniqueName('admin-set');
+        const groupId = uniqueName('admin-set-group');
+        await helperAdmin('createTopics', { topics: [{ topic }], waitForLeaders: true });
+        await produceRaw(topic, [0, 1, 2].map((i) => ({ value: `m${i}` })));
+        // kafkajs needs ~5 s for setOffsets: a 2 s timeout used to fail while the change was still applied
+        await load({ timeout: '2000' });
+        const missing = await outcome('a1', { action: 'setOffsets', payload: { groupId, topic, partitions: [{ partition: 7, offset: 1 }] } });
+        assert.match(missing.error.error.message, /partition 7 does not exist in topic/);
+        const outside = await outcome('a1', { action: 'setOffsets', payload: { groupId, topic, partitions: [{ partition: 0, offset: 4 }] } });
+        assert.match(outside.error.error.message, /offset 4 for partition 0 of topic .* is outside its offsets \(0 to 3\)/);
+        const huge = await outcome('a1', { action: 'setOffsets', payload: { groupId, topic, partitions: [{ partition: 0, offset: '99999999999999999999999' }] } });
+        assert.match(huge.error.error.message, /offset must be a whole number from 0 to 2\^63-1/);
+        const started = Date.now();
+        await expectOk('a1', { action: 'setOffsets', payload: { groupId, topic, partitions: [{ partition: 0, offset: 2 }] } });
+        assert.ok(Date.now() - started > 2000, 'it really takes longer than the node timeout');
+        const fetched = await expectOk('a1', { action: 'fetchOffsets', payload: { groupId, topics: [topic] } });
+        assert.equal(fetched.payload[0].partitions[0].offset, '2');
     });
 
     it('describeCluster, and an unknown action fails with the list of valid actions', async function () {

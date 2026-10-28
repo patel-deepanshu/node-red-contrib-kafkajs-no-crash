@@ -4,25 +4,53 @@
  * kafkajs-nc-admin: run Kafka admin operations (list/create/delete topics,
  * offsets, consumer groups, cluster and config info) from a flow.
  *
- * Design (SPEC §13, §17):
+ * Design (docs/ARCHITECTURE.md, The admin node):
  *  - The admin client is created lazily by the first message and then kept.
  *    Any connection-level failure (transient, auth, config, unknown, or a
  *    timeout) drops it, so the next message starts from a fresh client.
  *  - Messages are processed strictly one after another (an internal promise
- *    chain); each is bounded by the node's timeout, which also covers
- *    connecting.
+ *    chain) and at most LIMITS.maxQueued wait. Each is bounded by the node's
+ *    timeout counted from its arrival (waiting and connecting included), so
+ *    nothing runs long after it was requested.
+ *  - After a failed connection attempt, messages fail at once until the
+ *    broker's reconnect delay has passed (a backoff, like the producer and
+ *    consumer supervisors), instead of each waiting for another slow failure.
  *  - Input and close handlers are synchronous; every promise is handled.
  *    Failures go to `done(err)`, so Catch nodes receive the original message.
  */
 
+const { Backoff } = require('../lib/backoff');
 const { ErrorKind, MessageError, classifyError, shortMessage, problemText, asConfigError } = require('../lib/errors');
 const { getKafkajs } = require('../lib/kafka-factory');
 const { StatusReporter } = require('../lib/status');
-const { noop, once, toBool, toInt, withTimeout } = require('../lib/util');
+const { noop, once, toBool, toInt, withTimeout, formatDelay } = require('../lib/util');
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const TIMEOUT_LIMITS = { min: 100, max: 600000 };
 const DISCONNECT_TIMEOUT_MS = 3000;
+
+/** Exported as `module.exports.LIMITS` so that tests can lower them; production code never changes them. */
+const LIMITS = {
+    /**
+     * Most messages waiting behind the running one. Each waits for the earlier
+     * ones, so during an outage a polling flow would otherwise pile up
+     * messages for as long as it lasts, and fire them all, stale, at Kafka
+     * when it is back.
+     */
+    maxQueued: 1000,
+    /**
+     * Smallest timeout for setOffsets/resetOffsets: kafkajs runs them with an
+     * internal group member that only finishes after its first fetch, about
+     * 5 s (maxWaitTime) after joining. A shorter timeout would report a
+     * failure for a change that is still applied afterwards.
+     */
+    groupOffsetsTimeoutMs: 15000
+};
+
+/** Kafka offsets are signed 64-bit integers. */
+const MAX_OFFSET = 9223372036854775807n;
+/** The largest time a Date can hold (ms since the epoch). */
+const MAX_TIME_MS = 8640000000000000;
 
 // kafkajs ConfigResourceTypes, used when the module does not expose them.
 const FALLBACK_RESOURCE_TYPES = { UNKNOWN: 0, TOPIC: 2, BROKER: 4, BROKER_LOGGER: 8 };
@@ -112,6 +140,50 @@ function configEntries(value, topic, action) {
     throw new MessageError(`${action}: configEntries of topic "${topic}" must be an array of {name, value} or an object`);
 }
 
+/**
+ * A non-empty list of broker ids (integers >= 0, numbers or numeric
+ * strings). Malformed assignments would otherwise reach the broker, which
+ * answers by closing the connection: that looks like a network failure.
+ */
+function brokerIds(list, what, action) {
+    if (!Array.isArray(list) || list.length === 0) {
+        throw new MessageError(`${action}: ${what} must be a non-empty array of broker ids`);
+    }
+    return list.map((id) => {
+        const n = typeof id === 'number' || (typeof id === 'string' && /^\s*\d+\s*$/.test(id)) ? Number(id) : NaN;
+        if (!Number.isInteger(n) || n < 0 || n > 2147483647) {
+            throw new MessageError(`${action}: ${what} must contain broker ids (whole numbers >= 0)`);
+        }
+        return n;
+    });
+}
+
+/** createTopics replicaAssignment: [{ partition, replicas: [brokerId, ...] }] (kafkajs format). */
+function replicaAssignment(value, topic, action) {
+    if (value === undefined || value === null) return undefined;
+    if (!Array.isArray(value)) {
+        throw new MessageError(`${action}: replicaAssignment of topic "${topic}" must be an array of {partition, replicas}`);
+    }
+    return value.map((entry, i) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            throw new MessageError(`${action}: replicaAssignment[${i}] of topic "${topic}" must be {partition, replicas}`);
+        }
+        const partition = optionalInt(entry, 'partition', action, 0);
+        if (partition === undefined) throw new MessageError(`${action}: replicaAssignment[${i}].partition is required`);
+        return { partition, replicas: brokerIds(entry.replicas, `replicaAssignment[${i}].replicas`, action) };
+    });
+}
+
+/** createPartitions assignments: one array of broker ids per new partition. */
+function partitionAssignments(value, topic, action) {
+    if (value === undefined || value === null) return undefined;
+    if (!Array.isArray(value)) {
+        throw new MessageError(`${action}: assignments of topic "${topic}" must be an array with one array of broker ids ` +
+            'per new partition');
+    }
+    return value.map((ids, i) => brokerIds(ids, `assignments[${i}]`, action));
+}
+
 function topicSpec(spec, action) {
     if (typeof spec === 'string') return { topic: requireString(spec, 'topics[]', action) };
     if (!spec || typeof spec !== 'object') throw new MessageError(`${action}: every topic must be a name or {topic, ...}`);
@@ -126,23 +198,71 @@ function topicSpec(spec, action) {
         topic,
         numPartitions,
         replicationFactor,
-        replicaAssignment: Array.isArray(spec.replicaAssignment) ? spec.replicaAssignment : undefined,
+        replicaAssignment: replicaAssignment(spec.replicaAssignment, topic, action),
         configEntries: configEntries(spec.configEntries, topic, action)
     });
 }
 
+/**
+ * A point in time in ms since the epoch: a number or digits, a Date, or an
+ * ISO date string. Negative times are refused, not clamped: Kafka reads -1
+ * and -2 as "latest" and "earliest". Other text is refused rather than given
+ * to Date.parse(), which reads e.g. '-1' as 2001-01-01.
+ */
 function timestampMs(value, action) {
-    if (value instanceof Date) {
-        const t = value.getTime();
-        if (Number.isFinite(t)) return t;
-    } else if (typeof value === 'number' || (typeof value === 'string' && /^\s*\d+\s*$/.test(value))) {
-        const t = toInt(value, undefined, { min: 0 });
-        if (t !== undefined) return t;
-    } else if (typeof value === 'string' && value.trim() !== '') {
-        const t = Date.parse(value);
-        if (Number.isFinite(t)) return t;
+    let t = NaN;
+    if (value instanceof Date) t = value.getTime();
+    else if (typeof value === 'number') t = value;
+    else if (typeof value === 'string' && /^\s*\d+\s*$/.test(value)) t = Number(value);
+    else if (typeof value === 'string' && /^\s*\d{4}-\d{2}-\d{2}/.test(value)) t = Date.parse(value.trim());
+    if (!Number.isFinite(t) || t < 0 || t > MAX_TIME_MS) {
+        throw new MessageError(`${action}: msg.payload.timestamp is required (milliseconds since the epoch >= 0, a Date ` +
+            'or an ISO date string such as "2024-01-31T12:00:00Z")');
     }
-    throw new MessageError(`${action}: msg.payload.timestamp is required (milliseconds since epoch, a Date or an ISO date string)`);
+    return Math.floor(t);
+}
+
+/** A group offset to set: digits only (no -1/-2 markers, see setOffsets), at most 2^63-1, as a string. */
+function offsetText(value, action) {
+    let text = null;
+    if (typeof value === 'bigint') text = value.toString();
+    else if (typeof value === 'number' && Number.isSafeInteger(value)) text = String(value);
+    else if (typeof value === 'string') text = value.trim();
+    if (text === null || !/^\d+$/.test(text) || BigInt(text) > MAX_OFFSET) {
+        throw new MessageError(`${action}: partitions[].offset must be a whole number from 0 to 2^63-1 (number or string)`);
+    }
+    return BigInt(text).toString();
+}
+
+/**
+ * Check offsets to set against the partitions' current offsets (from
+ * admin.fetchTopicOffsets()). kafkajs ignores a partition that does not
+ * exist and still reports success, and a position outside low..high makes
+ * the group's consumers jump to their default position (earliest or latest)
+ * at the next start, like Kafka's own tool refuses to do.
+ */
+function checkOffsets(topic, partitions, current, action) {
+    const byPartition = new Map((Array.isArray(current) ? current : []).map((o) => [Number(o.partition), o]));
+    for (const { partition, offset } of partitions) {
+        const entry = byPartition.get(partition);
+        if (!entry) {
+            throw new MessageError(`${action}: partition ${partition} does not exist in topic "${topic}" ` +
+                `(it has ${byPartition.size} partition${byPartition.size === 1 ? '' : 's'})`);
+        }
+        let low;
+        let high;
+        try {
+            low = BigInt(entry.low);
+            high = BigInt(entry.high);
+        } catch (_) {
+            throw new Error(`${action}: Kafka returned unusable offsets for partition ${partition} of topic "${topic}"`);
+        }
+        const n = BigInt(offset);
+        if (n < low || n > high) {
+            throw new MessageError(`${action}: offset ${offset} for partition ${partition} of topic "${topic}" is outside ` +
+                `its offsets (${low} to ${high})`);
+        }
+    }
 }
 
 function resourceType(type, action) {
@@ -227,11 +347,8 @@ const ACTIONS = {
             if (!tp || typeof tp !== 'object') throw new MessageError(`${action}: every entry must be {topic, count}`);
             const count = optionalInt(tp, 'count', action, 1);
             if (count === undefined) throw new MessageError(`${action}: count (the new total number of partitions) is required`);
-            return compact({
-                topic: requireString(tp.topic, 'topicPartitions[].topic', action),
-                count,
-                assignments: Array.isArray(tp.assignments) ? tp.assignments : undefined
-            });
+            const topic = requireString(tp.topic, 'topicPartitions[].topic', action);
+            return compact({ topic, count, assignments: partitionAssignments(tp.assignments, topic, action) });
         });
         const args = compact({
             topicPartitions,
@@ -267,15 +384,28 @@ const ACTIONS = {
         return (admin) => admin.fetchOffsets(args);
     },
 
+    /**
+     * kafkajs' own resetOffsets() stores the -1/-2 "latest"/"earliest"
+     * markers. Consumers read a negative committed offset as "no position"
+     * and apply their own default (kafkajs fromBeginning, Java
+     * auto.offset.reset) instead, so half of the resets went the wrong way.
+     * The node looks up the real offsets and sets those.
+     */
     resetOffsets(payload, action) {
         const p = params(payload);
-        const args = {
-            groupId: requireString(p.groupId, 'groupId', action),
-            topic: requireString(p.topic, 'topic', action),
-            // kafkajs resets to the LATEST offset unless earliest is true
-            earliest: toBool(p.earliest, false)
+        const groupId = requireString(p.groupId, 'groupId', action);
+        const topic = requireString(p.topic, 'topic', action);
+        // the LATEST offset unless earliest is true (as in kafkajs)
+        const earliest = toBool(p.earliest, false);
+        return async (admin) => {
+            const current = await admin.fetchTopicOffsets(topic);
+            const partitions = (Array.isArray(current) ? current : []).map((o) => ({
+                partition: Number(o.partition),
+                offset: String(earliest ? o.low : o.high)
+            }));
+            if (partitions.length === 0) throw new MessageError(`${action}: topic "${topic}" has no partitions`);
+            return admin.setOffsets({ groupId, topic, partitions });
         };
-        return (admin) => admin.resetOffsets(args);
     },
 
     setOffsets(payload, action) {
@@ -285,18 +415,19 @@ const ACTIONS = {
         if (!Array.isArray(p.partitions) || p.partitions.length === 0) {
             throw new MessageError(`${action}: msg.payload.partitions is required (e.g. [{"partition":0,"offset":"42"}])`);
         }
+        const seen = new Set();
         const partitions = p.partitions.map((entry) => {
             if (!entry || typeof entry !== 'object') throw new MessageError(`${action}: every partition must be {partition, offset}`);
             const partition = optionalInt(entry, 'partition', action, 0);
             if (partition === undefined) throw new MessageError(`${action}: partitions[].partition is required`);
-            const offset = entry.offset;
-            const text = typeof offset === 'bigint' ? offset.toString() : (typeof offset === 'number' ? String(Math.trunc(offset)) : offset);
-            if (typeof text !== 'string' || !/^-?\d+$/.test(text.trim())) {
-                throw new MessageError(`${action}: partitions[].offset must be an integer (number or string)`);
-            }
-            return { partition, offset: text.trim() };
+            if (seen.has(partition)) throw new MessageError(`${action}: partition ${partition} is listed twice`);
+            seen.add(partition);
+            return { partition, offset: offsetText(entry.offset, action) };
         });
-        return (admin) => admin.setOffsets({ groupId, topic, partitions });
+        return async (admin) => {
+            checkOffsets(topic, partitions, await admin.fetchTopicOffsets(topic), action);
+            return admin.setOffsets({ groupId, topic, partitions });
+        };
     },
 
     listGroups: () => (admin) => admin.listGroups(),
@@ -339,8 +470,13 @@ const ACTIONS = {
 const ACTION_NAMES = Object.keys(ACTIONS);
 const ACTION_BY_LOWER = new Map(ACTION_NAMES.map((a) => [a.toLowerCase(), a]));
 
+/** Actions that run an internal kafkajs group member (see LIMITS.groupOffsetsTimeoutMs). */
+const GROUP_OFFSET_ACTIONS = new Set(['setOffsets', 'resetOffsets']);
+
 /**
- * Validate the action and its parameters.
+ * Validate the action and its parameters. The action name is matched
+ * trimmed and case-insensitively, like the consumer's and producer's
+ * msg.action.
  *
  * @param {*} name config.action or msg.action
  * @param {*} payload msg.payload
@@ -377,14 +513,26 @@ function disconnectQuietly(admin) {
 }
 
 /**
- * Settle with `promise`, or reject with a timeout error after `ms`, or with
- * the error passed to `abort(err)`. The timer is always cleared; the original
- * promise keeps a handler attached so a late rejection can never become
- * unhandled.
+ * The error for a message that used up its timeout. The timeout counts from
+ * the message's arrival, so the text says how much of it was spent waiting
+ * behind earlier messages.
+ */
+function timeoutError(action, limitMs, waitedMs) {
+    const queued = waitedMs >= 1000 ? ` (${formatDelay(waitedMs)} of it waiting behind earlier messages)` : '';
+    const err = new Error(`Kafka admin ${action} timed out after ${limitMs}ms${queued}`);
+    err.code = 'ETIMEDOUT';
+    return err;
+}
+
+/**
+ * Settle with `promise`, or reject with `makeTimeoutError()` after `ms`, or
+ * with the error passed to `abort(err)`. The timer is always cleared; the
+ * original promise keeps a handler attached so a late rejection can never
+ * become unhandled. Timeout errors are recorded in `timeoutErrors`.
  *
  * @returns {{promise: Promise, abort: (err: Error) => void}}
  */
-function withDeadline(promise, ms, action) {
+function withDeadline(promise, ms, makeTimeoutError) {
     let abort = noop;
     const raced = new Promise((resolve, reject) => {
         let timer = null;
@@ -396,8 +544,7 @@ function withDeadline(promise, ms, action) {
         abort = (err) => settle(reject, err);
         timer = setTimeout(() => {
             try {
-                const err = new Error(`Kafka admin ${action} timed out after ${ms}ms`);
-                err.code = 'ETIMEDOUT';
+                const err = makeTimeoutError();
                 timeoutErrors.add(err);
                 settle(reject, err);
             } catch (e) {
@@ -446,11 +593,17 @@ module.exports = function (RED) {
             queued: 0,
             busy: false, // a message has been accepted (its status wins over 'ready')
             inFlight: null, // { action, abort(err) } of the job being run
-            startTimer: null
+            startTimer: null,
+            // after a failed connection attempt, messages fail at once until this time (Date.now() ms)
+            retryAt: 0,
+            lastConnectError: null
         };
         let broker = null;
         let configAction = '';
         let timeoutMs = DEFAULT_TIMEOUT_MS;
+        // the broker node's reconnect settings (set in the try block below)
+        let backoff = new Backoff();
+        let authRetryMs = 60000;
 
         // Close handler first: Node-RED never calls it if the constructor throws.
         node.on('close', function (removed, done) {
@@ -521,19 +674,39 @@ module.exports = function (RED) {
                 throw new Error('Kafka admin connection abandoned (the node is stopping or the request timed out)');
             }
             state.admin = admin;
+            backoff.reset();
+            state.retryAt = 0;
+            state.lastConnectError = null;
             return admin;
+        }
+
+        function errorKind(err) {
+            if (timeoutErrors.has(err)) return ErrorKind.TRANSIENT;
+            try {
+                return classifyError(err, { op: 'admin' }).kind;
+            } catch (_) {
+                return ErrorKind.UNKNOWN;
+            }
+        }
+
+        /**
+         * A connection attempt failed (or timed out): the following messages
+         * fail at once for the broker's reconnect delay (growing with each
+         * failed attempt, at least *After auth/config errors* for those), so
+         * that a polling flow does not queue up behind one slow failing
+         * connect after another during an outage.
+         */
+        function noteConnectFailure(err) {
+            const kind = errorKind(err);
+            let delay = backoff.next();
+            if (kind === ErrorKind.AUTH || kind === ErrorKind.CONFIG) delay = Math.max(delay, authRetryMs);
+            state.retryAt = Date.now() + delay;
+            state.lastConnectError = err;
         }
 
         function reportFailure(err, action) {
             const timedOut = timeoutErrors.has(err);
-            let kind = ErrorKind.TRANSIENT;
-            if (!timedOut) {
-                try {
-                    kind = classifyError(err, { op: 'admin' }).kind;
-                } catch (_) {
-                    kind = ErrorKind.UNKNOWN;
-                }
-            }
+            const kind = errorKind(err);
             // MESSAGE/TOPIC problems are about this request (e.g. topic exists);
             // the connection is fine. Everything else: start afresh next time.
             if (kind !== ErrorKind.MESSAGE && kind !== ErrorKind.TOPIC) dropClient();
@@ -554,18 +727,37 @@ module.exports = function (RED) {
                     status.set('blue', 'dot', `running ${job.action}${state.queued > 0 ? ` (+${state.queued} queued)` : ''}`);
                 }
             };
+            let connected = false;
             try {
                 if (state.closing) {
                     finish(new Error(`The Kafka admin node stopped before running ${job.action}`));
                     return;
                 }
+                // The timeout counts from the message's arrival: a message must not run long after it was
+                // sent just because earlier ones were slow (it may delete topics or move offsets).
+                const limit = GROUP_OFFSET_ACTIONS.has(job.action)
+                    ? Math.max(timeoutMs, LIMITS.groupOffsetsTimeoutMs)
+                    : timeoutMs;
                 const started = Date.now();
+                const waited = started - job.arrivedAt;
+                if (waited >= limit) {
+                    // not a connection problem: keep the client and the status of the job before
+                    finish(timeoutError(job.action, limit, waited));
+                    return;
+                }
+                if (!state.admin && state.lastConnectError && started < state.retryAt) {
+                    const reason = shortMessage(state.lastConnectError, 60);
+                    finish(new Error(`Kafka admin ${job.action} not run: the last connection attempt failed (${reason}); ` +
+                        `the next message after ${formatDelay(state.retryAt - started)} connects again`));
+                    return;
+                }
                 if (state.admin) running();
                 const operation = ensureConnected().then((admin) => {
+                    connected = true;
                     running();
                     return job.run(admin);
                 });
-                const deadline = withDeadline(operation, timeoutMs, job.action);
+                const deadline = withDeadline(operation, limit - waited, () => timeoutError(job.action, limit, waited));
                 const inFlight = { action: job.action, abort: deadline.abort };
                 state.inFlight = inFlight;
                 let result;
@@ -592,6 +784,7 @@ module.exports = function (RED) {
                 finish();
             } catch (err) {
                 try {
+                    if (!connected && !state.closing) noteConnectFailure(err);
                     reportFailure(err, job.action);
                 } catch (_) {
                     // reporting must not prevent done(err)
@@ -604,6 +797,12 @@ module.exports = function (RED) {
             configAction = typeof config.action === 'string' ? config.action.trim() : '';
             timeoutMs = toInt(config.timeout, DEFAULT_TIMEOUT_MS, TIMEOUT_LIMITS);
             broker = RED.nodes.getNode(config.broker) || null;
+            const r = (broker && broker.reconnect) || {};
+            backoff = new Backoff({
+                min: toInt(r.min, 1000, { min: 10, max: 3600000 }),
+                max: toInt(r.max, 60000, { min: 10, max: 3600000 })
+            });
+            authRetryMs = toInt(r.authMin, 60000, { min: 10, max: 3600000 });
 
             node.on('input', function (msg, send, done) {
                 let job;
@@ -614,10 +813,15 @@ module.exports = function (RED) {
                         throw new Error(`Invalid Kafka broker configuration: ${configErrorText(broker.configError)}`);
                     }
                     job = prepare(configAction !== '' ? configAction : msg.action, msg.payload);
+                    if (state.queued >= LIMITS.maxQueued) {
+                        throw new Error(`Kafka admin ${job.action} not run: ${LIMITS.maxQueued} messages are already ` +
+                            'waiting (is Kafka reachable?)');
+                    }
                 } catch (err) {
                     safeDone(node, done, err);
                     return;
                 }
+                job.arrivedAt = Date.now();
                 state.busy = true;
                 state.queued++;
                 // Strictly sequential; runJob never rejects, .catch is belt and braces.
@@ -648,7 +852,8 @@ module.exports = function (RED) {
             });
         } catch (err) {
             try {
-                status.error('error');
+                // same status as the producer and the consumer for an unexpected bug
+                status.error('internal error');
                 node.error(`Kafka admin node failed to start: ${err && err.message}`);
             } catch (_) {
                 // ignore
@@ -670,4 +875,5 @@ function configErrorText(configError) {
 
 // exported for unit tests
 module.exports.ACTION_NAMES = ACTION_NAMES;
+module.exports.LIMITS = LIMITS;
 module.exports._prepare = prepare;

@@ -79,8 +79,9 @@ The design notes behind these decisions are in [docs/ARCHITECTURE.md](docs/ARCHI
   tombstone. You can set keys, headers (static, or taken from `msg.headers`), partitions and timestamps, and send
   batches with `msg.messages`. Every input gets a delivery report: `sent` with the partition and offset, or
   `queued`.
-- **Delivery options:** `acks` all/leader/none, an idempotent producer, gzip/snappy/lz4 compression, and the default or
-  legacy partitioner.
+- **Delivery options:** `acks` all/leader/none, gzip/snappy/lz4 compression, and the default or legacy partitioner.
+  Kafka errors that clear up by themselves (a partition leader moving, a request timeout) are retried by resending
+  the whole request, so a message is written at least once and never dropped silently.
 - **Consumer.** Output as a UTF-8 string, a Buffer or parsed JSON. Subscribe to a list of topics or to a regular
   expression. The group ID stays the same across restarts. Commit automatically or manually. Control messages
   `pause`, `resume`, `stop`, `start`, `restart`, `seek` and `commit` steer the consumer.
@@ -98,11 +99,11 @@ The design notes behind these decisions are in [docs/ARCHITECTURE.md](docs/ARCHI
 | | |
 |---|---|
 | Node.js | 18.5 or newer. CI runs Node.js 18, 20, 22 and 24. |
-| Node-RED | 3.0 or newer. Tested with 3.1, 4.1 and 5.0 (Node-RED 5 itself needs Node.js 22.9 or newer). |
+| Node-RED | 3.1 or newer. Tested with 3.1, 4.1 and 5.0 (Node-RED 5 itself needs Node.js 22.9 or newer). Node-RED 3.0 is not supported: it gives the nodes inside a subflow a new id on every start, which would change their default queue directory and consumer group each time. |
 | Kafka | Any broker KafkaJS 2.2.4 can talk to (KafkaJS states Kafka 0.10+). The end-to-end tests run against Apache Kafka 3.9.1 in KRaft mode. Kafka-compatible services such as Redpanda, Confluent Cloud, Amazon MSK or the Azure Event Hubs Kafka endpoint can work too; see the [recipes](#cloud-services). |
 | Authentication | None, SASL/PLAIN, SASL/SCRAM-SHA-256, SASL/SCRAM-SHA-512, mutual TLS. **Not supported:** OAUTHBEARER, AWS IAM (MSK IAM authentication), Kerberos/GSSAPI. |
 | Compression | gzip, snappy and lz4, for both producing and consuming. **zstd is not supported.** |
-| Not included | Transactions / exactly-once, schema registry (Avro/Protobuf: consume as a Buffer and decode in a function node), IPv6 literal broker addresses (use a host name). |
+| Not included | Transactions / exactly-once, the idempotent producer (see [Retries](#acknowledgements-retries-and-compression)), schema registry (Avro/Protobuf: consume as a Buffer and decode in a function node), IPv6 literal broker addresses (use a host name). |
 
 ## Installation
 
@@ -200,7 +201,7 @@ The editor has three tabs. The *Property* column is the name in the flow JSON.
 | Tab | Setting | Property | Default | Description |
 |---|---|---|---|---|
 | – | Name | `name` | | Label shown in the editor. |
-| Connection | Brokers | `brokers` | `localhost:9092` | `host:port` list, separated by commas or spaces. Port 9092 is used when none is given. Prefixes such as `PLAINTEXT://`, `SSL://`, `SASL_SSL://` or `SASL_PLAINTEXT://` are accepted and ignored: security is set on the *Security* tab. IPv6 literals are not supported by kafkajs. |
+| Connection | Brokers | `brokers` | `localhost:9092` | `host:port` list, separated by commas, semicolons or spaces. Port 9092 is used when none is given. Prefixes such as `PLAINTEXT://`, `SSL://`, `SASL_SSL://` or `SASL_PLAINTEXT://` are accepted, but security is set on the *Security* tab: a prefix that contradicts it (for example `SASL_SSL://` with *Use TLS* off) logs a warning. Credentials (`user:password@host`) are refused here. IPv6 literals are not supported by kafkajs. |
 | Connection | Client ID | `clientId` | `node-red` | Sent with every request. Visible in broker logs and used for quotas. |
 | Security | Mechanism | `authMechanism` | `none` | `none`, `plain`, `scram-sha-256` or `scram-sha-512`. |
 | Security | Username / Password | credentials | | Both are required for SASL. They are stored encrypted in the credentials file, never in the flow. |
@@ -209,7 +210,7 @@ The editor has three tabs. The *Property* column is the name in the flow JSON.
 | Advanced | Connect | `connectionTimeout` | 10000 ms | Time to open the TCP/TLS connection (100 – 300000). |
 | Advanced | Authentication | `authenticationTimeout` | 10000 ms | Time for the SASL handshake (100 – 300000). |
 | Advanced | Request | `requestTimeout` | 30000 ms | Time to wait for each broker answer (1000 – 600000). |
-| Advanced | Retries | `retries` | 5 | How often kafkajs itself retries one operation (0 – 50). Keep this small, because the nodes reconnect on their own afterwards. |
+| Advanced | Retries | `retries` | 5 | How often kafkajs itself retries one operation, such as connecting (0 – 50). Keep this small, because the nodes reconnect on their own afterwards. Produce requests are not retried by kafkajs: the producer resends them itself (see [Retries](#acknowledgements-retries-and-compression)). |
 | Advanced | First retry after | `initialRetryTime` | 300 ms | First kafkajs retry delay (50 – 60000). |
 | Advanced | Longest retry wait | `maxRetryTime` | 30000 ms | Longest kafkajs retry delay (100 – 600000). |
 | Advanced | Reconnect: first wait | `reconnectMin` | 1000 ms | After a failed or lost connection, the node waits this long, then doubles the wait after each failure (±20 % jitter) (100 – 600000). |
@@ -236,7 +237,9 @@ docker run -e KAFKA_BROKERS=broker1:9093 -e KAFKA_USER=node-red -e KAFKA_PASSWOR
 
 If a variable used in Brokers, Username or Password is not set, the configuration is invalid
 (`environment variable KAFKA_PASSWORD is not set`). If one used in a numeric field is not set, the default is used and a
-warning is logged.
+warning is logged. A reference inside a longer value, such as `kafka-${REGION}:9092`, is never replaced by Node-RED;
+it is reported as `${REGION} is only replaced by Node-RED when it is the whole value`, and the editor marks it before
+you deploy.
 
 ### When the configuration is broken (for example credentials missing)
 
@@ -253,9 +256,12 @@ problem:
 - The **consumer** does not start. Control messages fail with the reason.
 - The **admin** node fails each message with the reason, which goes to your *catch* node.
 
-Other problems reported the same way: no brokers, an invalid `host:port`, an IPv6 literal, an unknown mechanism, an
-unset environment variable, a TLS configuration node that is missing or whose certificate/key files cannot be read.
-SASL/PLAIN without TLS is allowed but logs a warning, because the password then travels in clear text.
+Other problems reported the same way: no brokers, an invalid `host:port`, credentials written into a broker address,
+an IPv6 literal, an unknown mechanism, an unset environment variable, a TLS configuration node that is missing or
+whose certificate/key files cannot be read. A certificate, key or CA that the TLS library refuses (for example a key
+that does not belong to the certificate) shows `TLS: invalid cert, key or CA` and is retried slowly. SASL/PLAIN
+without TLS is allowed but logs a warning, because the password then travels in clear text, and so is a broker prefix
+that contradicts the security settings (`Brokers are given as SASL_SSL:// but "Use TLS" is off`).
 
 ### Recipes
 
@@ -311,10 +317,11 @@ for current host names and ports.
 | Amazon MSK, SASL/SCRAM | Bootstrap brokers on port 9096 | SCRAM-SHA-512 | User / password from AWS Secrets Manager | On, no TLS configuration |
 | Amazon MSK, mutual TLS | Bootstrap brokers on port 9094 | None | – | On, TLS configuration with your client certificate and key |
 
-A `SASL_SSL://` prefix copied from a provider's console is fine: it is ignored, but you still have to select the
-mechanism and turn on TLS. `$ConnectionString` is not an environment variable reference: Node-RED only treats
-`${NAME}` and `$(NAME)` that way. A recommended pattern is Brokers `${KAFKA_BROKERS}`, Username `${KAFKA_USER}` and
-Password `${KAFKA_PASSWORD}`, with the values kept outside the flow.
+A `SASL_SSL://` prefix copied from a provider's console is fine, but it does not configure anything: you still have
+to select the mechanism and turn on TLS (the broker node logs a warning when they do not match the prefix).
+`$ConnectionString` is not an environment variable reference: Node-RED only treats `${NAME}` and `$(NAME)` that
+way. A recommended pattern is Brokers `${KAFKA_BROKERS}`, Username `${KAFKA_USER}` and Password `${KAFKA_PASSWORD}`,
+with the values kept outside the flow.
 
 ## Producer
 
@@ -332,7 +339,7 @@ The producer sends `msg.payload` (or a batch in `msg.messages`) to Kafka and pas
 | `msg.headers` | object (or `Map`) | Kafka headers, `{ name: value }`. A value may be an array for a header that repeats. Only used when **Also send msg.headers** is ticked (the default). Static headers win on equal names. |
 | `msg.timestamp` | number (epoch ms), `Date`, or a string of digits | The Kafka timestamp. Defaults to the time the message reached the node, so messages sent later from the queue keep their original time. ISO date strings are rejected: use `Date.parse()` first. |
 | `msg.messages` | array | A batch: see [Batches](#batches-msgmessages). |
-| `msg.action` | string | A [control action](#control-actions) instead of a message. |
+| `msg.action` | string | `flush`, `reconnect`, `queue-status` or `queue-clear` make the message a [control action](#control-actions). Any other value is ordinary data: the message is sent. |
 
 **Precedence:** a Topic, Key or Partition set in the node is used for every message, and the matching `msg` property
 is ignored. Leave the field empty to take the value from the message. Headers are merged: `msg.headers` (if enabled)
@@ -381,8 +388,9 @@ return msg;
 
 #### Control actions
 
-Send a message whose `msg.action` is one of these exact strings. Any other `msg.action` value is sent to Kafka as a
-normal message.
+Send a message whose `msg.action` is one of these values. Upper or lower case and spaces around the value do not
+matter (`" Queue-Status"` works too). These four values are reserved: a message carrying one of them is never sent
+to Kafka. Any other `msg.action` value is ordinary data, and the message is sent to Kafka normally.
 
 | `msg.action` | What it does | Output |
 |---|---|---|
@@ -393,7 +401,8 @@ normal message.
 
 ### Output: delivery report
 
-The input message is sent on with `msg.kafka` added (an existing `msg.kafka` is replaced):
+The input message is sent on with `msg.kafka` added. An existing `msg.kafka` is replaced, including the one a consumer
+set: keep a copy if you commit manually after producing (see [Commit](#commit)).
 
 | Property | `sent` | `queued` | Meaning |
 |---|---|---|---|
@@ -408,6 +417,11 @@ The input message is sent on with `msg.kafka` added (an existing `msg.kafka` is 
 Messages that cannot be sent end with `done(err)`. A *catch* node then receives the original message with
 `msg.error`. This happens for a missing or invalid topic, an `undefined` payload, a partition that does not exist, a
 message too large for the broker, a full queue with *Reject new messages*, or Kafka unreachable with the queue off.
+
+A partition counts as missing only when the producer's connection is less than 10 s old, so that its list of the
+topic's partitions is current. kafkajs keeps that list for up to 5 minutes: after partitions were added, a message for
+a new partition may not be written at first. The producer then reconnects, which fetches the current list, and sends
+that message again.
 
 ### Settings
 
@@ -425,7 +439,6 @@ message too large for the broker, a full queue with *Reject new messages*, or Ka
 | Delivery | Compression | `compression` | `none` | `none`, `gzip`, `snappy` or `lz4`. |
 | Delivery | Partitioner | `partitioner` | `default` | `default` (same key-to-partition mapping as the Java client) or `legacy` (kafkajs 1.x mapping). |
 | Delivery | Batch size | `batchSize` | 100 | At most this many messages per produce request (1 – 10000). Used both for messages that pile up while a request is in flight and for sending the queue. |
-| Delivery | Idempotent producer | `idempotent` | off | See below. Forces acks `all`. |
 | Delivery | Let the broker create missing topics | `allowAutoTopicCreation` | on | Only has an effect if the broker allows it (`auto.create.topics.enable`). |
 | Offline queue | Offline queue | `queueMode` | `disk` | `disk`, `memory` or `off`. See [Offline queue](#offline-queue-store-and-forward). |
 | Offline queue | Directory | `queueDir` | empty | Empty: `kafkajsNcProducerQueueDir` from `settings.js`, else `kafkajs-nc-queue`. Relative paths are relative to the Node-RED user directory. Disk mode only. |
@@ -436,24 +449,36 @@ message too large for the broker, a full queue with *Reject new messages*, or Ka
 | Offline queue | Expire after | `queueMaxAgeHours` | 0 | Queued messages older than this many hours are moved to the dead-letter file instead of being sent. 0 = never. |
 | Offline queue | Sync every write to disk | `queueFsync` | on | A message is only reported `queued` once it is on disk, even if the power fails. Disk mode only. |
 
-Any setting can be `${NAME}`. If a variable used in *Topic*, *Key* or *Partition* is not set, every message fails
-with a clear error, so nothing is sent to an unintended topic. In *Directory* or *Queue name*, an unset variable
-makes the offline queue unavailable (logged at deploy). In the other settings it falls back to the default.
+Any setting can be `${NAME}`; Node-RED only replaces it when it is the whole field. If a variable used in *Topic*,
+*Key*, *Partition* or the static headers is not set, every message fails with a clear error, so nothing is sent to an
+unintended topic. In *Directory* or *Queue name*, an unset variable, or a `${NAME}` inside a longer path such as
+`${HOME}/queues`, makes the offline queue unavailable (logged at deploy) instead of creating a directory with that
+literal name. In *Acknowledgement*, *Compression* and *Offline queue* a warning is logged and the default is used; in
+the other settings the default is used.
 
-### Acknowledgements, idempotence and compression
+Flows saved by a development version before 1.0 may still contain `idempotent: true`. The option no longer exists:
+it is ignored, and the node logs one warning at deploy (see [Retries](#acknowledgements-retries-and-compression) for
+why).
+
+### Acknowledgements, retries and compression
 
 - **acks.** `all` is the safe default: Kafka confirms only after every in-sync replica has the message. `leader` is
   faster but can lose a message if the leader fails right after answering. `none` never waits for an answer, so the
   report says `sent` as soon as the request went out, and `msg.kafka.results` is empty.
-- **Idempotent producer.** This uses kafkajs' idempotent mode with one request in flight and acks `all`. It removes
-  duplicates caused by kafkajs' own retries within one connection, but not those caused by a reconnect (see
-  [Delivery guarantees](#ordering-and-delivery-guarantees)). It needs *Retries* of at least 1 in the broker node:
-  with 0, kafkajs refuses to create the producer and the node shows `config error · retry 60s` (the log says
-  `Idempotent producer must allow retries to protect against transient errors`). kafkajs logs
-  `Limiting retries for the idempotent producer may invalidate EoS guarantees` when it is enabled. This is expected:
-  the kafkajs retries are deliberately limited, because the node reconnects by itself.
-- **Compression.** gzip is built into kafkajs. Snappy (through kafkajs-snappy) and LZ4 (through lz4js) are registered
-  by this palette automatically, and both are pure JavaScript. The end-to-end tests check that Kafka's own Java
+- **Retries.** Kafka errors that usually clear up within a second or two (a partition leader moving during a broker
+  restart or a leader rebalance, `NOT_ENOUGH_REPLICAS`, a request timeout) are retried by the node: it sends the
+  **whole** request again, up to 3 times, after pauses of about 0.2, 0.6 and 1.6 s (logged at debug level). If it
+  still fails, the messages go to the offline queue (or fail with `done(err)` with the queue off) and the node
+  reconnects. kafkajs' own produce retry is switched off: in kafkajs 2.2.4 a retried request can report success
+  without having written the messages for partitions whose leader moved to a broker that had already answered, and
+  nothing reports the loss. Resending the whole request can only cause a duplicate, never a silent loss. The broker
+  node's *Retries* setting still applies to connecting.
+- **No idempotent producer.** kafkajs' idempotent mode only works with its own produce retry switched on, which is
+  exactly the retry that can lose messages, so this palette does not offer it. Earlier development versions had an
+  *Idempotent producer* option; a flow that still sets it loads normally, the option is ignored, and a warning says
+  so. De-duplicate on the consuming side instead (see below).
+- **Compression.** gzip is built into kafkajs. Snappy (through kafkajs-snappy) and LZ4 (compressed through lz4js,
+  decompressed by this palette's own bounded decoder) are registered automatically, and both are pure JavaScript. The end-to-end tests check that Kafka's own Java
   consumer can read all three. zstd is not available.
 
 ### Ordering and delivery guarantees
@@ -464,10 +489,10 @@ makes the offline queue unavailable (logged at deploy). In the other settings it
   carries only one topic, so the order across topics is kept as well. Separate producer nodes are independent of each
   other.
 - **At least once.** `sent` means Kafka acknowledged the message. `queued` means it is stored (on disk when
-  *Sync every write* is on). If the connection breaks after Kafka wrote a message but before its answer arrived, the
-  message is sent again later, so in rare cases a consumer sees a **duplicate**. Messages are never dropped silently,
-  except by the queue limits and expiry you configure. Consumers that must not process a message twice should
-  de-duplicate, for example with a unique id in a header.
+  *Sync every write* is on). If the connection breaks after Kafka wrote a message but before its answer arrived, or a
+  retried request had partly been written, the messages are sent again, so in rare cases a consumer sees a
+  **duplicate**. Messages are never dropped silently, except by the queue limits and expiry you configure. Consumers
+  that must not process a message twice should de-duplicate, for example with a unique id in a header.
 
 ### Things to watch out for
 
@@ -478,8 +503,9 @@ makes the offline queue unavailable (logged at deploy). In the other settings it
   msg.headers*, or delete `msg.headers`, unless you want them as Kafka headers.
 - **Right after a deploy**, until the first connection is up, messages are queued (with the queue on). Their report
   says `queued`, and they are sent a moment later. With *Offline queue: Off* they fail with `done(err)` instead.
-- **An idle producer does not notice an outage** until it sends again: it shows `connected` until then. The next
-  message is retried by kafkajs first, so its `queued` report and the yellow status can take a few seconds.
+- **An idle producer does not notice an outage** until it sends again: it shows `connected` until then. kafkajs
+  first tries to reach the broker again for the next message (the broker node's *Retries*), so its `queued` report
+  and the yellow status can take a few seconds.
 
 ## Offline queue (store-and-forward)
 
@@ -507,8 +533,9 @@ format and recovery procedures, is in [docs/OFFLINE-QUEUE.md](docs/OFFLINE-QUEUE
 3. **Backlog:** while Kafka is not connected, every message is appended to the queue, the report `queued` is sent and
    the message is done. This also covers the time right after a deploy, an authentication problem and a broken broker
    configuration.
-4. When a live send fails because of the connection (broker down, timeout, network), the failed messages and every
-   message waiting behind them move to the queue, in order, and the node reconnects.
+4. When a live send fails because of the connection (broker down, timeout, network), or a Kafka error that usually
+   clears up by itself is still there after [3 retries](#acknowledgements-retries-and-compression), the failed
+   messages and every message waiting behind them move to the queue, in order, and the node reconnects.
 5. When Kafka is slow (a request has been in flight for more than 3 s) or more than 10000 messages wait in memory, new
    messages go to the queue, so they are safe on disk instead of piling up in memory.
 6. After the reconnect, the queue is sent oldest-first, in batches of *Batch size*, one topic per request. Messages
@@ -524,7 +551,7 @@ format and recovery procedures, is in [docs/OFFLINE-QUEUE.md](docs/OFFLINE-QUEUE
 | While Kafka is unreachable | Messages appended to files | Messages kept in memory | Each message fails with `done(err)` |
 | Survives a redeploy / restart / reboot | Yes | No (a warning says how many were discarded) | – |
 | Limits, overflow, expiry | Yes | Yes | – |
-| Dead letters | `dead-letter.jsonl` | Counted and logged. The last 100 are kept in memory only. | – |
+| Dead letters | `dead-letter.jsonl` | Counted and logged. The last 100 are kept in memory: `queue-status` returns them in `msg.payload.deadLetters`. Lost on restart. | – |
 | Use it for | Data you cannot afford to lose | Short outages, read-only file systems, sensitive data that must not touch the disk | Callers that handle failures themselves (*catch* node) |
 
 ### Where the files live
@@ -553,7 +580,7 @@ module.exports = {
 |---|---|
 | `seg-<16 digits>.jsonl` | The queued messages, one JSON object per line, in segments of about 4 MB. A segment is deleted once everything in it has been sent. |
 | `cursor.json` | How far the queue has been sent. Replaced atomically. |
-| `dead-letter.jsonl` | Messages that could not be delivered (see below). Rotated to `dead-letter.1.jsonl` at 50 MB, replacing the previous `.1` file. |
+| `dead-letter.jsonl` | Messages that could not be delivered (see below). Rotated to `dead-letter.1.jsonl` at 50 MB, replacing the previous `.1` file; a warning says how many bytes of older dead letters that deleted. |
 
 When the queue is empty, the segment and cursor files are deleted. The dead-letter file stays.
 
@@ -610,12 +637,13 @@ outputs:
 | `droppedTotal` | Messages removed by *Drop the oldest* since the node started. |
 | `deadLettered` | Messages moved to the dead-letter file since the node started. |
 | `oldestTs` | When the oldest queued message arrived (epoch ms), when known. |
-| `state` | Connection state: `connecting`, `connected`, `waiting` (to reconnect) or `stopped` (no broker / invalid configuration). |
+| `state` | Connection state: `idle` (starting, the queue is not open yet), `connecting`, `connected`, `waiting` (to reconnect), `stopped` (no broker / invalid configuration) or `closing`. |
 | `mode` | `live` (sending directly) or `backlog` (going through the queue). |
 | `queueMode` | `disk`, `memory`, or `off` (also when the queue could not be opened). |
 | `queueDir` | The queue directory (disk mode), else `null`. |
 | `pending` | Messages waiting in memory: behind the request in flight (live mode), or for the queue to open. |
 | `queueError`, `lastError` | Only present after a problem: why the queue could not be opened; the last connection error. |
+| `deadLetters` | Memory mode only: the last 100 dead letters, oldest first, each `{ ts, error, record }` like a line of [`dead-letter.jsonl`](#dead-letter-file). They exist nowhere else and are lost on restart. |
 
 A *switch* node on `msg.payload.size` can then raise an alarm, for example when more than 10000 messages are waiting
 or `oldestTs` is more than an hour old.
@@ -624,10 +652,11 @@ or `oldestTs` is more than an hour old.
 
 | Event | `disk` | `memory` |
 |---|---|---|
-| Redeploy, or Node-RED stopped normally | The node waits up to 5 s for a request in flight, then writes everything not yet sent to the queue (`Stored N unsent message(s) in the offline queue while closing`). The new instance sends it first. | Queued messages are discarded with a warning. Messages still waiting in memory fail with `done(err)`. |
+| Redeploy, or Node-RED stopped normally | The node waits up to 5 s for a request in flight, then writes everything not yet sent to the queue (`Stored N unsent message(s) in the offline queue while closing`; if some could not be stored or are still being written to a slow disk, the warning `Closing: X unsent message(s) stored in the offline queue, Y could not be stored ..., Z still being written` says so). The new instance waits until the old one has really closed the queue, then sends it first. On a very slow disk it starts without the queue after 12 s and opens it as soon as the old instance is done; it never writes the directory at the same time. | Queued messages are discarded with a warning. Messages still waiting in memory fail with `done(err)`. |
 | Node-RED crashes or is killed (`kill -9`) | Messages reported `queued` are safe. A few already-sent messages may be sent again (duplicates). Messages that had not yet received a report may be lost, as in any Node-RED flow. | Everything waiting is lost. |
 | Power loss | With *Sync every write to disk* on (default), every message reported `queued` is safe. With it off, the last messages written may be lost. | Everything waiting is lost. |
 | Node deleted | The files stay on disk. A warning names the directory if messages were left. | Lost. |
+| *Directory* or *Queue name* changed, or the queue turned off | The messages stay in the old directory and are not sent. A warning names it (`N unsent message(s) are left in the offline queue <dir>, which this node no longer uses ...`); set the old values again to send them. | Lost. |
 | Node copied or imported | The copy gets a new id and so a new, empty queue. The old directory is not sent. | – |
 
 A half-written last line from a crash is removed when the queue is opened again. That message had not been reported
@@ -639,8 +668,11 @@ as queued.
   and importing it again. Two producers must never use the same queue name: the second one logs an error, shows
   `connected · queue unavailable` and runs without a queue. A copy of a node keeps its Queue name, so give the copy
   a name of its own.
-- **Orphaned queue.** If a node lost its queue because it got a new id, set its Queue name to the old directory's
-  name (the old node id). The messages are then sent on the next deploy.
+- **Orphaned queue.** About 10 s after a disk queue opens, the producer looks at the other directories next to its
+  own and warns once about those that hold messages no running producer uses (`Found N offline queue(s) under
+  <directory> with unsent messages that no running producer uses: <name> (<size>), ...`). If a node lost its queue
+  because it got a new id, set its Queue name to the old directory's name (the old node id). The messages are then
+  sent on the next deploy. Otherwise delete the directory.
 - **One Node-RED per directory.** The lock that prevents two producers from sharing a directory only works inside one
   Node-RED process. Never point two Node-RED instances at the same queue directory, for example on a shared network
   drive. Use a local disk.
@@ -667,7 +699,7 @@ The consumer subscribes to topics as a member of a consumer group and sends one 
 | `msg.offset` | string | The offset. A string, because offsets can exceed JavaScript's safe integers. |
 | `msg.timestamp` | number | Kafka timestamp in ms since the epoch. |
 | `msg.headers` | object | `{ name: value }`. Values are strings (or Buffers with *Header values: Buffers*). A repeated header is an array, and a header without a value is `null`. |
-| `msg.kafka` | object | `{ groupId, topic, partition, offset, timestamp, highWatermark }`. `highWatermark` (string) is the offset after the last message in the partition when the batch was fetched, so `highWatermark - offset - 1` is roughly the lag. Keep `msg.kafka` if you commit manually. |
+| `msg.kafka` | object | `{ groupId, topic, partition, offset, timestamp, highWatermark }`. `highWatermark` (string) is the offset after the last message in the partition when the batch was fetched, so `highWatermark - offset - 1` is roughly the lag. Keep `msg.kafka` if you commit manually: a producer node replaces it with its delivery report. |
 
 **Formats.** *UTF-8 string* (default). *Buffer*, which keeps binary data such as Avro or Protobuf intact; each Buffer
 is a private copy. *Parsed JSON*: a value that is not valid JSON is not sent. Instead a *catch* node receives it with
@@ -687,16 +719,21 @@ strings or Buffers.
   read. Give two nodes different group IDs if both should receive every message. If empty, the group ID is
   `node-red-<node id>`. It stays the same across restarts and deploys, so the node continues where it stopped.
   Copying or importing the node creates a new id and therefore a new group: set a Group ID if the position must
-  survive that.
+  survive that. Inside a subflow the node id is `<subflow instance id>-<node id>`, so each instance of the subflow
+  has a group of its own, which also stays the same across restarts.
 - **Read from the beginning when the group has no stored position** (`fromBeginning`) only matters for a group without
   a committed offset for a partition, typically a new group. It then starts with the oldest message instead of only new
   ones. It does **not** rewind an existing group: use `seek`, or the admin action `resetOffsets` while the consumer is
   stopped.
 - **Start consuming on deploy** (`autoStart`, default on): untick it to start the node in the `stopped` state, waiting
   for `msg.action = "start"`.
-- A topic that does not exist yet is retried with the normal backoff (status `unknown topic/partition · retry …`), and
-  consuming starts at the first retry after the topic was created: at most *Reconnect: longest wait* (60 s by
-  default) later. By default the consumer does not create topics itself.
+- A topic that does not exist yet is retried with the normal backoff (status `unknown topic/partition · retry …`, and
+  a warning rather than an error in the log, since it is often created a moment later), and consuming starts at the
+  first retry after the topic was created: at most *Reconnect: longest wait* (60 s by default) later. By default the
+  consumer does not create topics itself.
+- A regular expression that matches no topic, or a member of a group whose partitions all went to other members,
+  shows the yellow status `connected · no partitions` instead of a green one. With a regular expression a warning is
+  logged too.
 
 ### Commit modes and delivery guarantees
 
@@ -705,7 +742,7 @@ stored decides what happens when Node-RED stops while records are being processe
 
 | Mode | When the position is stored | If Node-RED crashes | Use it for |
 |---|---|---|---|
-| **Automatically** (default) | Every *Every* ms (default 5000; 0 = only at the end of each batch), every *Or every* records (0 = off), and at the end of each fetched batch, as soon as the record was handed to the flow | Records handed to the flow but not finished are **not** delivered again (at most once into your processing). Records handed over since the last commit are delivered again. | Telemetry, dashboards, anything where an occasional gap is fine |
+| **Automatically** (default) | Every *Every* ms (default 5000; 0 = only at the end of each batch), every *Or every* records (0 = off), and at the end of each fetched batch, as soon as the record was handed to the flow | Records handed to the flow since the last stored position (at most the last fetched batch) are delivered **again** (at least once, with possible duplicates). The position does not wait for your flow, so a record that was still being processed when its position was stored is **not** delivered again. | Telemetry, dashboards, anything where an occasional gap or duplicate is fine |
 | **Manually** | Only when you send `msg.action = "commit"` with the record's `msg.kafka` | Every record not committed is delivered again after a restart, reconnect or rebalance (**at least once**) | Processing that must not lose records. Make it tolerate duplicates. |
 
 The committed position is the record's offset + 1. Committing a record also commits every earlier record of the same
@@ -725,8 +762,8 @@ to the output.
 | `stop` | – | Leave the group and disconnect. The node does not reconnect until `start`. Status `stopped`. |
 | `start` | – | Start a stopped consumer. Does nothing if it is already running. |
 | `restart` | – | Disconnect and connect again now, which also picks up new topics that match a regular expression. |
-| `seek` | `msg.payload = { topic, partition, offset }` | Continue reading a partition from another offset. `topic` may be left out when the node subscribes to a single topic. `offset` is a number, a string of digits, `"earliest"` or `"latest"`. Only works while connected, for a partition assigned to this consumer. |
-| `commit` | `msg.kafka = { topic, partition, offset }` | Store the position after this record (manual mode). Uses `msg.topic`, `msg.partition` and `msg.offset` when `msg.kafka` is missing. |
+| `seek` | `msg.payload = { topic, partition, offset }` | Continue reading a partition from another offset. `topic` may be left out when the node subscribes to a single topic. `offset` is a number, a string of digits, `"earliest"` (the oldest record still stored) or `"latest"` (only new records). See [Seek](#seek). |
+| `commit` | `msg.kafka = { groupId, topic, partition, offset }` | Store the position after this record (manual mode). `msg.kafka` must be the one this consumer set on its output. Uses `msg.topic`, `msg.partition` and `msg.offset` when `msg.kafka` is missing. See [Commit](#commit). |
 
 Examples, each in a *function* node wired to the consumer's input:
 
@@ -744,6 +781,44 @@ return msg;
 A typical at-least-once flow: consumer (Commit: *Manually*) → your processing → a *change* node that sets
 `msg.action` to `commit` → a *link out* back to the consumer's input. A *catch* node on the processing step can log
 failures: the uncommitted record is delivered again after the next restart.
+
+#### Seek
+
+Before seeking, the consumer looks up the partition's current offsets with a short admin connection (at most 15 s):
+
+- `"earliest"` (also `"beginning"`) becomes the partition's oldest stored offset and `"latest"` (also `"end"`) its
+  end. kafkajs itself would treat those names as "no position" and apply *Read from the beginning* instead.
+- A number outside the partition's offsets is refused (`seek: offset N is outside the offsets of orders[0] (low to
+  high); ...`): Kafka would otherwise jump to its default position and store it, even in manual mode, silently
+  replacing the position your flow committed.
+- A seek only works while the consumer is connected and not rebalancing, for a partition assigned to this member of
+  the group; the error lists the assigned partitions.
+
+With *Commit: Automatically* the new position is stored right away; with *Manually* only when you commit.
+
+#### Commit
+
+`msg.kafka` must be the one this consumer set on its output message. A commit is refused when its `groupId` is not
+this consumer's group or its topic is not one the consumer subscribes to, and fields are never mixed between
+`msg.kafka` and `msg`. This matters when the processing includes a **producer node**: the producer replaces
+`msg.kafka` with its delivery report (the topic, partition and offset it wrote to), and committing that would store a
+position for the wrong topic. Keep a copy before the producer and put it back before the commit:
+
+```js
+// function node before the producer
+msg.consumed = msg.kafka;
+return msg;
+```
+
+```js
+// function node after the producer, wired back to the consumer's input
+msg.kafka = msg.consumed;
+msg.action = "commit";
+return msg;
+```
+
+A commit fails (`Commit not stored: the Kafka consumer was stopping. ...`) when the consumer stopped or restarted
+before Kafka stored the position. The records after the last stored position are then delivered again.
 
 ### Back-pressure with pause and resume
 
@@ -807,11 +882,19 @@ wins. The parameters come from `msg.payload`.
 |---|---|---|---|
 | Broker | `broker` | | The broker configuration node (required). |
 | Action | `action` | empty | One of the actions below, used for every message. Empty (*set by msg.action*): take it from `msg.action`. |
-| Timeout | `timeout` | 30000 ms | Limit for each message, connecting included (100 – 600000). |
+| Timeout | `timeout` | 30000 ms | Limit for each message, counted from its arrival: waiting behind earlier messages and connecting are included (100 – 600000). `setOffsets` and `resetOffsets` always get at least 15 s. |
 | Name | `name` | | Label shown in the editor. |
 
 - The node connects on the first message and then stays connected. Messages are handled one after another, in
-  arrival order.
+  arrival order. At most 1000 messages wait; further ones fail at once (`Kafka admin X not run: 1000 messages are
+  already waiting (is Kafka reachable?)`), so a polling flow cannot pile up stale requests during an outage.
+- The *Timeout* counts from the moment a message arrives. A message that waited behind slow ones only gets the rest
+  of it, and the error says how long it waited (`Kafka admin X timed out after 30000ms (12s of it waiting behind
+  earlier messages)`).
+- After a failed connection attempt, the following messages fail at once (`Kafka admin X not run: the last connection
+  attempt failed (<reason>); the next message after 2s connects again`) until the broker node's reconnect wait has
+  passed (at least *After auth/config errors* for authentication and configuration problems). Then the next message
+  connects again.
 - The result is put in `msg.payload`, and `msg.kafka = { action, durationMs }` is added. The rest of the message is
   passed through. Actions without a result output `true`.
 - If an action fails, `done(err)` sends the original message to *catch* nodes, and the next message is processed
@@ -827,10 +910,10 @@ wins. The parameters come from `msg.payload`.
 | `createPartitions` | `{ "topicPartitions": [ { "topic": "orders", "count": 6 } ] }` or `{ "topic": "orders", "count": 6 }`. `count` is the new total; partitions can never be removed. Optional: `validateOnly`, `timeout`. | `true` |
 | `fetchTopicMetadata` | Optional topic name(s) or `{ "topics": [...] }`; none = all topics | `{ topics: [ { name, partitions: [ { partitionId, leader, replicas, isr, ... } ] } ] }` |
 | `fetchTopicOffsets` | `"orders"` or `{ "topic": "orders" }` | `[ { partition, offset, high, low } ]` (offsets as strings) |
-| `fetchTopicOffsetsByTimestamp` | `{ "topic": "orders", "timestamp": 1793188800000 }`. A `Date` or an ISO date string works too. | `[ { partition, offset } ]`: the first offset at or after that time |
+| `fetchTopicOffsetsByTimestamp` | `{ "topic": "orders", "timestamp": 1793188800000 }`. A `Date` or an ISO date string (`"2026-10-28T12:00:00Z"`) works too; negative times and other text are refused. | `[ { partition, offset } ]`: the first offset at or after that time |
 | `fetchOffsets` | `"my-group"` or `{ "groupId": "my-group", "topics": ["orders"] }` (topics optional). Optional: `resolveOffsets`. | `[ { topic, partitions: [ { partition, offset, metadata } ] } ]` |
-| `resetOffsets` | `{ "groupId": "my-group", "topic": "orders", "earliest": true }`. Without `earliest: true`, the group moves to the **latest** offset. | `true` |
-| `setOffsets` | `{ "groupId": "my-group", "topic": "orders", "partitions": [ { "partition": 0, "offset": "42" } ] }` | `true` |
+| `resetOffsets` | `{ "groupId": "my-group", "topic": "orders", "earliest": true }`. Without `earliest: true`, the group moves to the **latest** offset. The node looks up the partitions' oldest or end offsets and stores those numbers. | `true` |
+| `setOffsets` | `{ "groupId": "my-group", "topic": "orders", "partitions": [ { "partition": 0, "offset": "42" } ] }`. Offsets are whole numbers (number or string) between the partition's oldest and end offset (see `fetchTopicOffsets`); a partition must exist and be listed once. | `true` |
 | `listGroups` | – | `{ groups: [ { groupId, protocolType } ] }` |
 | `describeGroups` | `"my-group"`, `["a", "b"]` or `{ "groupIds": [...] }` | `{ groups: [ { groupId, state, protocol, protocolType, members, errorCode } ] }` |
 | `deleteGroups` | `"my-group"`, `["a", "b"]` or `{ "groupIds": [...] }` | `[ { groupId, errorCode } ]` |
@@ -838,7 +921,14 @@ wins. The parameters come from `msg.payload`.
 | `describeConfigs` | `{ "resources": [ { "type": "TOPIC", "name": "orders", "configNames": ["retention.ms"] } ] }` or `{ "type": "BROKER", "name": "1" }`. `type` is `TOPIC`, `BROKER` or `BROKER_LOGGER`. Optional: `configNames`, `includeSynonyms`. | `{ resources: [ { resourceType, resourceName, configEntries: [ { configName, configValue, ... } ], errorCode, errorMessage } ] }` |
 
 `resetOffsets`, `setOffsets` and `deleteGroups` only work while the group has no running members. Stop the consumers
-first (for example with `msg.action = "stop"`).
+first (for example with `msg.action = "stop"`). `resetOffsets` stores real offsets, so the group's consumers start
+exactly there, whatever their *Read from the beginning* setting (kafkajs' own `resetOffsets` would store a marker
+that leaves the choice to that setting). Both actions take about 5 s, because kafkajs joins the group briefly to
+change its offsets.
+
+`createTopics` also takes `replicaAssignment: [{ partition, replicas: [brokerId, ...] }]` per topic, and
+`createPartitions` takes `assignments: [[brokerId, ...], ...]` (one array per new partition). Values of the wrong
+shape are refused rather than ignored.
 
 Example: create a topic from a *function* node in front of an admin node whose Action is *set by msg.action*:
 
@@ -851,10 +941,11 @@ return msg;
 ## Status reference
 
 Statuses use the usual Node-RED colours. Green means it works, yellow means waiting or retrying by itself, red means a
-person has to fix something, and grey means idle. `· retry 8s` shows when the next connection attempt is due. Long
-reasons are shortened with `…` to fit the status line (the producer keeps 24 characters of a red reason, so
-`TLS: untrusted cert (CA?)` appears there as `TLS: untrusted cert (CA…`); the log always has the full text. The
-broker configuration node has no status of its own: its problems appear on the nodes that use it.
+person has to fix something, and grey means idle. `· retry 8s` shows when the next connection attempt is due. A
+status shows at most 48 characters: the reason gets whatever the suffixes (`· 3 queued`, `· retry 8s`) leave, so the
+usual reasons fit whole (`TLS: untrusted cert (CA?) · retry 60s`); a longer one is shortened with `…`, and the log
+always has the full text. The broker configuration node has no status of its own: its problems appear on the nodes
+that use it.
 
 ### Producer
 
@@ -868,6 +959,7 @@ broker configuration node has no status of its own: its problems appear on the n
 | `ECONNREFUSED broker:9092 · retry 8s` (yellow) | Same, with an empty queue, showing the reason. Other reasons: `broker unreachable (DNS)`, `connection timeout`, `request timeout`, `connection closed`, `TLS handshake failed`, `unknown topic/partition`. | See the [FAQ](#troubleshooting-faq). |
 | `auth failed · retry 60s` (red) | User name or password rejected. | Fix the credentials and deploy. |
 | `TLS: self-signed cert · retry 60s`, `TLS: untrusted cert (CA?)`, `TLS: hostname mismatch`, `TLS: cert expired` (red) | The broker's certificate is not trusted. | Add the CA in a TLS configuration node, or set the server name. |
+| `TLS: invalid cert, key or CA · retry 60s` (red) | The TLS configuration node's certificate, key or CA cannot be used (for example a key that does not belong to the certificate). | Check the files of the TLS configuration node. |
 | `not authorized (topic) · 1 queued · retry 60s` (red) | The user lacks rights (ACLs). Others: `SASL mechanism unsupported`, `SASL not expected by listener`, `broker version unsupported`. | Fix the ACLs or the configuration. |
 | `config error · 3 queued` (red) | The broker configuration is invalid (see the log). Messages are queued. | Fix it and deploy. |
 | `no broker config` (red) | No broker selected. Messages are queued. | Select a broker. |
@@ -879,13 +971,15 @@ broker configuration node has no status of its own: its problems appear on the n
 |---|---|---|
 | `starting` (grey), `connecting…`, `joining group…` (yellow) | Starting. | Nothing. |
 | `connected · orders, payments` (green dot) | Consuming. | – |
+| `connected · no partitions` (yellow dot) | In the group, but no partition is assigned to this node: the regular expression matches no topic (a warning is logged), or other members of the group have all partitions. | Check the expression; create the topics and send `restart`. |
 | `paused · orders` (yellow dot) | Paused with `msg.action = "pause"`. | Send `resume`. |
 | `rebalancing…` (yellow) | The group is redistributing the partitions. | Nothing. |
 | `stopped` (grey) | Stopped with `stop`, or *Start consuming on deploy* is off. | Send `start`. |
 | `ECONNREFUSED broker:9092 · retry 8s` (yellow) | Kafka cannot be reached. Other reasons as for the producer. | Check the broker and the network. |
 | `unknown topic/partition · retry 2s` (yellow) | A subscribed topic does not exist (yet). Consuming starts at the first retry after it was created. | Create the topic, or check its name. |
+| `group coordinator not found · retry 2s` (yellow) | The group's coordinator is not available (brokers starting or recovering, the `__consumer_offsets` topic offline), or the user may not use the group: kafkajs reports both the same way. Retried with the normal backoff. | If it stays, grant `READ` on the consumer group and check the brokers. |
 | `auth failed · retry 60s` (red) | Credentials rejected. | Fix them and deploy. |
-| `not authorized (group) · retry 60s`, `group coordinator not found · retry 60s`, `not authorized (topic) · retry 60s` (red) | Missing ACLs for the group or the topic. | Grant read access to the topic and the group. |
+| `not authorized (group) · retry 60s`, `not authorized (topic) · retry 60s` (red) | Missing ACLs for the group or the topic. | Grant read access to the topic and the group. |
 | `compression codec missing · retry 60s` (red) | The topic contains zstd-compressed records. | Use another compression on the producing side. |
 | `config error`, `no topic`, `invalid topic regex`, `no broker config` (red) | The configuration is invalid (see the log). The node does not connect. | Fix it and deploy. |
 
@@ -897,11 +991,11 @@ broker configuration node has no status of its own: its problems appear on the n
 | `connecting…` (yellow) | Connecting for the first message, or after a failure. |
 | `running createTopics (+2 queued)` (blue) | Working; more messages wait. |
 | `ok · createTopics` (green) | The last action succeeded. |
-| `createTopics: <reason>`, `fetchOffsets timed out`, `auth failed` (red) | The last action failed. The same reason is in `msg.error` for *catch* nodes. |
-| `config error`, `no broker config`, `unknown action` (red) | Fix the configuration and deploy. |
+| `createTopics: <reason>`, `fetchOffsets timed out`, `auth failed` (red) | The last action failed. The same reason is in `msg.error` for *catch* nodes. The next message runs normally. |
+| `config error`, `no broker config`, `unknown action` (red, from the start) | Fix the configuration and deploy. `unknown action`: the node's *Action* setting names no action of this node. |
 
-A producer or consumer showing `internal error` (red), or an admin node showing `error` (red), hit an unexpected bug.
-Please [open an issue](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues) with the log.
+A node showing `internal error` (red) hit an unexpected bug. Please
+[open an issue](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues) with the log.
 
 ## Error handling & monitoring
 
@@ -915,8 +1009,11 @@ message with `msg.error.message` explaining what went wrong:
   unreachable with the queue off, a failed control action. Messages already reported `queued` are done. If they
   later turn out to be undeliverable, they go to the [dead-letter file](#dead-letter-file), not to *catch*.
 - **Consumer:** a record that is not valid JSON (*Parsed JSON* format), with the raw text in `msg.payload`; failed
-  control messages (unknown action, `seek` while not connected, an invalid offset, ...).
-- **Admin:** every failed action, including timeouts and invalid parameters.
+  control messages (unknown action, `seek` while not connected or for a partition not assigned to this member, an
+  offset outside the partition's offsets, a `commit` with a `msg.kafka` that is not this consumer's, a commit that
+  Kafka did not store, ...).
+- **Admin:** every failed action, including timeouts, invalid parameters, messages refused because 1000 were already
+  waiting, and messages failed at once after a failed connection attempt.
 
 Connection problems do not belong to a message, so they are **not** sent to *catch* nodes. Watch them with a *status*
 node and in the log.
@@ -933,9 +1030,10 @@ node has been yellow for more than five minutes.
 - **Node messages.** The first failure of an outage is logged as an error with the full cause chain, for example
   `Kafka connection failed: KafkaJSNumberOfRetriesExceeded: Connection error: connect ECONNREFUSED 127.0.0.1:9092 ←
   caused by KafkaJSConnectionError [ECONNREFUSED] — retrying in 1s`. Identical repeats are logged at debug level,
-  with a warning every 10th attempt. A different kind of failure is logged as an error again. On recovery the log says
-  `Connected to Kafka after N attempts`. The producer also logs queue events (messages kept from earlier, sent after
-  the reconnect, dropped, dead-lettered).
+  with a warning every 10th attempt. A different kind of failure is logged as an error again (a consumer's missing
+  topic only as a warning). On recovery the log says `Connected to Kafka after N attempts`. The producer also logs
+  queue events (messages kept from earlier, sent after the reconnect, dropped, dead-lettered, queues left behind) and,
+  at debug level, each time it sends a request again after a Kafka error.
 - **kafkajs messages** are written to the Node-RED log, labelled with the node they belong to:
   `[kafkajs:Connection] [kafkajs-nc-producer:my producer] ...`. The broker's *kafkajs log level* selects which ones:
   `off`, `error`, `warn` (default), `info` or `debug` (very verbose). kafkajs errors and warnings are logged as
@@ -947,13 +1045,18 @@ node has been yellow for more than five minutes.
 
 Node-RED stops completely on any unhandled promise rejection. These nodes handle their own errors. kafkajs, however,
 runs some internal operations in the background, and an error from one of those would be unhandled. The *Crash safety
-net* option of the broker node (on by default) adds one process-wide handler for unhandled rejections while at least
-one broker node uses it:
+net* option of the broker node (on by default) adds one process-wide handler for unhandled **promise rejections**
+while at least one broker node uses it, and for 30 s after the last one closed (client nodes may still be shutting
+down then). It does not handle uncaught exceptions.
 
 - A rejection that comes from kafkajs or from this palette is logged as a warning
-  (`[kafkajs-nc] Prevented a crash: ...`) instead of stopping Node-RED.
-- Any other rejection is left alone. If no one else handles it, Node-RED stops exactly as it would without this
-  palette, so bugs in other nodes are not hidden.
+  (`[kafkajs-nc] Prevented a crash: ...`) instead of stopping Node-RED. That means an error named `KafkaJS*` or
+  `KafkaNc*`, or one whose stack runs through the copy of kafkajs this palette loads or through this palette's own
+  files. kafkajs errors raised by another palette that also uses kafkajs cannot be told apart and are caught too.
+- Any other rejection is handed back to Node.js, which handles it exactly as it would without this palette: by
+  default Node-RED logs it and stops, so bugs in other nodes are not hidden.
+- With `node --unhandled-rejections=strict`, Node.js stops the process before any handler runs. The safety net is
+  then not installed, and a warning at startup says so.
 
 Turn it off only if you install your own handler for unhandled rejections.
 
@@ -998,8 +1101,14 @@ you can migrate one flow at a time. The main differences:
   Off*.
 
 The script [`scripts/migrate-flows.js`](scripts/migrate-flows.js) converts a `flows.json` file for you and reports
-what needs attention; [docs/MIGRATION.md](docs/MIGRATION.md) explains how to get and run it. To migrate a flow by
-hand instead:
+what needs attention. It comes with the package as the command `kafkajs-nc-migrate-flows`:
+
+```sh
+npx -p node-red-contrib-kafkajs-no-crash kafkajs-nc-migrate-flows ~/.node-red/flows.json   # writes flows.migrated.json
+```
+
+From a git checkout it is `node scripts/migrate-flows.js ~/.node-red/flows.json`. [docs/MIGRATION.md](docs/MIGRATION.md)
+explains the options (`--in-place`, `--credentials`), Docker, and the report. To migrate a flow by hand instead:
 
 1. Install this palette next to the old one and write down the old settings. Credentials are not exported with a
    flow, so have the SASL username and password at hand.
@@ -1053,6 +1162,14 @@ in a header.
 
 **`invalid Kafka topic name "sensors/temp"`.** Kafka topic names cannot contain `/`. Set the producer's Topic, or
 change `msg.topic` (for example replace `/` with `.`).
+
+**`commit: msg.kafka is not a message of this consumer (it has no groupId)`.** A producer node between the consumer
+and the commit replaced `msg.kafka` with its delivery report. Keep a copy of the consumer's `msg.kafka` before the
+producer and put it back before the commit (see [Commit](#commit)).
+
+**`group coordinator not found · retry …`.** Usually temporary: the brokers are starting or recovering. If it stays,
+the user is probably not allowed to use the consumer group (kafkajs reports a missing group ACL the same way): grant
+`READ` on the group.
 
 ## Development
 
@@ -1111,8 +1228,8 @@ Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.
 [MIT](LICENSE) © Deepanshu Patel
 
 - Built on [KafkaJS](https://github.com/tulios/kafkajs) (MIT), pinned at 2.2.4.
-- Snappy compression through [kafkajs-snappy](https://github.com/tulios/kafkajs-snappy) (MIT). LZ4 through
-  [lz4js](https://github.com/Benzinga/lz4js) (ISC).
+- Snappy compression through [kafkajs-snappy](https://github.com/tulios/kafkajs-snappy) (MIT). LZ4 compression
+  through [lz4js](https://github.com/Benzinga/lz4js) (ISC).
 - Inspired by [node-red-contrib-kafkajs](https://github.com/emrebekar/node-red-contrib-kafkajs) by Emre Bekar. This
   project is an independent rewrite and shares no code with it. Thank you for the original palette.
 - Not affiliated with the Apache Software Foundation. Apache Kafka is a trademark of the Apache Software Foundation.

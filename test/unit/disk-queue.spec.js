@@ -5,7 +5,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const { DiskQueue } = require('../../lib/disk-queue');
+const { DiskQueue, normalizeQueueOptions } = require('../../lib/disk-queue');
 const { tmpDir } = require('../helpers/common');
 const { runQueueContract, captureLogger, prng } = require('./queue-contract');
 
@@ -254,6 +254,15 @@ describe('DiskQueue', function () {
             await q.enqueue(rec(1));
             assert.ok(fs.statSync(path.join(dir, 'seg-0000000000000002.jsonl')).isFile());
             assert.deepEqual(ids(await q.peek()), [1]);
+        });
+
+        it('parses the fsync option like every node setting: "off", "no", "false" disable it (MAINT-12)', function () {
+            for (const off of [false, 'false', 'off', 'OFF', 'no', 0, '0']) {
+                assert.equal(normalizeQueueOptions({ fsync: off }).fsync, false, String(off));
+            }
+            for (const on of [undefined, null, true, 'on', 'yes', 'garbage', 1]) {
+                assert.equal(normalizeQueueOptions({ fsync: on }).fsync, true, String(on));
+            }
         });
 
         it('normalises odd option values instead of throwing', async function () {
@@ -609,6 +618,87 @@ describe('DiskQueue', function () {
             assert.deepEqual(segFiles(dir), ['seg-0000000000000002.jsonl'], 'leftover segment removed on open');
         });
 
+        /** Make deleting the segment files that match `re` fail with `code` until the returned restore() is called. */
+        function failUnlink(re, code, times = Infinity) {
+            const realUnlink = fs.promises.unlink;
+            let left = times;
+            fs.promises.unlink = async function (p) {
+                if (left > 0 && re.test(p)) {
+                    left--;
+                    throw Object.assign(new Error(`${code}: resource busy or locked, unlink '${p}'`), { code });
+                }
+                return realUnlink.apply(this, arguments);
+            };
+            return () => {
+                fs.promises.unlink = realUnlink;
+            };
+        }
+
+        it('does not send a drained queue again when an older segment could not be deleted (DUP-1)', async function () {
+            const dir = newQueueDir();
+            const { logger } = captureLogger();
+            const q = await openQueue(dir, { segmentMaxBytes: 2 * lineBytes(rec(1)), logger });
+            await q.enqueueMany(range(1, 6).map((i) => rec(i)));
+            assert.equal(segFiles(dir).length, 3);
+            const restore = failUnlink(/seg-0000000000000001\.jsonl$/, 'EBUSY', 1);
+            try {
+                assert.deepEqual(ids(await drain(q)), range(1, 6));
+            } finally {
+                restore();
+            }
+            assert.deepEqual(segFiles(dir), ['seg-0000000000000001.jsonl'], 'the first segment was left behind');
+            await q.close();
+            const { logs, logger: logger2 } = captureLogger();
+            const q2 = await openQueue(dir, { logger: logger2 });
+            assert.equal(q2.size, 0);
+            assert.deepEqual(ids(await q2.peek()), [], 'acknowledged records are not sent again');
+            assert.deepEqual(fs.readdirSync(dir), [], 'the leftover segment and the cursor are cleaned up');
+            assert.deepEqual(logs.warn, []);
+            await q2.enqueue(rec(7));
+            assert.deepEqual(ids(await q2.peek()), [7]);
+        });
+
+        it('a segment left behind is not forgotten when a later drain succeeds (DUP-1)', async function () {
+            const dir = newQueueDir();
+            const { logger } = captureLogger();
+            const q = await openQueue(dir, { segmentMaxBytes: 2 * lineBytes(rec(1)), logger });
+            await q.enqueueMany(range(1, 6).map((i) => rec(i)));
+            const restore = failUnlink(/seg-0000000000000001\.jsonl$/, 'EPERM', 1);
+            try {
+                await drain(q);
+            } finally {
+                restore();
+            }
+            await q.enqueueMany([rec(7), rec(8)]);
+            assert.deepEqual(ids(await drain(q)), [7, 8]);
+            assert.deepEqual(fs.readdirSync(dir), [], 'this drain also deleted the leftover segment');
+            await q.close();
+            const q2 = await openQueue(dir);
+            assert.deepEqual(ids(await q2.peek()), [], 'nothing is sent again after a restart');
+        });
+
+        it('keeps marking a leftover segment as consumed while it still cannot be deleted (DUP-1)', async function () {
+            const dir = newQueueDir();
+            const q = await openQueue(dir, { segmentMaxBytes: 2 * lineBytes(rec(1)), logger: captureLogger().logger });
+            await q.enqueueMany(range(1, 4).map((i) => rec(i)));
+            const restore = failUnlink(/seg-0000000000000001\.jsonl$/, 'EBUSY');
+            try {
+                await drain(q);
+                await q.close();
+                const q2 = await openQueue(dir, { logger: captureLogger().logger });
+                assert.deepEqual(ids(await q2.peek()), []);
+                await q2.enqueue(rec(5));
+                assert.deepEqual(ids(await drain(q2)), [5]);
+                await q2.close();
+            } finally {
+                restore();
+            }
+            assert.deepEqual(segFiles(dir), ['seg-0000000000000001.jsonl']);
+            const q3 = await openQueue(dir);
+            assert.deepEqual(ids(await q3.peek()), [], 'still not sent again');
+            assert.deepEqual(fs.readdirSync(dir), [], 'deleted once that is possible');
+        });
+
         it('survives real SIGKILL crashes during concurrent enqueue/ack traffic', async function () {
             // A child process enqueues (small concurrent bursts, or multi-MB batches that a SIGKILL can
             // tear mid-write) while a consumer peeks and acks; it reports every resolved enqueue and every
@@ -956,6 +1046,29 @@ describe('DiskQueue', function () {
             assert.match(odd.error.message, /boom/);
             assert.ok(!Number.isNaN(Date.parse(odd.ts)));
             assert.equal(q.size, 10, 'dead-lettering does not remove');
+        });
+
+        it('logs how much it deletes when a rotation replaces an older dead-letter.1.jsonl (DLQ-1)', async function () {
+            const dir = newQueueDir();
+            const { logs, logger } = captureLogger();
+            const q = await openQueue(dir, { deadLetterMaxBytes: 600, logger });
+            await q.enqueueMany(range(1, 30).map((i) => rec(i, { pad: 'y'.repeat(100) })));
+            const entries = await q.peek();
+            let firstRotation = true;
+            for (const e of entries) {
+                const rotated = path.join(dir, 'dead-letter.1.jsonl');
+                const before = fs.existsSync(rotated) ? fs.statSync(rotated).size : 0;
+                await q.deadLetter(e, 'expired');
+                if (before > 0 && fs.statSync(rotated).size !== before) {
+                    // the previous dead-letter.1.jsonl was just replaced: its bytes must be reported
+                    const line = logs.warn.find((m) => m.includes(`${before} bytes of older dead letters were deleted`));
+                    assert.ok(line, `rotation that deleted ${before} bytes is logged:\n${logs.warn.join('\n')}`);
+                    assert.match(line, /dead-letter\.jsonl reached 600 bytes and replaced dead-letter\.1\.jsonl/);
+                    firstRotation = false;
+                }
+            }
+            assert.equal(firstRotation, false, 'the test rotated more than once');
+            assert.ok(logs.warn.length >= 2);
         });
     });
 });

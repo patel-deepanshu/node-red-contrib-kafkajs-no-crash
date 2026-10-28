@@ -112,7 +112,7 @@
         "type": "comment",
         "z": "081c701efbf9361d",
         "name": "Control messages (msg.action)",
-        "info": "Messages with `msg.action` set to `queue-status`, `flush`, `reconnect` or `queue-clear` are commands for the producer instead of Kafka messages.\n\n- **queue-status** outputs `msg.payload = { size, bytes, segments, droppedTotal, deadLettered, oldestTs, state, mode, queueMode, queueDir, pending, ... }`.\n- **flush now** (`flush`) retries the connection now instead of waiting for the next attempt, or starts sending the queue.\n- **queue-clear** deletes every queued message without sending it (a warning is logged), then outputs the statistics. Use it with care.",
+        "info": "Messages with `msg.action` set to `queue-status`, `flush`, `reconnect` or `queue-clear` (in any upper or lower case) are commands for the producer instead of Kafka messages. Any other `msg.action` is ordinary data: that message is sent to Kafka.\n\n- **queue-status** outputs `msg.payload = { size, bytes, segments, droppedTotal, deadLettered, oldestTs, state, mode, queueMode, queueDir, pending, ... }`.\n- **flush now** (`flush`) retries the connection now instead of waiting for the next attempt, or starts sending the queue.\n- **queue-clear** deletes every queued message without sending it (a warning is logged), then outputs the statistics. Use it with care.",
         "x": 190,
         "y": 240,
         "wires": []
@@ -213,7 +213,6 @@
         "ackTimeout": 30000,
         "compression": "none",
         "partitioner": "default",
-        "idempotent": false,
         "allowAutoTopicCreation": true,
         "batchSize": 100,
         "queueMode": "disk",

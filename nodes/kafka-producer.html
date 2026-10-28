@@ -107,11 +107,6 @@
                     <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Messages that arrive while a request is in flight, and queued messages, are sent together in requests of up to this many messages (1 - 10000)."></i>
                 </div>
                 <div class="form-row">
-                    <label for="node-input-idempotent" class="kafkajs-nc-check">
-                        <input type="checkbox" id="node-input-idempotent">Idempotent producer (no duplicates from kafkajs retries; forces acks=all)
-                    </label>
-                </div>
-                <div class="form-row">
                     <label for="node-input-allowAutoTopicCreation" class="kafkajs-nc-check">
                         <input type="checkbox" id="node-input-allowAutoTopicCreation">Let the broker create missing topics (if the broker allows it)
                     </label>
@@ -149,8 +144,9 @@
                     </div>
                     <div class="form-tips">
                         Messages are stored in <code>&lt;directory&gt;/&lt;queue name&gt;</code>. A relative directory is
-                        relative to the Node-RED user directory. Each producer needs its own queue name; set one if you
-                        want the queue to survive copying or re-importing the node (that gives it a new id).
+                        relative to the Node-RED user directory. Each producer needs its own queue: set a name if the
+                        queue should survive re-importing the node (that gives it a new id). A copy of the node keeps
+                        the name, so give the copy a name of its own (otherwise it runs without a queue).
                     </div>
                 </div>
 
@@ -194,8 +190,12 @@
 (function () {
     'use strict';
 
-    var ENV_REF = /^\s*(\$\{[^}]+\}|\$\([^)]+\))\s*$/;
+    // Node-RED replaces ${NAME} / $(NAME) only when it is the WHOLE value, without spaces
+    // (@node-red/runtime lib/flows/util.js); anything else stays literal at runtime.
+    var ENV_REF = /^(\$\{\S+\}|\$\(\S+\))$/;
+    var ANY_REF = /\$\{|\$\(/;
     var TOPIC_RE = /^[A-Za-z0-9._-]{1,249}$/;
+    var NOT_WHOLE = 'a ${NAME} reference is only replaced when it is the whole value, without spaces';
 
     function isBlank(v) {
         return v === undefined || v === null || String(v).trim() === '';
@@ -215,6 +215,9 @@
             if (isFinite(n) && n >= min && n <= max && (!integer || Math.floor(n) === n)) {
                 return true;
             }
+            if (ANY_REF.test(String(v))) {
+                return opt ? NOT_WHOLE : false;
+            }
             return opt ? 'must be ' + (integer ? 'a whole number' : 'a number') + ' from ' + min + ' to ' + max : false;
         };
     }
@@ -228,6 +231,9 @@
         if (TOPIC_RE.test(s) && s !== '.' && s !== '..') {
             return true;
         }
+        if (ANY_REF.test(s)) {
+            return opt ? NOT_WHOLE : false; // e.g. "orders-${REGION}": stays literal at runtime
+        }
         return opt ? 'invalid topic name (letters, digits, ".", "_" and "-", at most 249)' : false;
     }
 
@@ -238,34 +244,60 @@
         if (/^\s*\d+\s*$/.test(String(v)) && Number(v) <= 2147483647) {
             return true;
         }
+        if (ANY_REF.test(String(v))) {
+            return opt ? NOT_WHOLE : false;
+        }
         return opt ? 'must be empty or a whole number >= 0' : false;
     }
 
-    /** Saved headers object { name: value | [values] } → editable list rows. */
+    /**
+     * Saved headers → editable list rows. Reads everything the runtime reads,
+     * so opening and saving the dialog never changes what is sent: an object
+     * { name: value | [values] } (what this editor saves), an array of
+     * { key|name, value } pairs or a JSON string of either (hand-written
+     * flows). null values are left out, as at runtime.
+     */
     function headerRows(headers) {
         var rows = [];
+        function add(name, value) {
+            if (Array.isArray(value)) {
+                value.forEach(function (v) {
+                    add(name, v);
+                });
+            } else if (value !== null && value !== undefined) {
+                rows.push({ name: name, value: value });
+            }
+        }
+        if (typeof headers === 'string') {
+            try {
+                headers = JSON.parse(headers);
+            } catch (e) {
+                return rows;
+            }
+        }
         if (!headers || typeof headers !== 'object') {
             return rows;
         }
         if (Array.isArray(headers)) {
             headers.forEach(function (h) {
                 if (h && typeof h === 'object') {
-                    rows.push({ name: h.key !== undefined ? h.key : h.name, value: h.value });
+                    add(h.key !== undefined ? h.key : h.name, h.value);
                 }
             });
             return rows;
         }
         Object.keys(headers).forEach(function (name) {
-            var value = headers[name];
-            if (Array.isArray(value)) {
-                value.forEach(function (v) {
-                    rows.push({ name: name, value: v });
-                });
-            } else {
-                rows.push({ name: name, value: value });
-            }
+            add(name, headers[name]);
         });
         return rows;
+    }
+
+    /** A header value as the runtime sends it: objects as JSON (never '[object Object]'). */
+    function headerText(value) {
+        if (value === undefined || value === null) {
+            return '';
+        }
+        return typeof value === 'object' ? JSON.stringify(value) : String(value);
     }
 
     RED.nodes.registerType('kafkajs-nc-producer', {
@@ -289,7 +321,6 @@
             ackTimeout: { value: 30000, label: 'Ack timeout', validate: numberRange(100, 600000, true) },
             compression: { value: 'none' },
             partitioner: { value: 'default' },
-            idempotent: { value: false },
             allowAutoTopicCreation: { value: true },
             batchSize: { value: 100, label: 'Batch size', validate: numberRange(1, 10000, true) },
             queueMode: { value: 'disk' },
@@ -338,7 +369,6 @@
                 }
             });
 
-            // height 'auto': the list grows with its rows and the dialog scrolls
             var list = $('#node-input-headers-container').css({ 'min-height': '120px', 'min-width': '420px' }).editableList({
                 addItem: function (container, i, header) {
                     var h = header || {};
@@ -347,7 +377,7 @@
                         .val(h.name === undefined || h.name === null ? '' : String(h.name))
                         .appendTo(row);
                     $('<input/>', { type: 'text', class: 'kafkajs-nc-header-value', placeholder: 'value' })
-                        .val(h.value === undefined || h.value === null ? '' : String(h.value))
+                        .val(headerText(h.value))
                         .appendTo(row);
                 },
                 sortable: true,
@@ -355,6 +385,11 @@
                 addButton: 'header',
                 height: 'auto'
             });
+            // editableList measured the 120px min-height and fixed the list's
+            // height to it: rows from the 3rd on would overflow onto the controls
+            // below. Without that height the list grows with its rows (the
+            // min-height stays) and the dialog scrolls.
+            list.parent().css('height', '');
             headerRows(node.headers).forEach(function (row) {
                 list.editableList('addItem', row);
             });
@@ -411,10 +446,10 @@ Sends messages to Kafka. While Kafka cannot be reached, messages are stored in a
 : *topic* (string) : the Kafka topic, used when the node's **Topic** is empty.
 : *key* (string | buffer | number | object) : the message key, used when the node's **Key** is empty. Messages with the same key go to the same partition, which keeps their order.
 : *partition* (number) : send to this partition (0, 1, ...), used when the node's **Partition** is empty. Without it, the partitioner picks one from the key.
-: *headers* (object) : Kafka headers (`{ name: value }`, a value may be an array for repeated headers). Values are converted to text; `null` values are left out. Only used when *Also send msg.headers* is ticked.
-: *timestamp* (number | Date | string) : the Kafka message timestamp (epoch milliseconds). Defaults to the time the message reached this node, so messages delivered later from the offline queue keep their original time.
+: *headers* (object) : Kafka headers, an object of header names and values (a value may be an array for repeated headers). Values are converted to text; `null` values are left out. Only used when *Also send msg.headers* is ticked.
+: *timestamp* (number | Date | string) : the Kafka message timestamp, in epoch milliseconds (a number, a Date or a string of digits; other strings such as ISO dates are an error). Defaults to the time the message reached this node, so messages delivered later from the offline queue keep their original time.
 : *messages* (array) : send several Kafka messages at once. Each element is `{ value, key, headers, partition, timestamp, topic }` (`payload` is accepted instead of `value`); `msg.payload` is then ignored. An element without `topic` uses the node's Topic or `msg.topic`; the other `msg` properties (key, headers, partition, timestamp) are not applied to the elements. Node settings still win. The whole input succeeds or fails as one message (one report, one `done`).
-: *action* (string) : a control command instead of a message: `flush`, `reconnect`, `queue-status` or `queue-clear` (see *Control messages*). Messages with any other `msg.action` are sent normally.
+: *action* (string) : `flush`, `reconnect`, `queue-status` or `queue-clear` make the message a control command (see *Control messages*); upper/lower case and surrounding spaces do not matter. Any other `msg.action` is ordinary data and the message is sent normally.
 
 ### Outputs
 
@@ -424,9 +459,9 @@ The input message is passed on as a *delivery report* once it has been handled:
 : kafka.topic (string) : the topic.
 : kafka.partition (number) : the partition, when it is known.
 : kafka.offset (string) : the offset, when it is known exactly.
-: kafka.results (array) : `sent` only: what Kafka returned for the request that carried the message (`[{ topicName, partition, baseOffset, ... }]`). With *Acknowledgement: none* this is empty.
-: kafka.count (number) : for `msg.messages`: how many Kafka messages the input carried.
-: kafka.queueSize (number) : `queued` only: messages in the queue after this one was added.
+: kafka.results (array) : only with `sent`, what Kafka returned for the request that carried the message (`[{ topicName, partition, baseOffset, ... }]`). Empty when *Acknowledgement* is *None*.
+: kafka.count (number) : how many Kafka messages the input carried (only for `msg.messages`).
+: kafka.queueSize (number) : only with `queued`, the messages in the queue after this one was added.
 
 For `queue-status` and `queue-clear` the message is sent with the queue statistics in `msg.payload`.
 
@@ -446,14 +481,21 @@ a static header wins when both have the same name.
 Topic names may use letters, digits, `.`, `_` and `-` (at most 249 characters). An MQTT-style topic such as
 `sensors/temp` is rejected: set the node's Topic or change `msg.topic` first.
 
-Any setting can be `${NAME}` to read an environment variable. A variable that is not set makes every message fail
-with a clear error instead of being sent somewhere unexpected.
+A setting can be `${NAME}` to read an environment variable; Node-RED only replaces it when it is the whole field.
+What happens when the variable is not set depends on the setting:
+
+- Topic, Key, Partition and Static headers: every message fails with a clear error instead of being sent somewhere
+  unexpected.
+- Queue directory and Queue name: the offline queue is unavailable (an error is logged); messages are still sent
+  while Kafka is connected. A `${NAME}` inside a longer path is reported the same way.
+- Acknowledgement, Compression and Offline queue mode: a warning is logged and the default is used.
+- Other settings (numbers and check boxes): the default is used.
 
 #### Offline queue (store-and-forward)
 
 When the queue is on (the default is *On disk*):
 
-- While Kafka is not connected, every incoming message is appended to the queue, the report `kafka.status: "queued"`
+- While Kafka is not connected, every incoming message is appended to the queue, the report `kafka.status` `queued`
   is sent and the message is done. Nothing is lost while Node-RED keeps running, and with the disk queue also not
   when Node-RED is restarted, redeployed or the machine reboots.
 - When the connection is back, the queue is sent oldest-first, in batches of *Batch size*. Messages that arrive
@@ -467,8 +509,9 @@ When the queue is on (the default is *On disk*):
 **Where:** `<directory>/<queue name>`. The directory defaults to `kafkajs-nc-queue` in the Node-RED user directory
 (usually `~/.node-red/kafkajs-nc-queue`); an administrator can change the default with
 `kafkajsNcProducerQueueDir` in `settings.js`. The queue name defaults to the node's id, so each producer has its own
-queue. The files are `seg-*.jsonl` (the messages, one JSON object per line), `cursor.json` (how far the queue has
-been sent) and `dead-letter.jsonl`. When the queue is empty the message files are deleted.
+queue (inside a subflow the id is that of the node in the subflow instance, which stays the same across restarts).
+The files are `seg-*.jsonl` (the messages, one JSON object per line), `cursor.json` (how far the queue has been
+sent) and `dead-letter.jsonl`. When the queue is empty the message files are deleted.
 
 **Limits:** *Maximum size* (default 100 MB) and *Maximum messages* (default unlimited). When a limit is reached,
 *Drop the oldest* removes the oldest queued messages (a warning is logged); *Reject new messages* fails the new
@@ -482,10 +525,16 @@ cut.
 *In memory* mode works the same way but keeps the queue in memory only: it is lost when Node-RED stops or the node is
 redeployed. *Off* fails messages (`done(err)`) while Kafka is not connected.
 
-Copying, re-importing or deleting a node gives it a new id and therefore a new, empty queue; messages left in the old
-directory are not sent (a warning names the directory when a node with queued messages is deleted). Set a *Queue
-name* to keep the same queue across such changes. Two producers must never use the same queue name; the second one
-reports an error and runs without a queue.
+**Moving or renaming a queue.** Messages are only sent by a producer that uses their queue directory. Re-importing
+a node gives it a new id and therefore a new, empty queue (set a *Queue name* to keep the same queue). Changing
+*Directory* or *Queue name* leaves the queued messages in the old directory: a warning names it, and setting the old
+values again sends them. When a node with queued messages is deleted, a warning names its directory too, and a
+producer that starts warns about queue directories next to its own that hold messages no running producer uses.
+
+Two producers must never use the same queue. A copy of a node keeps its *Queue name*: while the original exists the
+copy cannot lock that queue, reports an error and runs without a queue, so give the copy its own name. After a
+redeploy, the new instance waits until the old one has finished writing the queue; on a very slow disk it runs
+without the queue for a moment and opens it as soon as the old instance is done.
 
 #### Order
 
@@ -498,54 +547,71 @@ order of messages for different topics is kept as well, because a request only e
 A message is reported `sent` only when Kafka has acknowledged it, and `queued` only when it is stored. If the
 connection breaks after Kafka wrote a message but before its answer arrived, the message is sent again later: in
 rare cases a consumer sees a **duplicate**. Messages are never silently dropped, except by the limits and expiry you
-configure. *Idempotent producer* removes duplicates caused by kafkajs' own retries within one connection, not those
-caused by a reconnect. Consumers that must not process a message twice should de-duplicate, for example with a
-unique id in a header.
+configure. Consumers that must not process a message twice should de-duplicate, for example with a unique id in a
+header.
+
+Kafka errors that usually clear within a second or two (a partition leader moving during a broker restart, not
+enough in-sync replicas yet, a request timeout) are retried by sending the whole request again, up to 3 times after
+pauses of about 0.2, 0.6 and 1.6 s, before the messages go to the offline queue. kafkajs' own retry is not used,
+because it can lose messages when partition leaders move.
+
+A message for an explicit partition that Kafka did not write because the producer's information about the topic may
+be out of date (partitions were added) is sent again after a reconnect; it fails as *partition does not exist* only
+when that is confirmed.
 
 #### Dead-letter file
 
 A queued message that Kafka refuses for good (for example *message too large*, a partition that does not exist, an
-invalid or unauthorised topic taken from the message, a damaged queue file, or expired) cannot be sent at all. So that
-it does not block the messages behind it, it is appended to `dead-letter.jsonl` in the queue directory, a warning is
-logged, and sending continues. Each line is `{ "ts": "...", "error": { "name", "message", "kind", ... }, "record":
-{ "t": topic, "ts": queued-at, "m": { "k": key, "v": value, "h": headers, "p": partition, "ts": timestamp } } }`,
-where values are `{ "s": "text" }` or `{ "b": "base64" }`. A batch that keeps failing with an unrecognised error 5
-times in a row is checked message by message the same way. The file is rotated to `dead-letter.1.jsonl` at 50 MB.
-In memory mode the last 100 dead letters are only kept in memory.
+invalid or unauthorised topic taken from the message or from a Topic setting the node no longer has, a damaged queue
+file, or expired) cannot be sent at all. So that it does not block the messages behind it, it is appended to
+`dead-letter.jsonl` in the queue directory, a warning is logged, and sending continues. Each line is `{ "ts": "...",
+"error": { "name", "message", "kind", ... }, "record": { "t": topic, "ts": queued-at, "m": { "k": key, "v": value,
+"h": headers, "p": partition, "ts": timestamp } } }`, where values are `{ "s": "text" }` or `{ "b": "base64" }`. A
+batch that keeps failing with an unrecognised error 5 times in a row is checked message by message the same way. The
+file is rotated to `dead-letter.1.jsonl` at 50 MB. In memory mode the last 100 dead letters are kept in memory only:
+`queue-status` returns them in `msg.payload.deadLetters`, and they are lost when Node-RED stops.
 
 #### Connection
 
 The node connects when it starts and reconnects on its own after any failure, waiting longer after each failed
 attempt (settings of the broker node). Authentication, authorisation and configuration errors are retried slowly
 (*After auth/config errors* in the broker node). The first failure of an outage is logged as an error; repeats are
-logged at debug level, with a warning every 10th attempt.
+logged at debug level, with a warning every 10th attempt. When Kafka works again the log says
+`Connected to Kafka after N attempts`.
 
 #### Status
 
+- `starting` / `12 queued` (grey): the offline queue is being opened (after a redeploy this can include waiting for
+  the previous instance to finish writing it).
 - `connecting…` (yellow): connecting to Kafka.
 - `connected` (green): messages are sent directly.
 - `connected · 12 queued` / `flushing · 1234 queued` (green): sending the offline queue.
 - `offline · 57 queued · retry 8s` (yellow): Kafka cannot be reached; the next attempt is in 8 s.
 - `ECONNREFUSED broker:9092 · retry 8s` (yellow): the same with an empty queue, showing the reason.
 - `auth failed · retry 60s` (red): wrong user name or password. Other problems that need a human show their
-  reason instead, for example `TLS: self-signed cert · retry 60s` or `not authorized (topic) · 1 queued · retry 60s`.
+  reason instead, for example `TLS: untrusted cert (CA?) · retry 60s` or `not authorized (topic) · 1 queued · retry 60s`.
 - `config error · 3 queued` (red): the broker configuration is invalid, or kafkajs refused an option (see the log);
   messages are queued.
 - `no broker config` (red): no broker configuration is selected; messages are queued.
 - `connected · queue unavailable` (yellow): connected, but the offline queue could not be opened (see the log).
 
+A status shows at most 48 characters; a longer reason is shortened with `…` (the log has the full text).
+
 #### Control messages
 
-Send a message with `msg.action` set to:
+Send a message with `msg.action` set to one of these (case and surrounding spaces do not matter):
 
 - `flush` or `reconnect`: retry the connection now instead of waiting, or start sending the queue now.
 - `queue-status`: outputs `msg.payload = { size, bytes, segments, droppedTotal, deadLettered, oldestTs, state, mode,
-  queueMode, queueDir, pending, queueError, lastError }`. `size` is the number of queued messages, `deadLettered` how
-  many were moved to the dead-letter file, `oldestTs` (when known) the arrival time of the oldest queued message,
-  `state` the connection state (`connecting`, `connected`, `waiting`, `stopped`), `mode` is `live` (sending directly)
-  or `backlog` (going through the queue), `pending` the messages waiting in memory. `queueError` and `lastError` are
-  only present after a problem.
+  queueMode, queueDir, pending, queueError, lastError, deadLetters }`. `size` is the number of queued messages,
+  `deadLettered` how many were moved to the dead-letter file, `oldestTs` (when known) the arrival time of the oldest
+  queued message, `state` the connection state (`idle` before the queue is open, `connecting`, `connected`,
+  `waiting` for the next attempt, `stopped` without a usable broker configuration, `closing`), `mode` is `live`
+  (sending directly) or `backlog` (going through the queue), `pending` the messages waiting in memory. `queueError`
+  and `lastError` are only present after a problem, `deadLetters` only in memory mode.
 - `queue-clear`: deletes every queued message without sending it (logged as a warning), then outputs the statistics.
+
+These four values are reserved: a message whose `msg.action` is one of them is never sent to Kafka.
 
 #### Examples
 

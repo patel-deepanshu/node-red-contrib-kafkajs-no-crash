@@ -164,7 +164,6 @@ describe('kafka producer node', function () {
         Object.assign(producerNode.LIMITS, ORIGINAL_LIMITS);
         factory.setKafkajs(null);
         queueRegistry._reset();
-        internals.queueClosers.clear();
     });
 
     describe('sending while connected', function () {
@@ -190,7 +189,8 @@ describe('kafka producer node', function () {
             const p = fake.producers[0];
             assert.equal(typeof p.options.createPartitioner, 'function', 'partitioner passed explicitly');
             assert.equal(p.options.allowAutoTopicCreation, true);
-            assert.equal(p.options.idempotent, false);
+            assert.deepEqual(p.options.retry, { retries: 0 }, 'no kafkajs produce retry (LOSS-1)');
+            assert.equal(p.options.idempotent, undefined);
             const args = p.sendCalls[0].args;
             assert.equal(args.acks, -1);
             assert.equal(args.timeout, 30000);
@@ -387,19 +387,30 @@ describe('kafka producer node', function () {
             });
         }
 
-        it('passes ack timeout, compression and the idempotent options to kafkajs', async function () {
-            const node = await load({ ackTimeout: '1234', compression: 'gzip', idempotent: true, acks: 'leader', partitioner: 'legacy' });
+        it('passes ack timeout, compression and the partitioner to kafkajs', async function () {
+            const node = await load({ ackTimeout: '1234', compression: 'gzip', acks: 'leader', partitioner: 'legacy' });
             await connected(node);
             await produce(node, { payload: 'x' });
             const p = fake.producers[0];
-            assert.equal(p.options.idempotent, true);
-            assert.equal(p.options.maxInFlightRequests, 1);
             assert.equal(p.options.createPartitioner, fake.Partitioners.LegacyPartitioner);
             const args = p.sendCalls[0].args;
             assert.equal(args.timeout, 1234);
             assert.equal(args.compression, fake.CompressionTypes.GZIP);
-            assert.equal(args.acks, -1, 'idempotent forces acks all');
-            assert.equal(logged(node, 'warn', /idempotent producer requires acks "all"/).length, 1);
+            assert.equal(args.acks, 1);
+        });
+
+        it('an old flow with "idempotent" on still works: the option is ignored with one warning', async function () {
+            // kafkajs' idempotent mode needs its own produce retry, which can lose messages (LOSS-1)
+            const node = await load({ idempotent: true, acks: 'leader' });
+            await connected(node);
+            const r = await produce(node, { payload: 'x' });
+            assert.equal(r.msg.kafka.status, 'sent');
+            const p = fake.producers[0];
+            assert.equal(p.options.idempotent, undefined);
+            assert.equal(p.options.maxInFlightRequests, undefined);
+            assert.deepEqual(p.options.retry, { retries: 0 });
+            assert.equal(p.sendCalls[0].args.acks, 1, 'acks is no longer forced to "all"');
+            assert.equal(logged(node, 'warn', /"Idempotent producer" option is no longer supported and is ignored/).length, 1);
         });
 
         it('fails a message whose explicit partition does not exist (kafkajs silently writes nothing)', async function () {
@@ -1322,11 +1333,8 @@ describe('kafka producer node', function () {
 
         it('a redeploy waits for the previous instance to release the queue directory', async function () {
             const dir = queueDir(userDir);
-            let release;
-            const previous = new Promise((resolve) => {
-                release = resolve;
-            });
-            internals.queueClosers.set(dir, previous);
+            const release = queueRegistry.acquire(dir, 'p1'); // the old instance, still closing
+            release.closing();
             fake.behaviour.connectError = fake.errors.connectionRefused();
             const node = await load();
             await sleep(60);
@@ -1373,6 +1381,479 @@ describe('kafka producer node', function () {
             assert.deepEqual(entry.record.m.h, { h: { b: Buffer.from('x').toString('base64') } });
         });
     });
+
+    // Regression tests of the review findings (ids in the test names). Each one
+    // fails on the code before the fix.
+
+    describe('node-level send retry instead of kafkajs\' (LOSS-1)', function () {
+        /** What kafkajs throws with retries: 0 for a retriable Kafka error. */
+        function retriable(type) {
+            return fake.errors.retriesExceeded(fake.errors.protocol(type), { retryCount: 0, retryTime: 300 });
+        }
+
+        beforeEach(function () {
+            producerNode.TIMEOUTS.sendRetryMin = 10;
+            producerNode.TIMEOUTS.sendRetryMax = 40;
+        });
+
+        it('a leader change during a send is retried by sending the whole batch again, on the same connection', async function () {
+            let failures = 2;
+            fake.behaviour.sendError = () => (failures-- > 0 ? retriable('NOT_LEADER_FOR_PARTITION') : null);
+            const node = await load();
+            await connected(node);
+            const { err, msg } = await produce(node, { payload: 'm1' });
+            assert.equal(err, null);
+            assert.equal(msg.kafka.status, 'sent', 'sent, not queued for a reconnect');
+            const p = fake.producers[0];
+            assert.equal(fake.producers.length, 1, 'no reconnect');
+            assert.deepEqual(p.sendCalls.map((c) => c.args.messages.map((m) => m.value)), [['m1'], ['m1'], ['m1']]);
+            assert.equal(logged(node, 'debug', /sending its 1 message\(s\) again .* \(retry 2 of 3\)/).length, 1);
+            assert.equal(logged(node, 'error').length, 0, 'retries are not errors');
+        });
+
+        it('request timeouts are retried too; after 3 retries the batch goes to the queue as before', async function () {
+            fake.behaviour.sendError = (args, client) => (client === fake.producers[0] ? fake.errors.requestTimeout() : null);
+            const node = await load();
+            await connected(node);
+            const { msg } = await produce(node, { payload: 'm1' });
+            assert.equal(msg.kafka.status, 'queued');
+            assert.equal(fake.producers[0].sendCalls.length, 4, 'one attempt and 3 retries');
+            await waitFor(() => fake.sent.length === 1 && rt(node).mode === 'live', { message: 'sent after reconnecting' });
+            assert.deepEqual(fake.sent.map((s) => s.value), ['m1']);
+        });
+
+        it('a connection failure is not retried: queue and reconnect at once', async function () {
+            fake.behaviour.sendError = (args, client) => (client === fake.producers[0] ? fake.errors.sendDuringOutage() : null);
+            const node = await load();
+            await connected(node);
+            const { msg } = await produce(node, { payload: 'm1' });
+            assert.equal(msg.kafka.status, 'queued');
+            assert.equal(fake.producers[0].sendCalls.length, 1);
+        });
+
+        it('the flusher retries a retriable error without dropping the connection', async function () {
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load();
+            await waitFor(() => rt(node).state === 'waiting');
+            await produce(node, { payload: 'q1' });
+            await produce(node, { payload: 'q2' });
+            let failures = 1;
+            fake.behaviour.sendError = () => (failures-- > 0 ? retriable('LEADER_NOT_AVAILABLE') : null);
+            const created = fake.producers.length;
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.length === 2 && rt(node).mode === 'live', { message: 'flushed' });
+            assert.deepEqual(fake.sent.map((s) => s.value), ['q1', 'q2']);
+            assert.equal(fake.producers.length, created + 1, 'one connection: the flush was retried, not reconnected');
+        });
+
+        it('sendRetriable: Kafka errors that clear by themselves and request timeouts only', function () {
+            const { sendRetriable } = internals;
+            assert.equal(sendRetriable(retriable('NOT_LEADER_FOR_PARTITION')), true);
+            assert.equal(sendRetriable(retriable('NOT_ENOUGH_REPLICAS')), true);
+            assert.equal(sendRetriable(fake.errors.retriesExceeded(fake.errors.requestTimeout())), true);
+            assert.equal(sendRetriable(fake.errors.sendDuringOutage()), false);
+            assert.equal(sendRetriable(fake.errors.unknownTopic()), false);
+            assert.equal(sendRetriable(fake.errors.messageTooLarge()), false);
+            assert.equal(sendRetriable(new Error('odd')), false);
+            assert.equal(sendRetriable(undefined), false);
+        });
+    });
+
+    describe('partitions added to a topic (PART-1)', function () {
+        /** The first connected producer has stale metadata (1 partition), later ones see 2. */
+        function partitionsAddedAfterFirstConnect() {
+            fake.behaviour.partitionCount = () => (fake.producers.filter((p) => p.connectCount > 0).length >= 2 ? 2 : 1);
+        }
+
+        it('live: a skipped partition with possibly stale metadata is sent again after a reconnect', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 0;
+            partitionsAddedAfterFirstConnect();
+            const node = await load();
+            await connected(node);
+            const { err, msg } = await produce(node, { payload: 'to-p1', partition: 1 });
+            assert.equal(err, null, 'not "Partition 1 does not exist"');
+            assert.equal(msg.kafka.status, 'sent');
+            assert.equal(msg.kafka.partition, 1);
+            assert.deepEqual(fake.sent.map((s) => [s.value, s.partition]), [['to-p1', 1]]);
+            assert.equal(logged(node, 'error', /Partition 1 of topic test-topic is not in the producer's metadata/).length, 1);
+        });
+
+        it('live: only the skipped messages of a batch are sent again', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 0;
+            partitionsAddedAfterFirstConnect();
+            const node = await load();
+            await connected(node);
+            const { msg } = await produce(node, { messages: [{ value: 'a', partition: 0 }, { value: 'b', partition: 1 }] });
+            assert.equal(msg.kafka.status, 'sent');
+            assert.deepEqual(fake.sent.map((s) => s.value), ['a', 'b'], 'a is not sent twice');
+        });
+
+        it('flush: a queued message for a skipped partition stays queued and is sent after a reconnect', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 0;
+            partitionsAddedAfterFirstConnect();
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load();
+            await waitFor(() => rt(node).state === 'waiting');
+            await produce(node, { payload: 'a' });
+            await produce(node, { payload: 'to-p1', partition: 1 });
+            await produce(node, { payload: 'c' });
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.some((s) => s.value === 'to-p1') && rt(node).mode === 'live', { message: 'sent' });
+            assert.deepEqual(deadLetters(queueDir(userDir)), [], 'not dead-lettered');
+            const values = fake.sent.map((s) => s.value);
+            assert.deepEqual(values.slice(0, 2), ['a', 'c'], 'first round: a and c written, to-p1 skipped');
+            assert.deepEqual(values.slice(2), ['to-p1', 'c'], 'after the reconnect: from to-p1 on (c again: at-least-once)');
+        });
+    });
+
+    describe('queue directory hand-over on redeploy (LOSS-2, MAINT-9)', function () {
+        it('a slow disk during a redeploy: the new instance waits for the real close and nothing is overwritten', async function () {
+            producerNode.TIMEOUTS.closeQueue = 100;
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            await load();
+            const old = rt(helper.getNode('p1'));
+            await waitFor(() => old.queueState === 'open' && old.state === 'waiting');
+            // the next fdatasync of the old queue takes 600 ms (SD card under load)
+            const queue = old.queue;
+            const syncData = queue._syncData;
+            let stalled = false;
+            queue._syncData = async function (...args) {
+                if (!stalled) {
+                    stalled = true;
+                    await sleep(600);
+                }
+                return syncData.apply(this, args);
+            };
+            old.input({ payload: 'm0' }, () => {}, () => {});
+            await sleep(30); // m0 written, its fsync hangs
+            old.input({ payload: 'm1' }, () => {}, () => {}); // behind m0 on the old queue
+            await sleep(30);
+            await helper.setFlows([brokerConfig(), producerConfig(), { id: 'out', type: 'helper' }], 'full');
+            const node = helper.getNode('p1');
+            assert.notEqual(rt(node), old);
+            const r = await produce(node, { payload: 'm2' });
+            assert.equal(r.msg.kafka.status, 'queued');
+            assert.equal(rt(node).queue.size, 3, 'the new instance opened the queue after the old one wrote m1');
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.length >= 3 && rt(node).mode === 'live', { message: 'flushed' });
+            assert.deepEqual(fake.sent.map((s) => s.value), ['m0', 'm1', 'm2']);
+        });
+
+        it('the directory stays locked until the queue has really closed, although done() came earlier', async function () {
+            producerNode.TIMEOUTS.closeQueue = 50;
+            const node = await load();
+            await connected(node);
+            const dir = queueDir(userDir);
+            const queue = rt(node).queue;
+            const close = queue.close.bind(queue);
+            queue.close = () => sleep(300).then(close);
+            const t0 = Date.now();
+            await helper.unload();
+            assert.ok(Date.now() - t0 < 250, 'Node-RED is not held up by the slow close');
+            assert.equal(queueRegistry.isOwned(dir), true, 'still locked while the close runs');
+            await waitFor(() => !queueRegistry.isOwned(dir), { timeout: 2000, message: 'released after the close' });
+        });
+
+        it('if the old instance is still closing after previousClose, the new one runs without the queue, then opens it', async function () {
+            producerNode.TIMEOUTS.previousClose = 50;
+            const dir = queueDir(userDir);
+            const old = queueRegistry.acquire(dir, 'p1');
+            old.closing();
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load();
+            await waitFor(() => rt(node).queueState === 'failed', { message: 'gave up waiting' });
+            assert.equal(logged(node, 'error', /still being closed by node p1 .*opened as soon as that node has closed it/).length, 1);
+            const refused = await produce(node, { payload: 'not stored' });
+            assert.match(refused.err.message, /offline queue is unavailable/);
+            old(); // the old instance has finished closing
+            await waitFor(() => rt(node).queueState === 'open', { message: 'queue opened later' });
+            assert.equal(logged(node, 'log', /Offline queue .* is open now/).length, 1);
+            const r = await produce(node, { payload: 'stored' });
+            assert.equal(r.msg.kafka.status, 'queued');
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.length === 1);
+            assert.deepEqual(fake.sent.map((s) => s.value), ['stored']);
+        });
+
+        it('close gives up waiting for the queued copy of a slow request: no duplicate at the tail', async function () {
+            producerNode.TIMEOUTS.liveStall = 30;
+            producerNode.TIMEOUTS.closeSendWait = 50;
+            producerNode.TIMEOUTS.closeQueue = 50;
+            producerNode.TIMEOUTS.disconnect = 50;
+            fake.behaviour.sendDelayMs = Infinity;
+            const node = await load();
+            await connected(node);
+            const queue = rt(node).queue;
+            const syncData = queue._syncData;
+            queue._syncData = async function (...args) {
+                await sleep(300); // every write waits for a slow disk
+                return syncData.apply(this, args);
+            };
+            const first = produce(node, { payload: 'm1' }); // in flight, never answered
+            await sleep(60);
+            const second = produce(node, { payload: 'm2' }); // stalled request: switch to the queue
+            await sleep(10);
+            await helper.unload();
+            const [r1, r2] = await Promise.all([first, second]);
+            assert.equal(r1.msg.kafka.status, 'queued', 'reported once its copy was written');
+            assert.equal(r2.msg.kafka.status, 'queued');
+            await waitFor(() => !queueRegistry.isOwned(queueDir(userDir)));
+            assert.deepEqual(queuedRecords(queueDir(userDir)).map((r) => r.m.v.s), ['m1', 'm2'], 'no second m1 at the tail');
+        });
+    });
+
+    describe('queued messages left behind (LOSS-4)', function () {
+        it('changing the Queue name warns where the queued messages are', async function () {
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load({ queueName: 'old-name' });
+            await waitFor(() => rt(node).state === 'waiting');
+            await produce(node, { payload: 'a' });
+            await produce(node, { payload: 'b' });
+            await helper.setFlows([brokerConfig(), producerConfig({ queueName: 'new-name' }), { id: 'out', type: 'helper' }], 'full');
+            const renamed = helper.getNode('p1');
+            const oldDir = path.join(userDir, 'kafkajs-nc-queue', 'old-name');
+            await waitFor(() => logged(renamed, 'warn', /2 unsent message\(s\) are left in the offline queue/).length === 1);
+            assert.ok(logged(renamed, 'warn').some((w) => w.includes(oldDir) && /set the old values again/.test(w)));
+            assert.equal(queuedRecords(oldDir).length, 2, 'nothing is deleted');
+        });
+
+        it('warns once about queue directories with messages that no running producer uses', async function () {
+            producerNode.TIMEOUTS.orphanScan = 30;
+            const base = path.join(userDir, 'kafkajs-nc-queue');
+            writeSegment(path.join(base, 'renamed-queue'), [record('stranded')]);
+            fs.mkdirSync(path.join(base, 'drained-queue'), { recursive: true }); // empty: not reported
+            const flowExtra = [producerConfig({ id: 'p2', queueName: 'other', wires: [[]] })];
+            writeSegment(path.join(base, 'other'), [record('owned by p2')]);
+            const node = await load({}, { extraNodes: flowExtra });
+            await waitFor(() => logged(node, 'warn', /Found 1 offline queue/).length + logged(helper.getNode('p2'), 'warn', /Found 1 offline queue/).length === 1,
+                { message: 'orphan warning' });
+            const warning = [...logged(node, 'warn', /Found/), ...logged(helper.getNode('p2'), 'warn', /Found/)][0];
+            assert.match(warning, /Found 1 offline queue\(s\) under .*kafkajs-nc-queue with unsent messages that no running producer uses: renamed-queue \(\d+ B\)/);
+            // the next start does not report the same directory again
+            await helper.setFlows([brokerConfig(), producerConfig(), ...flowExtra, { id: 'out', type: 'helper' }], 'full');
+            await sleep(150);
+            const again = [...logged(helper.getNode('p1'), 'warn', /Found/), ...logged(helper.getNode('p2'), 'warn', /Found/)];
+            assert.equal(again.length, 0);
+        });
+    });
+
+    describe('more review fixes', function () {
+        it('a queued record for a topic the node no longer uses is dead-lettered instead of blocking the queue (STUCK-1)', async function () {
+            fake.behaviour.sendError = (args) => (args.topic === 'ordrs' ? fake.errors.unknownTopic() : null);
+            const node = await load({ topic: 'ordrs' }); // typo, topic auto-creation off on the cluster
+            await connected(node);
+            for (const payload of ['x1', 'x2']) assert.equal((await produce(node, { payload })).msg.kafka.status, 'queued');
+            assert.equal(logged(node, 'error', /Kafka send failed \(topic ordrs\): .*UNKNOWN_TOPIC_OR_PARTITION/).length, 1,
+                'the log names the topic');
+            await helper.setFlows([brokerConfig(), producerConfig({ topic: 'orders' }), { id: 'out', type: 'helper' }], 'full');
+            const fixed = helper.getNode('p1');
+            const r = await produce(fixed, { payload: 'new' });
+            assert.equal(r.err, null);
+            await waitFor(() => fake.sent.length === 1 && rt(fixed).mode === 'live', { timeout: 4000, message: 'unblocked' });
+            assert.deepEqual(fake.sent.map((s) => [s.topic, s.value]), [['orders', 'new']]);
+            const dead = deadLetters(queueDir(userDir));
+            assert.deepEqual(dead.map((d) => [d.record.t, d.record.m.v.s]), [['ordrs', 'x1'], ['ordrs', 'x2']]);
+        });
+
+        it('msg.action is matched trimmed and case-insensitively; other values are produced (MAINT-3)', async function () {
+            const node = await load();
+            await connected(node);
+            const status = await produce(node, { action: ' Queue-Status ', payload: 'not data' });
+            assert.equal(status.msg.payload.state, 'connected');
+            const flush = await produce(node, { action: 'FLUSH', payload: 'not data either' });
+            assert.equal(flush.err, null);
+            assert.equal(flush.sent.length, 0);
+            assert.equal(fake.sent.length, 0, 'control messages are never produced');
+            const data = await produce(node, { action: 'created', payload: 'p' });
+            assert.equal(data.msg.kafka.status, 'sent');
+            assert.deepEqual(fake.sent.map((s) => s.value), ['p']);
+        });
+
+        it('logs "Connected to Kafka after N attempts" when a failed send is followed by a quick reconnect (MAINT-1)', async function () {
+            fake.behaviour.sendError = (args, client) => (client === fake.producers[0] ? fake.errors.sendDuringOutage() : null);
+            const node = await load({ queueMode: 'off' });
+            await connected(node);
+            const failed = await produce(node, { payload: 'a' });
+            assert.ok(failed.err);
+            await connected(node);
+            const ok = await produce(node, { payload: 'b' });
+            assert.equal(ok.msg.kafka.status, 'sent');
+            assert.equal(logged(node, 'log', /Connected to Kafka after 2 attempts/).length, 1);
+        });
+
+        it('internal errors are not reported while closing, like the consumer (MAINT-1)', async function () {
+            const node = await load();
+            await connected(node);
+            rt(node).closing = true;
+            rt(node).bug('test', new Error('late'));
+            assert.equal(logged(node, 'error', /Internal error/).length, 0);
+            rt(node).closing = false;
+        });
+
+        it('memory mode: queue-status returns the dead letters, which exist nowhere else (MAINT-7)', async function () {
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            fake.behaviour.sendError = (args) => (args.messages.some((m) => m.value === 'poison') ? fake.errors.messageTooLarge() : null);
+            const node = await load({ queueMode: 'memory' });
+            await waitFor(() => rt(node).state === 'waiting');
+            await produce(node, { payload: 'poison' });
+            await produce(node, { payload: 'ok' });
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.length === 1 && rt(node).mode === 'live');
+            const { msg } = await produce(node, { action: 'queue-status' });
+            assert.equal(msg.payload.deadLettered, 1);
+            assert.equal(msg.payload.deadLetters.length, 1);
+            assert.equal(msg.payload.deadLetters[0].record.m.v.s, 'poison');
+            assert.equal(logged(node, 'warn', /cannot be delivered to the memory queue's dead letters \(see msg\.payload\.deadLetters/).length, 1);
+        });
+
+        it('a red status shows the whole reason when it fits (not cut at 24 characters)', async function () {
+            fake.behaviour.connectError = fake.errors.retriesExceeded(fake.errors.connectionError({
+                code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', message: 'Connection error: unable to verify the first certificate'
+            }));
+            const node = await load();
+            await nextStatus(node, (s) => s.fill === 'red' && s.text === 'TLS: untrusted cert (CA?) · retry 1s');
+        });
+    });
+
+    describe('paths the suite did not run before (MAINT-10)', function () {
+        it('10 identical connection failures: one error, then a "still failing" warning', async function () {
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load();
+            await waitFor(() => fake.producers.length >= 11, { timeout: 5000, message: '11 attempts' });
+            assert.equal(logged(node, 'error', /Kafka connection failed/).length, 1);
+            assert.equal(logged(node, 'warn', /Kafka still failing after 10 attempts: .*ECONNREFUSED/).length, 1);
+        });
+
+        it('a live send that fails while the node closes is stored in the queue', async function () {
+            fake.behaviour.sendDelayMs = 150;
+            fake.behaviour.sendError = fake.errors.sendDuringOutage();
+            const node = await load();
+            await connected(node);
+            const r = produce(node, { payload: 'during-close' });
+            await sleep(20);
+            const logs = [];
+            node.log = (m) => logs.push(String(m));
+            await helper.unload();
+            const { err, msg } = await r;
+            assert.equal(err, null);
+            assert.equal(msg.kafka.status, 'queued');
+            assert.deepEqual(queuedRecords(queueDir(userDir)).map((x) => x.m.v.s), ['during-close']);
+            assert.ok(logs.includes('Stored 1 unsent message(s) in the offline queue while closing'));
+        });
+
+        it('memory mode: messages still waiting for Kafka at close fail with done(err) and a warning', async function () {
+            producerNode.TIMEOUTS.closeSendWait = 50;
+            producerNode.TIMEOUTS.disconnect = 50;
+            fake.behaviour.sendDelayMs = Infinity;
+            const node = await load({ queueMode: 'memory' });
+            await connected(node);
+            const results = ['m0', 'm1', 'm2'].map((payload) => produce(node, { payload }));
+            await sleep(20);
+            const warnings = [];
+            node.warn = (m) => warnings.push(String(m));
+            await helper.unload();
+            const errors = (await Promise.all(results)).map((r) => r.err && r.err.message);
+            assert.ok(errors.every((m) => /closed before the message was sent/.test(m)), String(errors));
+            assert.ok(warnings.includes('3 message(s) were not sent to Kafka before the node closed (the memory queue does not survive a restart)'));
+        });
+
+        it('persisting at close that fails is logged as such, not as "Stored" (LOG-1)', async function () {
+            producerNode.TIMEOUTS.closeSendWait = 50;
+            producerNode.TIMEOUTS.disconnect = 50;
+            fake.behaviour.sendDelayMs = Infinity;
+            const node = await load();
+            await connected(node);
+            const results = ['m0', 'm1', 'm2'].map((payload) => produce(node, { payload }));
+            await sleep(20);
+            rt(node).queue.enqueueMany = () => Promise.reject(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+            const lines = [];
+            node.log = (m) => lines.push(String(m));
+            node.warn = (m) => lines.push(String(m));
+            await helper.unload();
+            const errors = (await Promise.all(results)).map((r) => r.err && r.err.message);
+            assert.ok(errors.every((m) => /Could not store the message in the offline queue: ENOSPC/.test(m)), String(errors));
+            assert.equal(lines.filter((l) => /^Stored \d+ unsent/.test(l)).length, 0, String(lines));
+            assert.ok(lines.includes('Closing: 0 unsent message(s) stored in the offline queue, 3 could not be stored ' +
+                '(they failed with an error), 0 still being written (slow disk)'), String(lines));
+        });
+
+        it('closing while the queue is still opening is quick and fails the waiting messages cleanly', async function () {
+            producerNode.TIMEOUTS.closeQueue = 50;
+            const dir = queueDir(userDir);
+            const old = queueRegistry.acquire(dir, 'p1');
+            old.closing(); // the queue cannot open yet
+            const node = await load();
+            assert.equal(rt(node).queueState, 'pending');
+            const waiting = produce(node, { payload: 'early' });
+            const t0 = Date.now();
+            await helper.unload();
+            assert.ok(Date.now() - t0 < 500);
+            const r = await waiting;
+            assert.match(r.err.message, /closed before the message was sent/);
+            old();
+        });
+
+        it('too many messages while the queue opens: the rest fail instead of piling up', async function () {
+            producerNode.LIMITS.maxPending = 2;
+            const dir = queueDir(userDir);
+            const old = queueRegistry.acquire(dir, 'p1');
+            old.closing();
+            const node = await load();
+            const early = ['e1', 'e2'].map((payload) => produce(node, { payload }));
+            const overflow = await produce(node, { payload: 'e3' });
+            assert.match(overflow.err.message, /still opening and too many messages are waiting/);
+            old();
+            const results = await Promise.all(early);
+            assert.ok(results.every((r) => r.err === null));
+        });
+
+        it('a connection failure while isolating a poison batch stops, keeps the order and sends nothing twice', async function () {
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load();
+            await waitFor(() => rt(node).state === 'waiting');
+            for (const payload of ['a', 'b', 'c', 'd']) await produce(node, { payload });
+            let calls = 0;
+            fake.behaviour.sendError = (args) => {
+                calls++;
+                if (calls === 1) return fake.errors.messageTooLarge(); // the batch: isolate
+                if (calls === 3 && args.messages[0].value === 'b') return fake.errors.sendDuringOutage();
+                return null;
+            };
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.length === 4 && rt(node).mode === 'live', { timeout: 4000 });
+            assert.deepEqual(fake.sent.map((s) => s.value), ['a', 'b', 'c', 'd']);
+            assert.equal(logged(node, 'error', /Sending queued messages to Kafka failed: .*ECONNREFUSED/).length, 1);
+            assert.deepEqual(deadLetters(queueDir(userDir)), []);
+        });
+
+        it('a failed request while newer messages are already queued stays in memory and is sent first', async function () {
+            producerNode.TIMEOUTS.liveStall = 30;
+            fake.behaviour.sendDelayMs = (args) => (args.messages[0].value === 'm1' ? 120 : 0);
+            fake.behaviour.sendError = (args, client) => (client === fake.producers[0] && args.messages[0].value === 'm1'
+                ? fake.errors.sendDuringOutage() : null);
+            const node = await load();
+            await connected(node);
+            const queue = rt(node).queue;
+            const enqueueMany = queue.enqueueMany.bind(queue);
+            let failCopy = true;
+            queue.enqueueMany = (records) => {
+                if (failCopy) { // storing the copy of the in-flight batch fails (switchToBacklog)
+                    failCopy = false;
+                    return Promise.reject(new Error('EIO (simulated)'));
+                }
+                return enqueueMany(records);
+            };
+            const first = produce(node, { payload: 'm1' });
+            await sleep(60);
+            const second = await produce(node, { payload: 'm2' });
+            assert.equal(second.msg.kafka.status, 'queued');
+            const r1 = await first;
+            assert.equal(r1.err, null);
+            await waitFor(() => fake.sent.length === 2 && rt(node).mode === 'live', { message: 'both sent' });
+            assert.deepEqual(fake.sent.map((s) => s.value), ['m1', 'm2'], 'm1 before the newer queued m2');
+            assert.equal(r1.msg.kafka.status, 'sent');
+        });
+    });
 });
 
 describe('kafka producer editor (kafka-producer.html)', function () {
@@ -1414,6 +1895,96 @@ describe('kafka producer editor (kafka-producer.html)', function () {
         assert.deepEqual(internals.parseStaticHeaders(JSON.parse(JSON.stringify(node.headers))).headers, { a: ['1', '2'], b: '' });
     });
 
+    /**
+     * Run oneditprepare with a recording stand-in for jQuery: every call is
+     * logged with the chain it was made on, e.g. '#node-input-headers-container
+     * .css().editableList().parent()'. Returns the calls and the editableList
+     * options of the static headers list.
+     */
+    function runEditPrepare(node) {
+        const calls = [];
+        let listOptions = null;
+        const make = (chain) => new Proxy(function () {}, {
+            get(_, method) {
+                if (method === 'then') return undefined; // not a promise
+                return (...args) => {
+                    calls.push({ chain, method, args });
+                    if (method === 'editableList' && args[0] && typeof args[0] === 'object') listOptions = args[0];
+                    return make(`${chain}.${String(method)}()`);
+                };
+            }
+        });
+        const $ = (selector, options) => make(String(selector) + (options && options.class ? `.${options.class}` : ''));
+        const def = loadDefinition({ $, setTimeout: () => {} });
+        def.sandbox.RED.tabs = { create: () => ({ addTab() {}, resize() {} }) };
+        def.sandbox.RED.popover = { tooltip() {} };
+        def.oneditprepare.call(node);
+        return { calls, listOptions };
+    }
+
+    it('the static headers list grows with its rows instead of overflowing onto the controls below (EDITOR-1)', function () {
+        const { calls } = runEditPrepare({ headers: { a: '1', b: '2', c: '3', d: '4' } });
+        // editableList fixes the list height to the measured min-height (120 px); it must be cleared again
+        const cleared = calls.find((c) => c.method === 'css' && c.args[0] === 'height' && c.args[1] === '' &&
+            /^#node-input-headers-container\..*editableList\(\)\.parent\(\)$/.test(c.chain));
+        assert.ok(cleared, 'height of the list container cleared after editableList()');
+    });
+
+    it('opening and saving the dialog keeps hand-written static headers the runtime accepts (EDITOR-2)', function () {
+        for (const headers of ['{"source":"line-3","n":[1,2]}', { meta: { a: 1 }, gone: null, list: ['x', null] },
+            [{ key: 'k', value: 'v' }, { name: 'k', value: { deep: true } }]]) {
+            const { calls, listOptions } = runEditPrepare({ headers });
+            const rows = calls.filter((c) => c.method === 'editableList' && c.args[0] === 'addItem').map((c) => c.args[1]);
+            // what the dialog shows in each row
+            const shown = rows.map((row) => {
+                const before = calls.length;
+                listOptions.addItem({}, 0, row);
+                const vals = calls.slice(before).filter((c) => c.method === 'val' && c.args.length === 1);
+                return { name: vals[0].args[0], value: vals[1].args[0] };
+            });
+            assert.ok(shown.every((r) => r.value !== '[object Object]' && r.value !== ''), JSON.stringify(shown));
+            // Done: oneditsave reads the rows back
+            const $ = (target) => (target === '#node-input-headers-container'
+                ? { editableList: () => ({ each: (fn) => shown.forEach((row) => fn.call(row)) }) }
+                : { find: (cls) => ({ val: () => (cls.includes('name') ? target.name : target.value) }) });
+            const node = {};
+            loadDefinition({ $ }).oneditsave.call(node);
+            // the Kafka headers sent: (name, value) pairs; ['x'] and 'x' are the same single header
+            const sent = (h) => Object.entries(internals.parseStaticHeaders(h).headers || {})
+                .flatMap(([name, value]) => [].concat(value).map((v) => [name, String(v)]));
+            const saved = JSON.parse(JSON.stringify(node.headers));
+            assert.deepEqual(sent(saved), sent(headers), `same headers sent after open + Done for ${JSON.stringify(headers)}`);
+        }
+    });
+
+    it('every message property of the help renders as one complete entry in the Node-RED help sidebar (DOC-1)', function () {
+        // Node-RED's markdown extension (editor-client red.js, descriptionList/description): a line with a
+        // third ':' ends the property list and only the text after its last ':' is kept.
+        const block = /^(?::[^:\n]+:[^:\n]*(?:\n|$))+/;
+        const entry = /^:([^:\n]+)\(([^:\n]+)\).*?:([^:\n]*)(?:\n|$)/;
+        const help = /<script type="text\/markdown" data-help-name="kafkajs-nc-producer">\n([\s\S]*?)<\/script>/.exec(html)[1];
+        const lines = help.split('\n').filter((l) => l.startsWith(': '));
+        assert.ok(lines.length >= 15);
+        for (const line of lines) {
+            assert.equal((block.exec(line + '\n') || [''])[0], line + '\n', `stays in the list: ${line}`);
+            const m = entry.exec(line);
+            assert.equal(m && m[3].trim(), line.slice(line.indexOf(') : ') + 4).trim(), `whole description kept: ${line}`);
+        }
+    });
+
+    it('the help matches the runtime (DOC-2, DOC-4, idempotent removed, timestamp types)', function () {
+        const help = /<script type="text\/markdown" data-help-name="kafkajs-nc-producer">\n([\s\S]*?)<\/script>/.exec(html)[1];
+        assert.ok(!/idempotent/i.test(help), 'the removed option is not documented');
+        assert.ok(!/Any setting can be/.test(help), 'only some settings fail every message when a variable is not set');
+        for (const state of ['`idle`', '`connecting`', '`connected`', '`waiting`', '`stopped`', '`closing`']) {
+            assert.ok(help.includes(state), state);
+        }
+        assert.ok(help.includes('`starting` / `12 queued` (grey)'));
+        assert.match(help, /a string of digits; other strings such as ISO dates are an error/);
+        assert.match(help, /A copy of a node keeps its \*Queue name\*/);
+        assert.match(help, /msg\.payload\.deadLetters/);
+    });
+
     it('registers the node with every runtime property as a default', function () {
         const def = loadDefinition();
         assert.equal(def.category, 'kafka');
@@ -1426,7 +1997,7 @@ describe('kafka producer editor (kafka-producer.html)', function () {
         assert.deepEqual(Array.from(def.outputLabels), ['delivery report']); // vm realm array
         assert.deepEqual(Object.keys(def.defaults).sort(), [
             'ackTimeout', 'acks', 'allowAutoTopicCreation', 'batchSize', 'broker', 'compression', 'headers',
-            'idempotent', 'key', 'name', 'partition', 'partitioner', 'queueDir', 'queueFsync', 'queueMaxAgeHours',
+            'key', 'name', 'partition', 'partitioner', 'queueDir', 'queueFsync', 'queueMaxAgeHours',
             'queueMaxMB', 'queueMaxMessages', 'queueMode', 'queueName', 'queueOverflow', 'topic', 'useMsgHeaders'
         ]);
         assert.equal(def.defaults.broker.type, 'kafkajs-nc-broker');
@@ -1467,6 +2038,17 @@ describe('kafka producer editor (kafka-producer.html)', function () {
         assert.ok(ok('queueMaxAgeHours', '${MAX_AGE}'));
     });
 
+    it('validators accept a ${VAR} only as the whole value, as Node-RED replaces nothing else (VALID-1)', function () {
+        const d = loadDefinition().defaults;
+        const reason = (field, v) => d[field].validate.call({}, v, {});
+        assert.equal(reason('topic', '$(TOPIC)'), true);
+        assert.equal(reason('partition', '${PARTITION}'), true);
+        for (const [field, v] of [['topic', ' ${TOPIC}'], ['topic', 'orders-${REGION}'], ['partition', '${PARTITION} '],
+            ['batchSize', ' ${BATCH}'], ['queueMaxMB', '${MB}0']]) {
+            assert.match(String(reason(field, v)), /only replaced when it is the whole value/, `${field} ${JSON.stringify(v)}`);
+        }
+    });
+
     it('has a markdown help text with the standard sections', function () {
         const m = /<script type="text\/markdown" data-help-name="kafkajs-nc-producer">\n([\s\S]*?)<\/script>/.exec(html);
         assert.ok(m, 'markdown help present');
@@ -1498,7 +2080,7 @@ describe('kafka producer internals', function () {
         assert.equal(c.ackTimeout, 30000);
         assert.equal(c.compression, 'none');
         assert.equal(c.partitioner, 'default');
-        assert.equal(c.idempotent, false);
+        assert.equal('idempotent' in c, false);
         assert.equal(c.allowAutoTopicCreation, true);
         assert.equal(c.batchSize, 100);
         assert.deepEqual(c.queue, {
@@ -1610,5 +2192,22 @@ describe('kafka producer internals', function () {
         assert.match(queueDirFor(parseConfig({ queueName: '${N}' }), RED, 'x').error, /environment variable N is not set/);
         const hostile = { get settings() { throw new Error('boom'); } };
         assert.ok(queueDirFor(cfg, hostile, 'x').dir, 'never throws');
+    });
+
+    it('queueDirFor rejects ${VAR} inside a path and ~user instead of creating literal directories (PATH-2)', function () {
+        const RED = { settings: { userDir: '/data/nr' } };
+        const embedded = /\$\{HOME\} is only replaced by Node-RED when it is the whole/;
+        for (const [cfg, settings, re] of [
+            [{ queueDir: '${HOME}/queues' }, {}, embedded],
+            [{ queueDir: '/mnt/${DATA}/q' }, {}, /\$\{DATA\} is only replaced/],
+            [{}, { kafkajsNcProducerQueueDir: '${HOME}/q' }, embedded],
+            [{ queueName: 'line-${LINE}' }, {}, /Queue name setting: \$\{LINE\} is only replaced/],
+            [{ queueDir: '~user/q' }, {}, /"~user\/q" is not expanded; use an absolute path/]
+        ]) {
+            const where = queueDirFor(parseConfig(cfg), { settings: { ...RED.settings, ...settings } }, 'x');
+            assert.equal(where.dir, null, JSON.stringify(cfg));
+            assert.match(where.error, re);
+        }
+        assert.equal(queueDirFor(parseConfig({ queueDir: '~/q' }), RED, 'x').error, null, '~/ is expanded');
     });
 });

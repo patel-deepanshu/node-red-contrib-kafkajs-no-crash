@@ -7,7 +7,9 @@
  */
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 const helper = require('node-red-node-test-helper');
 
 const brokerNode = require('../../nodes/kafka-broker.js');
@@ -53,6 +55,50 @@ function logged(level) {
     return spy.args.map((a) => a[0]).filter((e) => e.level === spy[level]).map((e) => String(e.msg));
 }
 
+/**
+ * The editor definition of the broker (nodes/kafka-broker.html), evaluated like the editor does, with a
+ * minimal jQuery stand-in: `fields` holds the form values by element id, as Node-RED fills them in before
+ * oneditprepare (a select keeps a value, a checkbox is checked when the property is truthy).
+ */
+function editorDefinition() {
+    const html = fs.readFileSync(path.join(__dirname, '..', '..', 'nodes', 'kafka-broker.html'), 'utf8');
+    const script = /<script type="text\/javascript">([\s\S]*?)<\/script>/.exec(html)[1];
+    const fields = {};
+    const element = (selector) => {
+        const id = String(selector).replace(/^#/, '');
+        const el = {
+            length: 1,
+            val(v) {
+                if (v === undefined) return fields[id];
+                fields[id] = v;
+                return el;
+            },
+            prop(name, v) {
+                if (v === undefined) return fields[id];
+                fields[id] = v;
+                return el;
+            },
+            is: () => !!fields[id],
+            on: () => el,
+            toggle: () => el,
+            trigger: () => el,
+            each: () => el,
+            attr: () => '',
+            children: () => el,
+            hide: () => el,
+            show: () => el
+        };
+        return el;
+    };
+    let def;
+    vm.runInNewContext(script, {
+        RED: { nodes: { registerType(type, d) { def = d; } }, tabs: { create: () => ({ addTab() {}, resize() {} }) } },
+        $: element,
+        setTimeout: () => {}
+    });
+    return { def, fields };
+}
+
 describe('kafkajs-nc-broker config node', function () {
     let fake;
     const savedEnv = {};
@@ -92,7 +138,7 @@ describe('kafkajs-nc-broker config node', function () {
     describe('valid configuration', function () {
         it('builds kafkajs options with numbers (not strings), trimmed brokers, SASL and TLS', async function () {
             await helper.load(brokerNode, [broker({
-                brokers: '  b1:9092 ,b2:9093\n PLAINTEXT://b3 , b1:9092 ',
+                brokers: '  b1:9092 ,b2:9093\n SASL_SSL://b3 , b1:9092 ',
                 clientId: ' my-client ',
                 authMechanism: 'scram-sha-256',
                 tls: true,
@@ -112,12 +158,6 @@ describe('kafkajs-nc-broker config node', function () {
             assert.equal(b1.configError, null);
             assert.deepEqual(b1.warnings, []);
             assert.deepEqual(b1.reconnect, { min: 2000, max: 30000, authMin: 90000 });
-            assert.equal(b1.reconnectMin, 2000);
-            assert.equal(b1.reconnectMax, 30000);
-            assert.equal(b1.authRetryMin, 90000);
-            assert.equal(b1.logLevelName, 'info');
-            assert.equal(b1.summary, 'b1:9092, b2:9093, b3:9092 · SASL/SCRAM-SHA-256 · TLS');
-            assert.deepEqual(b1.brokerList, ['b1:9092', 'b2:9093', 'b3:9092']);
 
             const kafka = b1.createKafka(PRODUCER);
             assert.ok(kafka instanceof fake.Kafka);
@@ -157,8 +197,27 @@ describe('kafkajs-nc-broker config node', function () {
             assert.equal('sasl' in o, false, 'no sasl key without SASL');
             assert.strictEqual(o.logLevel, fake.logLevel.WARN);
             assert.deepEqual(b1.reconnect, { min: 1000, max: 60000, authMin: 60000 });
-            assert.equal(b1.logLevelName, 'warn');
         });
+
+        it('exposes only the documented API to client nodes (no unused aliases)', async function () {
+            await helper.load(brokerNode, [broker()]);
+            const b1 = helper.getNode('b1');
+            for (const gone of ['reconnectMin', 'reconnectMax', 'authRetryMin', 'logLevelName', 'summary', 'brokerList']) {
+                assert.equal(b1[gone], undefined, gone);
+            }
+            assert.equal(typeof b1.createKafka, 'function');
+        });
+
+        it('warns when a broker prefix contradicts the TLS/SASL settings, instead of looping on "connection closed" (CFG-1)',
+            async function () {
+                await helper.load(brokerNode, [broker({ brokers: 'SASL_SSL://pkc-1.eu-west-1.aws.confluent.cloud:9092' })]);
+                const b1 = helper.getNode('b1');
+                assert.equal(b1.configError, null);
+                assert.deepEqual(callsOf(b1, 'warn').map(String), [
+                    'Brokers are given as SASL_SSL:// but "Use TLS" is off',
+                    'Brokers are given as SASL_SSL:// but no SASL mechanism is selected'
+                ]);
+            });
 
         it('creates a NEW kafkajs client for every call (one per connect attempt)', async function () {
             await helper.load(brokerNode, [broker()]);
@@ -395,6 +454,26 @@ describe('kafkajs-nc-broker config node', function () {
     });
 
     describe('safety net', function () {
+        let savedGrace;
+        beforeEach(function () {
+            savedGrace = safetyNet._setReleaseGrace(0); // remove at once; the grace period has its own test
+        });
+        afterEach(function () {
+            safetyNet._setReleaseGrace(savedGrace);
+        });
+
+        it('stays installed while client nodes are still closing after the broker closed (CRASH-2)', async function () {
+            const base = process.listenerCount('unhandledRejection');
+            safetyNet._setReleaseGrace(300);
+            await helper.load(brokerNode, [broker()]);
+            await helper.unload();
+            assert.equal(process.listenerCount('unhandledRejection'), base + 1, 'still installed after the broker closed');
+            assert.equal(safetyNet.isInstalled(), true);
+            assert.equal(safetyNet.handleRejection(fake.errors.connectionRefused(), 1, null, 'throw'), 'swallowed');
+            await new Promise((r) => setTimeout(r, 400));
+            assert.equal(process.listenerCount('unhandledRejection'), base, 'removed after the grace period');
+        });
+
         it('is acquired by default and released on close (ref-counted across broker nodes)', async function () {
             const base = process.listenerCount('unhandledRejection');
             const baseRefs = safetyNet.references();
@@ -431,6 +510,54 @@ describe('kafkajs-nc-broker config node', function () {
             // what Node would do with an unhandled rejection: call the listeners
             safetyNet._processListener(fake.errors.connectionRefused());
             assert.ok(logged('WARN').some((m) => m.startsWith('[kafkajs-nc] Prevented a crash: unhandled KafkaJS error')));
+        });
+    });
+
+    describe('editor (nodes/kafka-broker.html)', function () {
+        it('accepts every SASL mechanism spelling the runtime accepts (VALID-2)', function () {
+            const { def, fields } = editorDefinition();
+            fields['node-config-input-username'] = 'alice';
+            const valid = def.defaults.authMechanism.validate;
+            for (const v of ['none', 'NONE', '', 'plain', 'PLAIN', 'SCRAM-SHA-256', 'scram-sha-512', ' Scram-Sha-512 ']) {
+                assert.equal(valid(v, {}), true, v);
+            }
+            assert.equal(valid('gssapi', {}), 'unknown SASL mechanism');
+        });
+
+        it('shows what the runtime will use for hand-written values, so open + Done changes nothing (VALID-2)', function () {
+            const { def, fields } = editorDefinition();
+            // what Node-RED puts into the form from the node's properties before oneditprepare
+            Object.assign(fields, {
+                'node-config-input-authMechanism': 'PLAIN', 'node-config-input-logLevel': 'DEBUG',
+                'node-config-input-safetyNet': 'false', 'node-config-input-tls': 'false'
+            });
+            def.oneditprepare.call({ authMechanism: 'PLAIN', logLevel: 'DEBUG', safetyNet: 'false', tls: 'false' });
+            assert.equal(fields['node-config-input-authMechanism'], 'plain');
+            assert.equal(fields['node-config-input-logLevel'], 'debug');
+            assert.equal(fields['node-config-input-safetyNet'], false, "the string 'false' is off at runtime");
+            assert.equal(fields['node-config-input-tls'], false);
+            def.oneditprepare.call({ authMechanism: undefined, logLevel: 'nothing', safetyNet: undefined, tls: 'true' });
+            assert.equal(fields['node-config-input-authMechanism'], 'none');
+            assert.equal(fields['node-config-input-logLevel'], 'off');
+            assert.equal(fields['node-config-input-safetyNet'], true, 'on by default');
+            assert.equal(fields['node-config-input-tls'], true);
+        });
+
+        it('validates brokers like the runtime (semicolons, credentials, exact ${VAR})', function () {
+            const valid = editorDefinition().def.defaults.brokers.validate;
+            assert.equal(valid('kafka1:9092;kafka2:9092', {}), true);
+            assert.equal(valid('${KAFKA_BROKERS}', {}), true);
+            assert.match(String(valid(' ${KAFKA_BROKERS}', {})), /invalid broker address/, 'not replaced by Node-RED');
+            const credentials = valid('SASL_SSL://user:secret@b1:9093', {});
+            assert.equal(credentials, 'credentials do not belong in the broker address: set them on the Security tab');
+            assert.match(String(valid('b1:9092:9093', {})), /invalid broker address b1:9092:9093/);
+        });
+
+        it('says that the safety net covers promise rejections only (DOC-3)', function () {
+            const html = fs.readFileSync(path.join(__dirname, '..', '..', 'nodes', 'kafka-broker.html'), 'utf8');
+            assert.match(html, /Crash safety net for unhandled kafkajs promise rejections/);
+            assert.match(html, /covers promise rejections only, not uncaught\s+exceptions/);
+            assert.match(html, /--unhandled-rejections=strict/);
         });
     });
 

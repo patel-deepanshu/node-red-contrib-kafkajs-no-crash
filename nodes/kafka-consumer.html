@@ -101,8 +101,8 @@
                 <div class="form-row">
                     <label for="node-input-commitMode"><i class="fa fa-check-square-o"></i> Commit</label>
                     <select id="node-input-commitMode" style="width: calc(100% - 160px);">
-                        <option value="auto">Automatically (at most once into the flow)</option>
-                        <option value="manual">Manually with msg.action "commit" (at least once)</option>
+                        <option value="auto">Automatically (after the hand-off to the flow)</option>
+                        <option value="manual">Manually with msg.action "commit" (after processing)</option>
                     </select>
                 </div>
                 <div class="kafkajs-nc-commit-auto">
@@ -116,13 +116,16 @@
                     </div>
                     <div class="form-tips">
                         The position is stored when either limit is reached, and always at the end of each batch of
-                        messages fetched from Kafka.
+                        messages fetched from Kafka. Messages handed to the flow since the last stored position are
+                        delivered again after a crash or restart; a message the flow was still processing when its
+                        position was stored is not.
                     </div>
                 </div>
                 <div class="form-tips kafkajs-nc-commit-manual">
-                    Nothing is committed automatically. When a message has been processed, send it (or just its
-                    <code>msg.kafka</code>) back to this node with <code>msg.action = "commit"</code>. Messages that were
-                    not committed are delivered again after a restart or a rebalance.
+                    Nothing is committed automatically. When a message has been processed, send it back to this node
+                    with <code>msg.action = "commit"</code> and this node's <code>msg.kafka</code> (a producer node
+                    replaces <code>msg.kafka</code>: keep a copy). Messages that were not committed are delivered again
+                    after a restart or a rebalance (at least once).
                 </div>
             </div>
 
@@ -177,8 +180,11 @@
 (function () {
     'use strict';
 
-    var ENV_REF = /^\s*(\$\{[^}]+\}|\$\([^)]+\))\s*$/;
+    // Node-RED replaces ${NAME} / $(NAME) only when it is the WHOLE value, without spaces
+    // (@node-red/runtime lib/flows/util.js); anything else stays literal at runtime.
+    var ENV_REF = /^(\$\{\S+\}|\$\(\S+\))$/;
     var TOPIC_RE = /^[A-Za-z0-9._-]{1,249}$/;
+    var NOT_WHOLE = 'a ${NAME} reference is only replaced when it is the whole value, without spaces';
 
     function isBlank(v) {
         return v === undefined || v === null || String(v).trim() === '';
@@ -213,9 +219,12 @@
         if (isBlank(v)) {
             return opt ? 'at least one topic is required' : false;
         }
+        if (ENV_REF.test(String(v))) {
+            return true;
+        }
         var text = String(v).trim();
         if (ENV_REF.test(text)) {
-            return true;
+            return opt ? NOT_WHOLE : false; // spaces around it
         }
         if (isRegex(this)) {
             try {
@@ -230,10 +239,13 @@
                 return opt ? 'invalid regular expression: ' + err.message : false;
             }
         }
+        if (text.indexOf('${') !== -1) {
+            return opt ? NOT_WHOLE : false; // e.g. "orders, ${MORE}": stays literal at runtime
+        }
         var names = text.split(/[\s,]+/);
         for (var i = 0; i < names.length; i++) {
             var name = names[i];
-            if (name !== '' && !ENV_REF.test(name) && (!TOPIC_RE.test(name) || name === '.' || name === '..')) {
+            if (name !== '' && (!TOPIC_RE.test(name) || name === '.' || name === '..')) {
                 return opt ? 'invalid topic name "' + name + '" (letters, digits, ".", "_" and "-", at most 249)' : false;
             }
         }
@@ -306,8 +318,14 @@
                 $('#node-input-autoStart').prop('checked', true);
             }
 
-            // The runtime default group id is stable: show exactly what will be used.
-            $('#node-input-groupId').attr('placeholder', 'node-red-' + String(node.id).replace(/[^A-Za-z0-9._-]/g, '_'));
+            // The runtime default group id is stable: show exactly what will be used. Inside a subflow the
+            // runtime node id is "<subflow instance id>-<node id>", so every instance has its own group.
+            var groupPlaceholder = 'node-red-' + String(node.id).replace(/[^A-Za-z0-9._-]/g, '_');
+            if (node.z && RED.nodes.subflow && RED.nodes.subflow(node.z)) {
+                groupPlaceholder = 'node-red-<subflow instance id>-' + String(node.id).replace(/[^A-Za-z0-9._-]/g, '_') +
+                    ' (one group per subflow instance)';
+            }
+            $('#node-input-groupId').attr('placeholder', groupPlaceholder);
 
             function updateCommitSections() {
                 var manual = $('#node-input-commitMode').val() === 'manual';
@@ -348,8 +366,8 @@ Reads messages from Kafka topics and sends one message per Kafka record. Reconne
 The input only takes control messages:
 
 : action (string) : `pause`, `resume`, `stop`, `start`, `restart`, `seek` or `commit` (see *Control messages*). Any other value, or none, is an error.
-: *payload* (object) : for `seek`: `{ topic, partition, offset }`.
-: *kafka* (object) : for `commit`: `{ topic, partition, offset }` of the processed message, as set on every output message.
+: *payload* (object) : for `seek`, the object `{ topic, partition, offset }`.
+: *kafka* (object) : for `commit`, the `msg.kafka` this node set on the processed message (its `groupId` must be this node's group). A producer node replaces `msg.kafka` with its delivery report, see *Commit modes*.
 
 ### Outputs
 
@@ -359,8 +377,8 @@ The input only takes control messages:
 : partition (number) : the partition.
 : offset (string) : the offset of the message in its partition. A string, because offsets can exceed JavaScript's safe integers.
 : timestamp (number) : the Kafka timestamp in milliseconds since the epoch.
-: headers (object) : the Kafka headers, `{ name: value }`. Values are strings (or Buffers with *Header values: Buffers*); a header sent several times is an array; a header without value is `null`.
-: kafka (object) : `{ groupId, topic, partition, offset, timestamp, highWatermark }`. `highWatermark` (string) is the offset after the last message in the partition when the batch was fetched, so `highWatermark - offset - 1` is roughly how many messages are still waiting. Keep `msg.kafka` if you commit manually.
+: headers (object) : the Kafka headers as an object of name → value. Values are strings (or Buffers when *Header values* is *Buffers*); a header sent several times is an array; a header without value is `null`.
+: kafka (object) : `{ groupId, topic, partition, offset, timestamp, highWatermark }`. `highWatermark` (string) is the offset after the last message in the partition when the batch was fetched, so `highWatermark - offset - 1` is roughly how many messages are still waiting. Keep `msg.kafka` if you commit manually (a producer node replaces it with its delivery report).
 
 ### Details
 
@@ -376,13 +394,16 @@ The **Group ID** decides which consumers share the work and where Kafka stores h
 *committed offsets*). Every consumer with the same group ID gets a share of the partitions; give two nodes different
 group IDs if both should receive every message. When empty, the group ID is `node-red-<node id>`: it stays the same
 across restarts and deploys, so the node continues where it stopped. Copying or importing the node gives it a new id
-and therefore a new group that starts from scratch; set a Group ID if you need it to survive that.
+and therefore a new group that starts from scratch; set a Group ID if you need it to survive that. Inside a subflow
+the node id is `<subflow instance id>-<node id>`, so every instance of the subflow has a group of its own.
 
 *Read from the beginning* only applies when the group has no committed position for a partition (a new group):
 it then starts with the oldest message instead of only new ones. It does not rewind an existing group; use `seek`
 or the admin node (`resetOffsets`) for that.
 
 Any setting can be `${NAME}` to read an environment variable, for example a Topics value of `${KAFKA_TOPICS}`.
+Node-RED only replaces it when it is the whole value, without spaces: `orders, ${MORE}` stays as it is, and the node
+reports it.
 
 #### Commit modes and delivery guarantee
 
@@ -390,14 +411,22 @@ Kafka remembers, per group and partition, the offset of the next message to read
 happens if Node-RED stops while messages are being processed:
 
 - **Automatically** (default): the position is stored every *Every* ms (default 5 s), every *Or every* messages,
-  and at the end of each fetched batch, once the messages were handed to the flow. If Node-RED stops or crashes
-  while a message is still being processed by the flow, that message is **not** delivered again: *at most once*
-  into the flow. Usually fine for telemetry.
-- **Manually**: nothing is stored until you send `msg.action = "commit"` with the message's `msg.kafka` (send the
-  processed message itself back to this node's input, or a message with the same `msg.kafka`). The committed
-  position is that message's offset + 1. Messages that were not committed are delivered **again** after a
-  restart, a reconnect or a rebalance: *at least once*. Downstream processing should tolerate duplicates. Committing
-  a message commits every earlier message of the same partition too.
+  and at the end of each fetched batch, once the messages were handed to the flow. The messages handed to the flow
+  since the last stored position (at most the last fetched batch) are delivered **again** after a
+  crash or restart: *at least once* into the flow, with possible duplicates. The position does not wait for the
+  flow to finish a message, so a message the flow was still processing when its position was stored is not
+  delivered again. Usually fine for telemetry; use manual commits when every message must be fully processed.
+- **Manually**: nothing is stored until you send `msg.action = "commit"` with the message's `msg.kafka`: send the
+  processed message itself back to this node's input. The committed position is that message's offset + 1.
+  Messages that were not committed are delivered **again** after a restart, a reconnect or a rebalance: *at least
+  once*. Downstream processing should tolerate duplicates. Committing a message commits every earlier message of
+  the same partition too.
+
+`msg.kafka` must be the one this node set on its output message: the commit is refused when its `groupId` is not
+this node's group or its topic is not one this node subscribes to. **A producer node replaces `msg.kafka`** with
+its delivery report (the topic, partition and offset it wrote to). In a *consume → produce → commit* flow, keep a
+copy before the producer and put it back before the commit, for example with *change* nodes: set `msg.consumed` to
+`msg.kafka` before the producer, then move `msg.consumed` to `msg.kafka` and set `msg.action` to `commit`.
 
 #### Pause, stop and order
 
@@ -420,9 +449,11 @@ log explains the reason.
 The node connects when it is deployed and reconnects on its own after any failure, waiting longer after each failed
 attempt (settings of the broker node). It always creates a fresh Kafka client, so a consumer that was stopped can
 never come back as a hidden extra group member. Authentication, authorisation (also for the topic or the group)
-and configuration errors are retried slowly (*After auth/config errors* in the broker node). The first failure is
-logged as an error; repeats are logged at debug level, with a warning every 10th attempt. Use a *status* node to
-react to connection changes.
+and configuration errors are retried slowly (*After auth/config errors* in the broker node). *group coordinator
+not found* is retried with the normal waits: Kafka reports a coordinator that is not available yet (brokers
+starting or recovering) and a missing permission for the group the same way. The first failure is logged as an
+error (as a warning for a missing topic, which is usually temporary); repeats are logged at debug level, with a
+warning every 10th attempt. Use a *status* node to react to connection changes.
 
 A message that cannot be turned into an output message (for example invalid JSON with *Parsed JSON*) is reported to
 *catch* nodes with `msg.payload` as text and is skipped; the consumer carries on. Control messages that fail
@@ -432,11 +463,17 @@ A message that cannot be turned into an output message (for example invalid JSON
 
 - `connecting…` / `joining group…` (yellow): starting.
 - `connected · orders, payments` (green): consuming.
+- `connected · no partitions` (yellow dot): in the group, but no partition is assigned to this node. With a regular
+  expression this usually means it matches no topic (see the warning in the log); with a topic list, other members
+  of the group have all partitions.
 - `paused · orders` (yellow dot): paused with `msg.action = "pause"`.
 - `rebalancing…` (yellow): the group is redistributing the partitions.
 - `ECONNREFUSED broker:9092 · retry 8s` (yellow): Kafka cannot be reached; the next attempt is in 8 s.
 - `unknown topic/partition · retry 2s` (yellow): a subscribed topic does not exist (yet). The node keeps retrying
-  and starts consuming as soon as the topic is created.
+  and starts consuming at the next retry once the topic exists (the waits grow up to the broker's *max* reconnect
+  delay).
+- `group coordinator not found · retry 2s` (yellow): the group's coordinator is not available (yet), or the user
+  may not use the group.
 - `auth failed · retry 60s` (red): wrong user name or password. Other problems that need a human show their
   reason instead, for example `TLS: self-signed cert · retry 60s` or `not authorized (group) · retry 60s`.
 - `stopped` (grey): stopped with `msg.action = "stop"`, or *Start consuming on deploy* is off.
@@ -451,10 +488,15 @@ Send a message with `msg.action` set to:
 - `stop`: leave the group and disconnect; no reconnect until `start`. `start` starts a stopped consumer.
 - `restart`: disconnect and connect again now (also picks up new topics matching a regular expression).
 - `seek`: continue reading a partition from another offset: `msg.payload = { topic, partition, offset }`. `topic` may
-  be left out when the node subscribes to a single topic; `offset` is a number, `"earliest"` or `"latest"`. Only
-  works while connected, for a partition assigned to this consumer.
-- `commit`: store the position after a processed message (manual commit mode): `msg.kafka = { topic, partition,
-  offset }` as received; `msg.topic`, `msg.partition` and `msg.offset` are used when `msg.kafka` is missing.
+  be left out when the node subscribes to a single topic; `offset` is a number, `"earliest"` (the oldest message
+  still stored) or `"latest"` (only new messages). The node looks up the partition's current offsets with a short
+  admin connection first: `"earliest"` and `"latest"` become those offsets, and a number outside them is refused
+  (Kafka would otherwise jump to its default position and store it, even with manual commits). Only works while
+  connected and not rebalancing, for a partition assigned to this consumer (see the error for the assigned ones).
+  With *Automatically* the new position is stored at once; with *Manually* only when you commit.
+- `commit`: store the position after a processed message: `msg.kafka` as this node set it on the output message
+  (see *Commit modes*); `msg.topic`, `msg.partition` and `msg.offset` are used when `msg.kafka` is missing. It fails
+  when the consumer stopped before Kafka stored the position.
 
 Every control message completes with `done()`, so a *complete* node can follow it; a failing one goes to *catch*
 nodes. The control messages are not sent to the output.
@@ -463,7 +505,8 @@ nodes. The control messages are not sent to the output.
 
 Process at least once: this node (Commit: *Manually*) → a *function* node that does the work → a *link* back to
 this node's input with `msg.action = "commit"` set by a *change* node. A *catch* node on the function node can log
-failures; the uncommitted message is then delivered again after the next restart.
+failures; the uncommitted message is then delivered again after the next restart. With a producer node in the
+path, keep a copy of `msg.kafka` before it (see *Commit modes*).
 
 ### References
 

@@ -7,6 +7,9 @@
  */
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 const helper = require('node-red-node-test-helper');
 
 const brokerNode = require('../../nodes/kafka-broker.js');
@@ -16,6 +19,9 @@ const { createFakeKafkajs } = require('../helpers/fake-kafkajs');
 const { tmpDir, sleep, waitFor, nextStatus, statusCalls } = require('../helpers/common');
 
 helper.init(require.resolve('node-red'));
+
+/** Short reconnect delays (the broker's limits: reconnectMin >= 100 ms, authRetryMin >= 1 s). */
+const FAST_RECONNECT = { reconnectMin: '100', reconnectMax: '200', authRetryMin: '1000' };
 
 function flow(adminProps = {}, brokerProps = {}) {
     return [
@@ -130,13 +136,15 @@ describe('kafkajs-nc-admin node', function () {
             ['fetchTopicOffsetsByTimestamp', { topic: 'orders', timestamp: '2024-01-01T00:00:00.000Z' },
                 { topic: 'orders', timestamp: 1704067200000 }, [{ partition: 0, offset: '0' }]],
             ['fetchTopicOffsetsByTimestamp', { topic: 'orders', timestamp: 1700000000000 }, { topic: 'orders', timestamp: 1700000000000 }, null],
+            ['fetchTopicOffsetsByTimestamp', { topic: 'orders', timestamp: new Date(0) }, { topic: 'orders', timestamp: 0 }, null],
+            ['fetchTopicOffsetsByTimestamp', { topic: 'orders', timestamp: ' 1700000000000 ' }, { topic: 'orders', timestamp: 1700000000000 }, null],
+            ['createTopics', { topics: [{ topic: 'r', replicaAssignment: [{ partition: '0', replicas: [1, '2'] }] }] },
+                { topics: [{ topic: 'r', replicaAssignment: [{ partition: 0, replicas: [1, 2] }] }] }, true],
+            ['createPartitions', { topicPartitions: [{ topic: 'orders', count: 3, assignments: [[1, 2], ['2', 3]] }] },
+                { topicPartitions: [{ topic: 'orders', count: 3, assignments: [[1, 2], [2, 3]] }] }, true],
             ['fetchOffsets', { groupId: 'g', topics: ['orders'] }, { groupId: 'g', topics: ['orders'] },
                 [{ topic: 'orders', partitions: [{ partition: 0, offset: '-1', metadata: null }] }]],
             ['fetchOffsets', { groupId: 'g' }, { groupId: 'g' }, null],
-            ['resetOffsets', { groupId: 'g', topic: 'orders', earliest: true }, { groupId: 'g', topic: 'orders', earliest: true }, true],
-            ['resetOffsets', { groupId: 'g', topic: 'orders' }, { groupId: 'g', topic: 'orders', earliest: false }, true],
-            ['setOffsets', { groupId: 'g', topic: 't', partitions: [{ partition: '0', offset: 42 }, { partition: 1, offset: '7' }] },
-                { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: '42' }, { partition: 1, offset: '7' }] }, true],
             ['listGroups', undefined, undefined, { groups: [{ groupId: 'test-group', protocolType: 'consumer' }] }],
             ['describeGroups', 'g1', ['g1'], null],
             ['describeGroups', { groupIds: ['g1', 'g2'] }, ['g1', 'g2'], null],
@@ -173,6 +181,67 @@ describe('kafkajs-nc-admin node', function () {
             });
         }
 
+        it('resetOffsets sets the real low/high offsets, never kafkajs\' -2/-1 markers', async function () {
+            // consumers read a negative committed offset as "no position" and apply their own fromBeginning
+            await helper.load([brokerNode, adminNode], flow());
+            fake.behaviour.adminResults = {
+                fetchTopicOffsets: [{ partition: 0, offset: '9', high: '9', low: '2' }, { partition: 1, offset: '5', high: '5', low: '0' }]
+            };
+            const earliest = await run(message({ action: 'resetOffsets', payload: { groupId: 'g', topic: 'orders', earliest: 'true' } }));
+            assert.equal(earliest.out.payload, true);
+            const latest = await run(message({ action: 'resetOffsets', payload: { groupId: 'g', topic: 'orders' } }));
+            assert.equal(latest.out.payload, true);
+            assert.deepEqual(fake.admins[0].calls, [
+                { method: 'fetchTopicOffsets', args: 'orders' },
+                { method: 'setOffsets', args: { groupId: 'g', topic: 'orders', partitions: [{ partition: 0, offset: '2' }, { partition: 1, offset: '0' }] } },
+                { method: 'fetchTopicOffsets', args: 'orders' },
+                { method: 'setOffsets', args: { groupId: 'g', topic: 'orders', partitions: [{ partition: 0, offset: '9' }, { partition: 1, offset: '5' }] } }
+            ]);
+            assert.ok(fake.admins[0].calls.every((c) => c.method !== 'resetOffsets'));
+        });
+
+        it('setOffsets checks the partitions and the offsets against the topic before setting them', async function () {
+            await helper.load([brokerNode, adminNode], flow());
+            fake.behaviour.adminResults = { fetchTopicOffsets: [{ partition: 0, offset: '50', high: '50', low: '10' }] };
+            const ok = await run(message({
+                action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: '0', offset: 42 }] }
+            }));
+            assert.equal(ok.out.payload, true);
+            const bounds = await run(message({
+                action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: '50' }] }
+            }));
+            assert.ok(bounds.out, 'the high offset itself is allowed');
+            // kafkajs silently ignores a partition that does not exist and reports success
+            const missing = await run(message({
+                action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 7, offset: 1 }] }
+            }));
+            assert.match(missing.error.error.message, /setOffsets: partition 7 does not exist in topic "t" \(it has 1 partition\)/);
+            for (const offset of ['51', 9]) {
+                const outside = await run(message({
+                    action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset }] }
+                }));
+                assert.match(outside.error.error.message, new RegExp(`offset ${offset} for partition 0 of topic "t" is outside its offsets \\(10 to 50\\)`));
+            }
+            assert.deepEqual(fake.admins[0].calls.filter((c) => c.method === 'setOffsets').map((c) => c.args.partitions),
+                [[{ partition: 0, offset: '42' }], [{ partition: 0, offset: '50' }]]);
+            assert.equal(fake.admins.length, 1, 'a refused request keeps the connection');
+            assert.equal(fake.admins[0].disconnectCount, 0);
+        });
+
+        it('setOffsets and resetOffsets get at least LIMITS.groupOffsetsTimeoutMs (kafkajs needs ~5 s for them)', async function () {
+            await helper.load([brokerNode, adminNode], flow({ timeout: '150' }));
+            fake.behaviour.adminDelayMs = { setOffsets: 400 };
+            const set = await run(message({ action: 'setOffsets', payload: { groupId: 'g', topic: 'test-topic', partitions: [{ partition: 0, offset: 0 }] } }));
+            assert.equal(set.error, undefined, set.error && set.error.error.message);
+            const reset = await run(message({ action: 'resetOffsets', payload: { groupId: 'g', topic: 'test-topic' } }));
+            assert.equal(reset.error, undefined, reset.error && reset.error.error.message);
+            assert.equal(adminNode.LIMITS.groupOffsetsTimeoutMs, 15000);
+            // other actions keep the node's timeout
+            fake.behaviour.adminDelayMs = { listTopics: 400 };
+            const list = await run(message({ action: 'listTopics' }));
+            assert.match(list.error.error.message, /timed out after 150ms/);
+        });
+
         it('the node Action wins over msg.action; msg.action is case-insensitive', async function () {
             await helper.load([brokerNode, adminNode], flow({ action: 'listTopics' }));
             const { out } = await run(message({ action: 'deleteTopics', payload: 'x' }));
@@ -182,6 +251,13 @@ describe('kafkajs-nc-admin node', function () {
             await helper.load([brokerNode, adminNode], flow());
             const second = await run(message({ action: 'DESCRIBECLUSTER' }));
             assert.equal(second.out.kafka.action, 'describeCluster');
+            // trimmed too, like the consumer's and the producer's msg.action
+            const third = await run(message({ action: '  listtopics\n' }));
+            assert.equal(third.out.kafka.action, 'listTopics');
+            await helper.unload();
+            await helper.load([brokerNode, adminNode], flow({ action: ' LISTTOPICS ' }));
+            const fourth = await run(message({}));
+            assert.equal(fourth.out.kafka.action, 'listTopics');
         });
 
         it('keeps one connected client for many messages and reports "ok"', async function () {
@@ -216,7 +292,34 @@ describe('kafkajs-nc-admin node', function () {
             [{ action: 'resetOffsets', payload: { groupId: 'g' } }, /resetOffsets: msg\.payload\.topic is required/],
             [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't' } }, /setOffsets: msg\.payload\.partitions is required/],
             [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: 'abc' }] } },
-                /partitions\[\]\.offset must be an integer/],
+                /partitions\[\]\.offset must be a whole number from 0 to 2\^63-1/],
+            // the -1/-2 markers are stored as such and read as "no position" by consumers (ADMIN-1)
+            [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: -1 }] } }, /offset must be a whole number/],
+            [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: '-2' }] } }, /offset must be a whole number/],
+            // kafkajs would wrap it to 200376420520689663 and report success
+            [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: '99999999999999999999999' }] } },
+                /offset must be a whole number from 0 to 2\^63-1/],
+            [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: 1.5 }] } }, /offset must be a whole number/],
+            [{ action: 'setOffsets', payload: { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: 1 }, { partition: '0', offset: 2 }] } },
+                /partition 0 is listed twice/],
+            // Kafka reads -1/-2 as latest/earliest; Date.parse reads '-1' as 2001-01-01
+            [{ action: 'fetchTopicOffsetsByTimestamp', payload: { topic: 't', timestamp: -1 } }, /timestamp is required \(milliseconds since the epoch >= 0/],
+            [{ action: 'fetchTopicOffsetsByTimestamp', payload: { topic: 't', timestamp: '-1' } }, /timestamp is required/],
+            [{ action: 'fetchTopicOffsetsByTimestamp', payload: { topic: 't', timestamp: 'abc 1' } }, /timestamp is required/],
+            [{ action: 'fetchTopicOffsetsByTimestamp', payload: { topic: 't', timestamp: new Date(-5000) } }, /timestamp is required/],
+            // malformed assignments would make the broker close the connection (looks like a network failure)
+            [{ action: 'createPartitions', payload: { topicPartitions: [{ topic: 'x', count: 2, assignments: [['a']] }] } },
+                /assignments\[0\] must contain broker ids/],
+            [{ action: 'createPartitions', payload: { topicPartitions: [{ topic: 'x', count: 2, assignments: [[]] }] } },
+                /assignments\[0\] must be a non-empty array of broker ids/],
+            [{ action: 'createPartitions', payload: { topicPartitions: [{ topic: 'x', count: 2, assignments: '1,2' }] } },
+                /assignments of topic "x" must be an array/],
+            [{ action: 'createTopics', payload: { topics: [{ topic: 'x', replicaAssignment: [[1, 2]] }] } },
+                /replicaAssignment\[0\] of topic "x" must be \{partition, replicas\}/],
+            [{ action: 'createTopics', payload: { topics: [{ topic: 'x', replicaAssignment: [{ partition: 0, replicas: [-1] }] }] } },
+                /replicaAssignment\[0\]\.replicas must contain broker ids/],
+            [{ action: 'createTopics', payload: { topics: [{ topic: 'x', replicaAssignment: [{ replicas: [1] }] }] } },
+                /replicaAssignment\[0\]\.partition is required/],
             [{ action: 'describeGroups', payload: {} }, /describeGroups: msg\.payload\.groupIds is required/],
             [{ action: 'deleteGroups', payload: [] }, /deleteGroups: msg\.payload\.groupIds is required/],
             [{ action: 'describeConfigs', payload: {} }, /describeConfigs: msg\.payload\.resources is required/],
@@ -270,8 +373,8 @@ describe('kafkajs-nc-admin node', function () {
             assert.equal(fake.admins[0].disconnectCount, 0);
         });
 
-        it('connection failure => done(err) to Catch; the next message reconnects with a new client', async function () {
-            await helper.load([brokerNode, adminNode], flow());
+        it('connection failure => done(err) to Catch; messages fail at once for the reconnect delay, then a new client connects', async function () {
+            await helper.load([brokerNode, adminNode], flow({}, FAST_RECONNECT));
             const refused = fake.errors.connectionRefused();
             fake.behaviour.adminConnectError = (args, admin) => (admin.index === 0 ? refused : null);
             const first = await run(message({ action: 'listTopics' }));
@@ -280,6 +383,13 @@ describe('kafkajs-nc-admin node', function () {
             await nextStatus(helper.getNode('a1'), (s) => s.fill === 'red' && /^listTopics: ECONNREFUSED/.test(s.text));
             await waitFor(() => fake.admins[0].disconnectCount === 1, { message: 'failed client is disconnected' });
 
+            // right after a failed attempt: no new attempt (it would most likely fail the same way, slowly)
+            const fast = await run(message({ action: 'listTopics' }));
+            assert.match(fast.error.error.message,
+                /Kafka admin listTopics not run: the last connection attempt failed \(ECONNREFUSED .*\); the next message after \S+ connects again/);
+            assert.equal(fake.admins.length, 1);
+
+            await sleep(150); // reconnectMin 100 ms (+/- 20 % jitter)
             const second = await run(message({ action: 'listTopics' }));
             assert.deepEqual(second.out.payload, ['test-topic']);
             assert.equal(fake.admins.length, 2, 'a new admin client');
@@ -287,38 +397,50 @@ describe('kafkajs-nc-admin node', function () {
             assert.equal(fake.admins[1].state, 'connected');
         });
 
-        it('a transient failure of a running operation drops the client; the next message reconnects', async function () {
+        it('messages queued behind a failing connect fail at once instead of each waiting for another attempt', async function () {
             await helper.load([brokerNode, adminNode], flow());
-            await run(message({ action: 'listTopics' }));
-            fake.behaviour.adminErrors = { listTopics: (args, admin) => (admin.index === 0 ? fake.errors.connectionClosed() : null) };
-            const failed = await run(message({ action: 'listTopics' }));
-            assert.ok(failed.error, 'error routed to Catch');
-            await waitFor(() => fake.admins[0].disconnectCount === 1, { message: 'old client disconnected' });
-            const ok = await run(message({ action: 'listTopics' }));
-            assert.deepEqual(ok.out.payload, ['test-topic']);
-            assert.equal(fake.admins.length, 2);
+            fake.behaviour.connectDelayMs = 200;
+            fake.behaviour.adminConnectError = fake.errors.connectionRefused();
+            const a1 = helper.getNode('a1');
+            const caught = collect('caught');
+            const started = Date.now();
+            for (let i = 0; i < 5; i++) a1.receive(message({ action: 'listTopics' }));
+            await waitFor(() => caught.length === 5, { timeout: 2000 });
+            assert.ok(Date.now() - started < 600, `took ${Date.now() - started} ms (one failing connect, not five)`);
+            assert.equal(fake.admins.length, 1);
+            assert.match(caught[0].error.message, /ECONNREFUSED/);
+            for (const m of caught.slice(1)) assert.match(m.error.message, /not run: the last connection attempt failed/);
         });
 
-        it('authentication failure shows "auth failed" and reconnects on the next message', async function () {
-            await helper.load([brokerNode, adminNode], flow({}, { authMechanism: 'plain', tls: true }), { b1: { username: 'u', password: 'wrong' } });
+        it('authentication failure shows "auth failed"; the next attempt waits authRetryMin (no lockout), then reconnects', async function () {
+            this.timeout(5000);
+            await helper.load([brokerNode, adminNode], flow({}, { authMechanism: 'plain', tls: true, ...FAST_RECONNECT }),
+                { b1: { username: 'u', password: 'wrong' } });
             const sasl = fake.errors.saslAuth('PLAIN');
             fake.behaviour.adminConnectError = (args, admin) => (admin.index === 0 ? sasl : null);
             const first = await run(message({ action: 'listTopics' }));
             assert.ok(first.error);
             await nextStatus(helper.getNode('a1'), (s) => s.fill === 'red' && /^auth failed/.test(s.text));
+            await sleep(300); // longer than reconnectMax: an auth failure holds back for authRetryMin (1 s here)
+            const held = await run(message({ action: 'listTopics' }));
+            assert.match(held.error.error.message, /not run: the last connection attempt failed \(.*SASL.*\)/i);
+            assert.equal(fake.admins.length, 1);
+            await sleep(800);
             const second = await run(message({ action: 'listTopics' }));
             assert.ok(second.out);
             assert.equal(fake.admins.length, 2);
         });
 
         it('kafka.admin() throwing synchronously is reported per message, without crashing', async function () {
-            await helper.load([brokerNode, adminNode], flow());
+            this.timeout(5000);
+            await helper.load([brokerNode, adminNode], flow({}, FAST_RECONNECT));
             fake.behaviour.adminFactoryError = new TypeError("'timeout' is not a number, received 'string'");
             const first = await run(message({ action: 'listTopics' }));
             assert.match(first.error.error.message, /Could not create the Kafka admin client: 'timeout' is not a number/);
             // same status as the producer and the consumer for a factory throw
             await nextStatus(helper.getNode('a1'), (s) => s.fill === 'red' && s.text === 'config error');
             delete fake.behaviour.adminFactoryError;
+            await sleep(1100); // a config problem is retried after authRetryMin (1 s here)
             const second = await run(message({ action: 'listTopics' }));
             assert.ok(second.out);
         });
@@ -344,10 +466,11 @@ describe('kafkajs-nc-admin node', function () {
         });
 
         it('the timeout also bounds connecting; a connect that completes late is disconnected (no zombie)', async function () {
-            await helper.load([brokerNode, adminNode], flow({ timeout: '150' }));
+            await helper.load([brokerNode, adminNode], flow({ timeout: '150' }, FAST_RECONNECT));
             fake.behaviour.connectDelayMs = (args, client) => (client.index === 0 ? 400 : 0);
             const first = await run(message({ action: 'listTopics' }));
             assert.match(first.error.error.message, /timed out after 150ms/);
+            await sleep(150); // a connect that timed out counts as a failed attempt (reconnectMin 100 ms here)
             const second = await run(message({ action: 'listTopics' }));
             assert.ok(second.out, 'second message uses a fresh client');
             assert.equal(fake.admins.length, 2);
@@ -355,6 +478,51 @@ describe('kafkajs-nc-admin node', function () {
             await waitFor(() => fake.admins[0].connectCount === 1 && fake.admins[0].state === 'disconnected',
                 { timeout: 2000, message: 'late connect is disconnected' });
             assert.equal(fake.admins[0].calls.length, 0, 'the abandoned client was never used');
+        });
+
+        it('the timeout counts from the arrival: a message that waited only gets the rest of it', async function () {
+            await helper.load([brokerNode, adminNode], flow({ timeout: '1000' }));
+            fake.behaviour.adminDelayMs = { listTopics: 700 };
+            const a1 = helper.getNode('a1');
+            const outs = collect('out');
+            const caught = collect('caught');
+            const started = Date.now();
+            a1.receive(message({ n: 1, action: 'listTopics' }));
+            a1.receive(message({ n: 2, action: 'listTopics' }));
+            await waitFor(() => outs.length + caught.length === 2, { timeout: 3000 });
+            const took = Date.now() - started;
+            assert.deepEqual(outs.map((m) => m.n), [1]);
+            // it would have run until ~1400 ms, 400 ms after its timeout
+            assert.equal(caught[0].n, 2);
+            assert.match(caught[0].error.message, /: Kafka admin listTopics timed out after 1000ms$/);
+            assert.ok(took < 1250, `took ${took} ms`);
+        });
+
+        it('behind a hung broker every queued message settles within its own timeout, not one timeout after another', async function () {
+            await helper.load([brokerNode, adminNode], flow({ timeout: '300' }));
+            fake.behaviour.adminDelayMs = { listTopics: Infinity };
+            const a1 = helper.getNode('a1');
+            const caught = collect('caught');
+            const started = Date.now();
+            for (let i = 0; i < 12; i++) a1.receive(message({ action: 'listTopics' }));
+            // before: they settled at 0.3, 0.6, ... 3.6 s, each with the same text
+            await waitFor(() => caught.length === 12, { timeout: 3000 });
+            const took = Date.now() - started;
+            assert.ok(took < 900, `took ${took} ms`);
+            for (const m of caught) assert.match(m.error.message, /Kafka admin listTopics timed out after 300ms/);
+            const calls = fake.admins.reduce((n, admin) => n + admin.calls.length, 0);
+            assert.ok(calls <= 2, `expired messages are not sent to Kafka (${calls} calls)`);
+        });
+
+        it('a timeout reports how long the message waited behind earlier ones', async function () {
+            await helper.load([brokerNode, adminNode], flow({ timeout: '1500' }));
+            fake.behaviour.adminDelayMs = { listTopics: (args, admin) => (admin.calls.length === 1 ? 1100 : Infinity) };
+            const a1 = helper.getNode('a1');
+            const caught = collect('caught');
+            a1.receive(message({ action: 'listTopics' }));
+            a1.receive(message({ action: 'listTopics' }));
+            await waitFor(() => caught.length === 1, { timeout: 3000 });
+            assert.match(caught[0].error.message, /: Kafka admin listTopics timed out after 1500ms \(1\.1s of it waiting behind earlier messages\)$/);
         });
     });
 
@@ -398,6 +566,29 @@ describe('kafkajs-nc-admin node', function () {
             assert.equal(caught[0].n, 3);
             assert.deepEqual(fake.admins[0].calls.map((c) => c.method),
                 ['listTopics', 'listTopics', 'describeCluster', 'listTopics', 'listTopics']);
+        });
+
+        it('refuses new messages at once while LIMITS.maxQueued messages are waiting', async function () {
+            const saved = adminNode.LIMITS.maxQueued;
+            adminNode.LIMITS.maxQueued = 3;
+            try {
+                await helper.load([brokerNode, adminNode], flow());
+                fake.behaviour.adminDelayMs = { listTopics: 200 };
+                const a1 = helper.getNode('a1');
+                const outs = collect('out');
+                const caught = collect('caught');
+                a1.receive(message({ n: 1, action: 'listTopics' }));
+                await waitFor(() => fake.admins.length === 1 && fake.admins[0].calls.length === 1);
+                for (let n = 2; n <= 6; n++) a1.receive(message({ n, action: 'listTopics' }));
+                await waitFor(() => caught.length === 2, { timeout: 150 });
+                assert.deepEqual(caught.map((m) => m.n), [5, 6]);
+                assert.match(caught[0].error.message, /: Kafka admin listTopics not run: 3 messages are already waiting \(is Kafka reachable\?\)$/);
+                await waitFor(() => outs.length === 4, { timeout: 2000 });
+                assert.deepEqual(outs.map((m) => m.n), [1, 2, 3, 4]);
+            } finally {
+                adminNode.LIMITS.maxQueued = saved;
+            }
+            assert.equal(adminNode.LIMITS.maxQueued, 1000);
         });
 
         it('shows how many messages are queued while one is running', async function () {
@@ -495,6 +686,102 @@ describe('kafkajs-nc-admin node', function () {
             const second = await run(message({ action: 'listTopics' }));
             assert.match(second.error.error.message, /Invalid Kafka broker configuration: TLS configuration node not found/);
             assert.equal(fake.instances.length, 0);
+        });
+    });
+
+    describe('node construction', function () {
+        it('an unexpected error in the constructor shows "internal error", like the producer and the consumer', function () {
+            let ctor = null;
+            const statuses = [];
+            const errors = [];
+            const RED = {
+                nodes: {
+                    registerType(type, fn) {
+                        ctor = fn;
+                    },
+                    createNode(node) {
+                        node.on = () => node;
+                        node.status = (s) => statuses.push(s);
+                        node.error = (e) => errors.push(String(e));
+                    },
+                    getNode() {
+                        throw new Error('registry broken');
+                    }
+                }
+            };
+            adminNode(RED);
+            const node = {};
+            assert.doesNotThrow(() => ctor.call(node, { broker: 'b1', action: '' }));
+            assert.deepEqual(statuses.map((s) => [s.fill, s.shape, s.text]), [['red', 'ring', 'internal error']]);
+            assert.match(errors[0], /Kafka admin node failed to start: registry broken/);
+        });
+    });
+
+    describe('editor definition (kafka-admin.html)', function () {
+        const html = fs.readFileSync(path.join(__dirname, '../../nodes/kafka-admin.html'), 'utf8');
+        const script = /<script type="text\/javascript">([\s\S]*?)<\/script>/.exec(html)[1];
+
+        /** Evaluate the editor script; `$` records what oneditprepare does with the Action select. */
+        function editor() {
+            const added = [];
+            let selected = null;
+            const chain = (selector) => {
+                let value; // the value given to a new <option> element
+                const self = new Proxy({}, {
+                    get(_, name) {
+                        if (name === 'val') {
+                            return (v) => {
+                                if (v === undefined) return selector === '#node-input-action' ? selected : '';
+                                if (selector === '#node-input-action') selected = v;
+                                else value = v;
+                                return self;
+                            };
+                        }
+                        if (name === 'text') {
+                            return (t) => {
+                                added.push({ value, text: t });
+                                return self;
+                            };
+                        }
+                        return () => self;
+                    }
+                });
+                return self;
+            };
+            let def = null;
+            vm.runInNewContext(script, { RED: { nodes: { registerType: (type, d) => { def = d; } } }, $: chain },
+                { filename: 'kafka-admin.html.js' });
+            return { def, added, selected: () => selected };
+        }
+
+        it('an action the editor does not list (also an Object.prototype name) is shown as unknown, not as a blank select', function () {
+            for (const action of ['dropEverything', 'toString', 'constructor', '__proto__']) {
+                const e = editor();
+                e.def.oneditprepare.call({ action });
+                assert.deepEqual(e.added, [{ value: action, text: `${action} (unknown)` }], action);
+                assert.equal(e.selected(), action);
+            }
+            const known = editor();
+            known.def.oneditprepare.call({ action: 'listTopics' });
+            assert.deepEqual(known.added, []);
+        });
+
+        it('the timeout accepts a whole ${VAR} only (Node-RED replaces nothing else)', function () {
+            const { def } = editor();
+            const timeout = def.defaults.timeout.validate;
+            assert.equal(timeout('${ADMIN_TIMEOUT}', {}), true);
+            assert.equal(timeout(' ${ADMIN_TIMEOUT}', undefined), false);
+            assert.equal(timeout('5000', {}), true);
+            assert.match(timeout('50', {}), /from 100 to 600000/);
+        });
+
+        it('help property lines have no extra ":" (Node-RED\'s help renderer drops the text before it)', function () {
+            const help = /<script type="text\/markdown"[^>]*>([\s\S]*?)<\/script>/.exec(html)[1];
+            assert.deepEqual(help.split('\n').filter((l) => /^: .*\(.*\) : .*:/.test(l)), []);
+            for (const re of [/from its arrival/, /at least 15000 ms/, /fail at once/, /At most 1000\s+messages/, /internal error/,
+                /stores them as numbers/, /between the low and the high offset/]) {
+                assert.match(help, re);
+            }
         });
     });
 });

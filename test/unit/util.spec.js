@@ -2,9 +2,11 @@
 
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const util = require('../../lib/util');
+const { tmpDir } = require('../helpers/common');
 
 describe('lib/util', function () {
     describe('toNumber / toInt', function () {
@@ -285,24 +287,66 @@ describe('lib/util', function () {
     });
 
     describe('userDir', function () {
+        const KEYS = ['NODE_RED_HOME', 'HOMEPATH', 'HOME', 'USERPROFILE'];
         let saved;
         beforeEach(function () {
-            saved = process.env.NODE_RED_HOME;
+            saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
         });
         afterEach(function () {
-            if (saved === undefined) delete process.env.NODE_RED_HOME;
-            else process.env.NODE_RED_HOME = saved;
+            for (const k of KEYS) {
+                if (saved[k] === undefined) delete process.env[k];
+                else process.env[k] = saved[k];
+            }
         });
         it('prefers RED.settings.userDir', function () {
             assert.equal(util.userDir({ settings: { userDir: '/u' } }), '/u');
         });
-        it('falls back to NODE_RED_HOME then ~/.node-red', function () {
-            process.env.NODE_RED_HOME = '/nrhome';
-            assert.equal(util.userDir({ settings: {} }), '/nrhome');
+        it('falls back to ~/.node-red, not to the Node-RED install directory in NODE_RED_HOME (PATH-1)', function () {
+            // red.js always sets NODE_RED_HOME to the node-red package directory
+            const install = tmpDir('kafkajs-nc-nr-install-');
+            process.env.NODE_RED_HOME = install;
+            delete process.env.HOMEPATH;
+            const home = path.join(process.env.HOME || process.env.USERPROFILE || os.homedir(), '.node-red');
+            assert.equal(util.userDir({ settings: {} }), home);
             delete process.env.NODE_RED_HOME;
-            assert.equal(util.userDir(undefined), path.join(os.homedir(), '.node-red'));
+            assert.equal(util.userDir(undefined), home);
             const throwing = { get settings() { throw new Error('x'); } };
-            assert.equal(util.userDir(throwing), path.join(os.homedir(), '.node-red'));
+            assert.equal(util.userDir(throwing), home);
+        });
+        it('uses NODE_RED_HOME or HOMEPATH/.node-red when they hold a Node-RED configuration (as Node-RED does)', function () {
+            const nrHome = tmpDir('kafkajs-nc-nr-home-');
+            fs.writeFileSync(path.join(nrHome, '.config.json'), '{}');
+            process.env.NODE_RED_HOME = nrHome;
+            assert.equal(util.userDir({ settings: {} }), nrHome);
+            const winHome = tmpDir('kafkajs-nc-nr-homepath-');
+            fs.mkdirSync(path.join(winHome, '.node-red'));
+            fs.writeFileSync(path.join(winHome, '.node-red', '.config.nodes.json'), '{}');
+            process.env.NODE_RED_HOME = tmpDir('kafkajs-nc-nr-install-');
+            process.env.HOMEPATH = winHome;
+            assert.equal(util.userDir({ settings: {} }), path.join(winHome, '.node-red'));
+        });
+    });
+
+    describe('envReference / envProblem (the one ${VAR} rule of every node)', function () {
+        it('a whole-value reference left over means the variable is not set', function () {
+            assert.deepEqual(util.envReference('${KAFKA_BROKERS}'), { name: 'KAFKA_BROKERS', whole: true });
+            assert.deepEqual(util.envReference('$(OLD_STYLE)'), { name: 'OLD_STYLE', whole: true });
+            assert.equal(util.envProblem('${KAFKA_BROKERS}'), 'environment variable KAFKA_BROKERS is not set');
+            assert.equal(util.envProblem('$(OLD)', { embedded: false }), 'environment variable OLD is not set');
+        });
+        it('a reference inside a longer value is never replaced by Node-RED, whatever the environment', function () {
+            for (const [value, name] of [['kafka-${REGION}:9092', 'REGION'], [' ${KB}', 'KB'], ['${KB} ', 'KB'],
+                ['a:1,${B2}', 'B2'], ['x${}y', '?']]) {
+                assert.deepEqual(util.envReference(value), { name, whole: false }, value);
+                assert.equal(util.envProblem(value), `\${${name}} is only replaced by Node-RED when it is the whole value`);
+                assert.equal(util.envProblem(value, { embedded: false }), null, 'ignored on request (passwords)');
+            }
+        });
+        it('anything else is no reference', function () {
+            for (const v of ['localhost:9092', '', '$', '$HOME', 'pa$$word', '$(not closed', 42, null, undefined, {}]) {
+                assert.equal(util.envReference(v), null, String(v));
+                assert.equal(util.envProblem(v), null, String(v));
+            }
         });
     });
 
