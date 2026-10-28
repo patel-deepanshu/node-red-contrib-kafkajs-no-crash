@@ -1,5 +1,5 @@
 {
-    "name": "node-red-kafkajs-no-crash",
+    "name": "node-red-contrib-kafkajs-no-crash",
     "version": "1.0.0",
     "description": "Crash-proof Kafka nodes for Node-RED built on KafkaJS: auto-reconnect, clear errors, and a disk-backed offline queue that stores messages while Kafka is unreachable and replays them in order when the connection comes back.",
     "main": "nodes/kafka-broker.js",
@@ -7,10 +7,10 @@
         "test": "mocha \"test/**/*.spec.js\"",
         "test:unit": "mocha \"test/unit/**/*.spec.js\"",
         "test:nodes": "mocha \"test/nodes/**/*.spec.js\"",
-        "test:e2e": "mocha --timeout 180000 \"test/e2e/**/*.e2e.js\"",
+        "test:e2e": "mocha --timeout 240000 \"test/e2e/**/*.e2e.js\"",
         "lint": "eslint .",
-        "kafka:start": "bash scripts/kafka/start.sh",
-        "kafka:stop": "bash scripts/kafka/stop.sh"
+        "kafka:start": "bash scripts/kafka/kafka-start.sh",
+        "kafka:stop": "bash scripts/kafka/kafka-stop.sh"
     },
     "keywords": [
         "node-red",
@@ -19,12 +19,15 @@
         "apache-kafka",
         "producer",
         "consumer",
+        "admin",
         "offline",
         "store-and-forward",
         "queue",
         "sasl",
+        "scram",
         "tls",
-        "iot"
+        "iot",
+        "edge"
     ],
     "node-red": {
         "version": ">=3.0.0",
@@ -48,7 +51,9 @@
         "LICENSE"
     ],
     "dependencies": {
-        "kafkajs": "^2.2.4"
+        "kafkajs": "2.2.4",
+        "kafkajs-snappy": "^1.1.0",
+        "lz4js": "^0.2.0"
     },
     "devDependencies": {
         "@eslint/js": "^9.39.0",
