@@ -332,7 +332,9 @@ describe('kafkajs-nc-admin node', function () {
             const first = await run(message({ action: 'listTopics' }));
             const elapsed = Date.now() - started;
             assert.match(first.error.error.message, /Kafka admin listTopics timed out after 200ms/);
-            assert.equal(first.error.error.code, 'ETIMEDOUT');
+            // Node-RED >= 4 copies err.code into msg.error; Node-RED 3 does not
+            const nrMajor = Number(require('node-red/package.json').version.split('.')[0]);
+            if (nrMajor >= 4) assert.equal(first.error.error.code, 'ETIMEDOUT');
             assert.ok(elapsed >= 150 && elapsed < 1500, `took ${elapsed} ms`);
             await nextStatus(helper.getNode('a1'), (s) => s.fill === 'red' && s.text === 'listTopics timed out');
             await waitFor(() => fake.admins[0].disconnectCount === 1, { message: 'hung client is disconnected' });

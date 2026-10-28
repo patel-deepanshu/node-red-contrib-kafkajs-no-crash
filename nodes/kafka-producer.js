@@ -37,7 +37,7 @@ const { DiskQueue } = require('../lib/disk-queue');
 const { MemoryQueue } = require('../lib/memory-queue');
 const queueRegistry = require('../lib/queue-registry');
 const {
-    MessageError, ErrorKind, classifyError, describeError, shortMessage, problemText, connectionKind, asConfigError
+    MessageError, ErrorKind, classifyError, describeError, shortMessage, problemText, connectionKind, topicKind, asConfigError
 } = require('../lib/errors');
 const serialize = require('../lib/serialize');
 const {
@@ -1427,7 +1427,7 @@ class ProducerRuntime {
     /** Classify a failed produce request; TOPIC depends on where the topic came from. */
     sendKind(err, batch, forcedKind) {
         const kind = forcedKind || classifyError(err, { op: 'send' }).kind;
-        if (kind === ErrorKind.TOPIC) return batch[0].tf ? ErrorKind.MESSAGE : ErrorKind.AUTH;
+        if (kind === ErrorKind.TOPIC) return topicKind(err, !!batch[0].tf);
         return kind;
     }
 
@@ -1630,7 +1630,7 @@ class ProducerRuntime {
      */
     flushKind(err, first, unknownIsMessage) {
         let kind = classifyError(err, { op: 'send' }).kind;
-        if (kind === ErrorKind.TOPIC) kind = first.tf ? ErrorKind.MESSAGE : ErrorKind.AUTH;
+        if (kind === ErrorKind.TOPIC) kind = topicKind(err, !!first.tf);
         if (kind !== ErrorKind.UNKNOWN) return { kind, forced: false };
         if (unknownIsMessage) return { kind: ErrorKind.MESSAGE, forced: true };
         const head = `${first.entry.pos.seg}:${first.entry.pos.end}`;

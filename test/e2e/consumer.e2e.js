@@ -124,11 +124,10 @@ describe('e2e: consumer node', function () {
         assert.deepEqual(out.map((m) => m.payload).sort(), ['A', 'B']);
     });
 
-    it('a topic that does not exist (no auto-creation): clear red status, slow retry, no crash', async function () {
+    it('a topic that does not exist (no auto-creation): clear status, retries, no crash', async function () {
         const k1 = await load({ topics: uniqueName('c-missing'), allowAutoTopicCreation: false });
-        const s = await nextStatus(k1, (st) => st.fill === 'red' && / · retry /.test(st.text), 60000);
-        // authRetryMin of the e2e broker config is 1 s
-        assert.equal(s.text, 'unknown topic/partition · retry 1s');
+        const s = await nextStatus(k1, (st) => st.fill === 'yellow' && / · retry /.test(st.text), 60000);
+        assert.match(s.text, /^unknown topic\/partition · retry /);
         assert.ok(calls(k1, 'error').some((e) => /Kafka connection failed: .*UNKNOWN_TOPIC_OR_PARTITION.*check that the topic exists/.test(e)),
             calls(k1, 'error').join(' / '));
     });

@@ -5,7 +5,7 @@ const K = require('kafkajs/src/errors');
 const { createErrorFromCode, errorCodes } = require('kafkajs/src/protocol/error');
 const {
     ConfigError, MessageError, QueueFullError, ErrorKind, flatten, classifyError, shortMessage, describeError,
-    toPlainError, isKafkaJsError, problemText, connectionKind, asConfigError
+    toPlainError, isKafkaJsError, problemText, connectionKind, topicKind, asConfigError
 } = require('../../lib/errors');
 
 // ---------------------------------------------------------------------------
@@ -447,8 +447,9 @@ describe('lib/errors', function () {
     });
 
     describe('connectionKind (failures of the connection itself)', function () {
-        it('maps TOPIC to AUTH and MESSAGE to UNKNOWN, keeps the rest', function () {
-            assert.equal(connectionKind(nonRetriableWrap(proto('UNKNOWN_TOPIC_OR_PARTITION')), 'consume'), AUTH);
+        it('maps a missing topic to TRANSIENT, other TOPIC errors to AUTH and MESSAGE to UNKNOWN, keeps the rest', function () {
+            // a configured topic that does not exist yet is often created a moment later: normal backoff
+            assert.equal(connectionKind(nonRetriableWrap(proto('UNKNOWN_TOPIC_OR_PARTITION')), 'consume'), TRANSIENT);
             assert.equal(connectionKind(nonRetriableWrap(proto('TOPIC_AUTHORIZATION_FAILED')), 'connect'), AUTH);
             assert.equal(connectionKind(proto('CORRUPT_MESSAGE'), 'consume'), UNKNOWN);
             assert.equal(connectionKind(retriesExceeded(conn('ECONNREFUSED', 'connect ECONNREFUSED 127.0.0.1:9092'))), TRANSIENT);
@@ -460,6 +461,18 @@ describe('lib/errors', function () {
 
         it('never throws', function () {
             assert.equal(connectionKind(new Proxy({}, { get() { throw new Error('trap'); } })), UNKNOWN);
+        });
+    });
+
+    describe('topicKind', function () {
+        it('a topic from the message only affects that message', function () {
+            assert.equal(topicKind(proto('UNKNOWN_TOPIC_OR_PARTITION'), true), MESSAGE);
+            assert.equal(topicKind(proto('TOPIC_AUTHORIZATION_FAILED'), true), MESSAGE);
+        });
+
+        it('a configured topic: missing ⇒ TRANSIENT, not authorised ⇒ AUTH', function () {
+            assert.equal(topicKind(retriesExceeded(proto('UNKNOWN_TOPIC_OR_PARTITION')), false), TRANSIENT);
+            assert.equal(topicKind(nonRetriableWrap(proto('TOPIC_AUTHORIZATION_FAILED')), false), AUTH);
         });
     });
 

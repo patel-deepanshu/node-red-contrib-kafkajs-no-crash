@@ -435,9 +435,10 @@ A message that cannot be turned into an output message (for example invalid JSON
 - `paused · orders` (yellow dot): paused with `msg.action = "pause"`.
 - `rebalancing…` (yellow): the group is redistributing the partitions.
 - `ECONNREFUSED broker:9092 · retry 8s` (yellow): Kafka cannot be reached; the next attempt is in 8 s.
+- `unknown topic/partition · retry 2s` (yellow): a subscribed topic does not exist (yet). The node keeps retrying
+  and starts consuming as soon as the topic is created.
 - `auth failed · retry 60s` (red): wrong user name or password. Other problems that need a human show their
-  reason instead, for example `TLS: self-signed cert · retry 60s`, `not authorized (group) · retry 60s` or
-  `unknown topic/partition · retry 60s`.
+  reason instead, for example `TLS: self-signed cert · retry 60s` or `not authorized (group) · retry 60s`.
 - `stopped` (grey): stopped with `msg.action = "stop"`, or *Start consuming on deploy* is off.
 - `config error`, `no topic`, `invalid topic regex`, `no broker config` (red): fix the configuration (see the log)
   and deploy again.
