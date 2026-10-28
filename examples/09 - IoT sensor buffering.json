@@ -1,0 +1,329 @@
+[
+    {
+        "id": "f2b0d7e4e9b2d5ea",
+        "type": "tab",
+        "label": "Kafka 09: IoT sensor buffering",
+        "disabled": false,
+        "info": "A sensor reading every second goes to Kafka through a bounded, expiring disk queue that rides out network outages; a consumer aggregates the readings into 10-second summaries.",
+        "env": []
+    },
+    {
+        "id": "86c9c21f18b729e5",
+        "type": "comment",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "Example 09: IoT sensor buffering - select me and open the Info sidebar",
+        "info": "## IoT sensor buffering\n\nAn edge device (a Raspberry Pi in a machine, a gateway on a mobile network...) reads a sensor every second and sends the readings to Kafka. Its network connection is not reliable, so the producer buffers the readings on disk while Kafka cannot be reached and sends them, in order, when the connection is back. In a real setup the consumer part runs elsewhere, for example on a server.\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 09)*) and change **Brokers**. Then click **Deploy**. The simulated sensor starts on its own.\n\n**Topics:** the producer creates `example-sensors` with its first message if the broker allows automatic topic creation (Apache Kafka does by default, many managed services do not). Until a topic exists, the consumer shows `unknown topic/partition · retry …` (yellow) and keeps retrying, waiting a little longer each time; it starts at the first retry after the topic was created. To create topics yourself, use the admin node (example 06) or your Kafka tools. The consumer starts with new readings only (*Read from the beginning* is off), so readings sent before its group first joined are not summarised.\n\n### The producer's settings (open it, *Offline queue* and *Delivery* tabs)\n\n- **On disk**, queue name `example-sensors`: stored in `~/.node-red/kafkajs-nc-queue/example-sensors/` (the Node-RED user directory), so the readings also survive a reboot of the device.\n- **Maximum size 50 MB, maximum messages 100000** (about 28 hours at one reading per second), **when full: drop the oldest**: the queue never fills the disk; during a very long outage the newest readings are kept.\n- **Expire after 24 hours**: readings older than that are not sent any more (they go to the dead-letter file instead).\n- **Sync every write to disk: off**: fewer disk writes, which is kinder to SD cards. The price: if the power fails, the readings of the last moment may be lost. Tick it if every reading matters.\n- **Compression: GZIP** saves bandwidth on metered links.\n- The message **key** is the sensor id, so the readings of one sensor stay in order in one partition.\n\n### Try it\n\nStop Kafka for a minute and watch the producer status (`offline · 42 queued · retry …`) and **queue-status**. Start Kafka again: the backlog is sent first, and the next summaries include the readings from the outage (look at `from`, `to` and `count`).\n\nTo stop the simulated sensor, disable the *every second* inject node or delete it.",
+        "x": 320,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "cc7750f395a7a2c6",
+        "type": "comment",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "Edge device: sensor → Kafka (buffered on disk)",
+        "info": "Replace the inject and the function by your real input: *mqtt in*, a serial port, Modbus, GPIO...",
+        "x": 250,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "7d86b20af4d2ab90",
+        "type": "inject",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "every second",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "1",
+        "crontab": "",
+        "once": true,
+        "onceDelay": 1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 140,
+        "y": 140,
+        "wires": [
+            [
+                "84e04486a95cd623"
+            ]
+        ]
+    },
+    {
+        "id": "84e04486a95cd623",
+        "type": "function",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "simulated sensor",
+        "func": "// A pretend temperature/humidity sensor (a slow random walk).\nconst last = context.get('last') || { temperature: 21, humidity: 45 };\nconst clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));\nconst reading = {\n    sensor: 'sensor-1',\n    temperature: Math.round((last.temperature + (Math.random() - 0.5) * 0.4) * 100) / 100,\n    humidity: Math.round(clamp(last.humidity + (Math.random() - 0.5), 0, 100) * 10) / 10,\n    ts: Date.now()\n};\ncontext.set('last', reading);\nmsg.key = reading.sensor;\nmsg.payload = reading;\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 390,
+        "y": 140,
+        "wires": [
+            [
+                "39e2ca205056a2f9"
+            ]
+        ]
+    },
+    {
+        "id": "804b334f97f0fd81",
+        "type": "inject",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "queue-status",
+        "props": [
+            {
+                "p": "action",
+                "v": "queue-status",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 130,
+        "y": 200,
+        "wires": [
+            [
+                "39e2ca205056a2f9"
+            ]
+        ]
+    },
+    {
+        "id": "39e2ca205056a2f9",
+        "type": "kafkajs-nc-producer",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "sensor producer (disk queue)",
+        "broker": "fe96d07eeb9b00f2",
+        "topic": "example-sensors",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "gzip",
+        "partitioner": "default",
+        "idempotent": false,
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "example-sensors",
+        "queueMaxMB": 50,
+        "queueMaxMessages": 100000,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 24,
+        "queueFsync": false,
+        "x": 670,
+        "y": 170,
+        "wires": [
+            [
+                "9e08efb7f9ab4cf0"
+            ]
+        ]
+    },
+    {
+        "id": "9e08efb7f9ab4cf0",
+        "type": "switch",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "msg.action set?",
+        "property": "action",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "nnull"
+            },
+            {
+                "t": "else"
+            }
+        ],
+        "checkall": "false",
+        "repair": false,
+        "outputs": 2,
+        "x": 950,
+        "y": 170,
+        "wires": [
+            [
+                "62fd608c73ab243b"
+            ],
+            [
+                "a5450f0f0a6c5034"
+            ]
+        ]
+    },
+    {
+        "id": "62fd608c73ab243b",
+        "type": "debug",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "queue statistics",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1210,
+        "y": 150,
+        "wires": []
+    },
+    {
+        "id": "a5450f0f0a6c5034",
+        "type": "debug",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "last delivery",
+        "active": true,
+        "tosidebar": false,
+        "console": false,
+        "tostatus": true,
+        "complete": "kafka.status",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1190,
+        "y": 190,
+        "wires": []
+    },
+    {
+        "id": "1464230d46a63184",
+        "type": "comment",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "Server side: Kafka → 10-second summaries",
+        "info": "The *join* node collects the readings for 10 seconds after the first one arrives; the function computes count, min, average and max. The times come from the readings themselves, so a backlog sent after an outage is easy to recognise.",
+        "x": 230,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "f4b416dc741dcd79",
+        "type": "kafkajs-nc-consumer",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "sensor readings",
+        "broker": "fe96d07eeb9b00f2",
+        "topics": "example-sensors",
+        "topicIsRegex": false,
+        "groupId": "example-sensors-aggregator",
+        "fromBeginning": false,
+        "autoStart": true,
+        "payloadFormat": "json",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 150,
+        "y": 300,
+        "wires": [
+            [
+                "17c7714255004a35"
+            ]
+        ]
+    },
+    {
+        "id": "17c7714255004a35",
+        "type": "join",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "collect 10 s",
+        "mode": "custom",
+        "build": "array",
+        "property": "payload",
+        "propertyType": "msg",
+        "key": "topic",
+        "joiner": "\\n",
+        "joinerType": "str",
+        "useparts": false,
+        "accumulate": false,
+        "timeout": "10",
+        "count": "",
+        "reduceRight": false,
+        "reduceExp": "",
+        "reduceInit": "",
+        "reduceInitType": "",
+        "reduceFixup": "",
+        "x": 370,
+        "y": 300,
+        "wires": [
+            [
+                "e651b339139f53ba"
+            ]
+        ]
+    },
+    {
+        "id": "e651b339139f53ba",
+        "type": "function",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "min / avg / max",
+        "func": "// msg.payload: the readings collected by the join node (an array).\nconst readings = msg.payload.filter((r) => r && typeof r.temperature === 'number');\nif (readings.length === 0) return null;\nlet min = Infinity, max = -Infinity, sum = 0, first = Infinity, last = -Infinity;\nfor (const r of readings) {\n    min = Math.min(min, r.temperature);\n    max = Math.max(max, r.temperature);\n    sum += r.temperature;\n    first = Math.min(first, r.ts);\n    last = Math.max(last, r.ts);\n}\nmsg.payload = {\n    sensor: readings[0].sensor,\n    count: readings.length,\n    from: new Date(first).toISOString(),\n    to: new Date(last).toISOString(),\n    temperature: { min: min, avg: Math.round(sum / readings.length * 100) / 100, max: max }\n};\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 620,
+        "y": 300,
+        "wires": [
+            [
+                "7cb95c39a77c2e00"
+            ]
+        ]
+    },
+    {
+        "id": "7cb95c39a77c2e00",
+        "type": "debug",
+        "z": "f2b0d7e4e9b2d5ea",
+        "name": "10-second summary",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 960,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "fe96d07eeb9b00f2",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 09)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]

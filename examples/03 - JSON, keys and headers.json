@@ -1,0 +1,380 @@
+[
+    {
+        "id": "deca1f169edbc456",
+        "type": "tab",
+        "label": "Kafka 03: JSON, keys, headers",
+        "disabled": false,
+        "info": "Send JSON objects with a message key and Kafka headers, and read them back as parsed JSON. Shows what happens to a message that is not valid JSON.",
+        "env": []
+    },
+    {
+        "id": "8daaaca8f92fe129",
+        "type": "comment",
+        "z": "deca1f169edbc456",
+        "name": "Example 03: JSON, keys and headers - select me and open the Info sidebar",
+        "info": "## JSON, keys and headers\n\nA Kafka message has a **value** (`msg.payload`), an optional **key** (`msg.key`) and optional **headers** (`msg.headers`), small name/value pairs for metadata.\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 03)*) and change **Brokers**. Then click **Deploy**.\n\n**Topics:** the producer creates `example-orders` with its first message if the broker allows automatic topic creation (Apache Kafka does by default, many managed services do not). Until a topic exists, the consumer shows `unknown topic/partition · retry …` (yellow) and keeps retrying, waiting a little longer each time; it starts at the first retry after the topic was created. To create topics yourself, use the admin node (example 06) or your Kafka tools.\n\n### Producer side\n\n- Objects and arrays in `msg.payload` are sent as JSON text.\n- The *change* node sets `msg.key` to the customer. Kafka sends messages with the same key to the same partition, so all orders of one customer stay in order.\n- It also sets `msg.headers`. The producer adds its own *static header* `source: node-red` (Message tab); a static header wins over a `msg.headers` entry with the same name. *Also send msg.headers* must be ticked for `msg.headers` to be used. Careful: *http in* and *http request* nodes put HTTP headers in `msg.headers`.\n\n### Consumer side\n\nThe consumer's *Payload* format is *Parsed JSON*, so `msg.payload` is an object again. The key and header values arrive as strings (choose *Buffer* on the Output tab for binary data).\n\nClick **send text that is not JSON**: the consumer cannot parse it, so it does not send it to its output. Instead a *catch* node receives the message, with the raw text in `msg.payload` and the reason in `msg.error`, and the consumer carries on with the next message.",
+        "x": 340,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "d822f9f66178cecb",
+        "type": "comment",
+        "z": "deca1f169edbc456",
+        "name": "Produce JSON with a key and headers",
+        "info": "Three orders from two customers.",
+        "x": 220,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "eeda3952c0b11540",
+        "type": "inject",
+        "z": "deca1f169edbc456",
+        "name": "order 1001 (alice)",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"orderId\":1001,\"customer\":\"alice\",\"items\":[{\"sku\":\"A-12\",\"qty\":2}],\"total\":19.9}",
+        "payloadType": "json",
+        "x": 150,
+        "y": 140,
+        "wires": [
+            [
+                "d1fcdc0654b1d23f"
+            ]
+        ]
+    },
+    {
+        "id": "48d781b338d16f2f",
+        "type": "inject",
+        "z": "deca1f169edbc456",
+        "name": "order 1002 (bob)",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"orderId\":1002,\"customer\":\"bob\",\"items\":[{\"sku\":\"A-12\",\"qty\":2}],\"total\":5.5}",
+        "payloadType": "json",
+        "x": 150,
+        "y": 180,
+        "wires": [
+            [
+                "d1fcdc0654b1d23f"
+            ]
+        ]
+    },
+    {
+        "id": "a333ab69217e3116",
+        "type": "inject",
+        "z": "deca1f169edbc456",
+        "name": "order 1003 (alice)",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"orderId\":1003,\"customer\":\"alice\",\"items\":[{\"sku\":\"A-12\",\"qty\":2}],\"total\":42}",
+        "payloadType": "json",
+        "x": 150,
+        "y": 220,
+        "wires": [
+            [
+                "d1fcdc0654b1d23f"
+            ]
+        ]
+    },
+    {
+        "id": "d1fcdc0654b1d23f",
+        "type": "change",
+        "z": "deca1f169edbc456",
+        "name": "set key and headers",
+        "rules": [
+            {
+                "t": "set",
+                "p": "key",
+                "pt": "msg",
+                "to": "payload.customer",
+                "tot": "msg"
+            },
+            {
+                "t": "set",
+                "p": "headers",
+                "pt": "msg",
+                "to": "{\"event\":\"order-created\",\"schema-version\":\"1\"}",
+                "tot": "json"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 460,
+        "y": 180,
+        "wires": [
+            [
+                "e6e3bd905e022f2e"
+            ]
+        ]
+    },
+    {
+        "id": "648c31ca9549ffd6",
+        "type": "inject",
+        "z": "deca1f169edbc456",
+        "name": "send text that is not JSON",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "this is not JSON",
+        "payloadType": "str",
+        "x": 180,
+        "y": 280,
+        "wires": [
+            [
+                "e6e3bd905e022f2e"
+            ]
+        ]
+    },
+    {
+        "id": "e6e3bd905e022f2e",
+        "type": "kafkajs-nc-producer",
+        "z": "deca1f169edbc456",
+        "name": "",
+        "broker": "6ddd09e81a9bceec",
+        "topic": "example-orders",
+        "key": "",
+        "partition": "",
+        "headers": {
+            "source": "node-red"
+        },
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "idempotent": false,
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 730,
+        "y": 220,
+        "wires": [
+            [
+                "a08210af987c449f"
+            ]
+        ]
+    },
+    {
+        "id": "a08210af987c449f",
+        "type": "debug",
+        "z": "deca1f169edbc456",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 980,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "853e6d18ca4a0777",
+        "type": "comment",
+        "z": "deca1f169edbc456",
+        "name": "Consume as parsed JSON",
+        "info": "The *function* node shows how to use the key, a header, the partition and the offset of a received message.",
+        "x": 180,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "0cc791f7e57154df",
+        "type": "kafkajs-nc-consumer",
+        "z": "deca1f169edbc456",
+        "name": "",
+        "broker": "6ddd09e81a9bceec",
+        "topics": "example-orders",
+        "topicIsRegex": false,
+        "groupId": "example-orders-reader",
+        "fromBeginning": true,
+        "autoStart": true,
+        "payloadFormat": "json",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 170,
+        "y": 400,
+        "wires": [
+            [
+                "37406143a0da1f1b",
+                "e88a880bb75ef6ea"
+            ]
+        ]
+    },
+    {
+        "id": "37406143a0da1f1b",
+        "type": "debug",
+        "z": "deca1f169edbc456",
+        "name": "complete message",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 460,
+        "y": 380,
+        "wires": []
+    },
+    {
+        "id": "e88a880bb75ef6ea",
+        "type": "function",
+        "z": "deca1f169edbc456",
+        "name": "summary",
+        "func": "// msg.payload is an object (Payload: Parsed JSON); key and header\n// values are strings.\nconst order = msg.payload;\nmsg.payload = `customer ${msg.key}: order ${order.orderId}, total ${order.total} ` +\n    `(event ${msg.headers.event}, from ${msg.headers.source}, ` +\n    `partition ${msg.partition}, offset ${msg.offset})`;\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 420,
+        "y": 420,
+        "wires": [
+            [
+                "3adfb445865893d4"
+            ]
+        ]
+    },
+    {
+        "id": "3adfb445865893d4",
+        "type": "debug",
+        "z": "deca1f169edbc456",
+        "name": "summary",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 680,
+        "y": 420,
+        "wires": []
+    },
+    {
+        "id": "7484744eeeae81f2",
+        "type": "comment",
+        "z": "deca1f169edbc456",
+        "name": "Messages that are not valid JSON go to a catch node",
+        "info": "The catch node only listens to the consumer (its scope). `msg.payload` holds the raw text, `msg.error.message` the reason.",
+        "x": 270,
+        "y": 480,
+        "wires": []
+    },
+    {
+        "id": "d1b48556a4bb6b25",
+        "type": "catch",
+        "z": "deca1f169edbc456",
+        "name": "invalid JSON",
+        "scope": [
+            "0cc791f7e57154df"
+        ],
+        "uncaught": false,
+        "x": 130,
+        "y": 520,
+        "wires": [
+            [
+                "eb8f8f8e6337dfd0"
+            ]
+        ]
+    },
+    {
+        "id": "eb8f8f8e6337dfd0",
+        "type": "debug",
+        "z": "deca1f169edbc456",
+        "name": "not valid JSON",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 440,
+        "y": 520,
+        "wires": []
+    },
+    {
+        "id": "6ddd09e81a9bceec",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 03)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]
