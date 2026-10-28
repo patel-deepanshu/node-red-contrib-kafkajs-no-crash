@@ -1,0 +1,413 @@
+<style>
+    .kafkajs-nc-form .form-row > label { width: 150px; }
+    .kafkajs-nc-form .form-row > label.kafkajs-nc-check { width: auto; margin-left: 154px; }
+    .kafkajs-nc-form .form-row > label.kafkajs-nc-check input { width: auto; margin: 0 6px 3px 0; vertical-align: middle; }
+    .kafkajs-nc-form .kafkajs-nc-unit { margin-left: 6px; color: var(--red-ui-secondary-text-color, #777); }
+    .kafkajs-nc-form .kafkajs-nc-section {
+        margin: 16px 0 10px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--red-ui-secondary-border-color, #ddd);
+        font-weight: bold;
+        color: var(--red-ui-primary-text-color, #555);
+    }
+    .kafkajs-nc-form .kafkajs-nc-section:first-child { margin-top: 4px; }
+    .kafkajs-nc-form .form-tips { margin-bottom: 12px; }
+    .kafkajs-nc-form .kafkajs-nc-warn { border-color: var(--red-ui-text-color-warning, #c09853); }
+    .kafkajs-nc-form .kafkajs-nc-help { margin-left: 4px; color: var(--red-ui-secondary-text-color, #999); cursor: help; }
+</style>
+
+<script type="text/html" data-template-name="kafkajs-nc-broker">
+    <div class="kafkajs-nc-form">
+        <div class="form-row">
+            <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
+            <input type="text" id="node-config-input-name" placeholder="e.g. Production cluster" style="width: calc(100% - 160px);">
+        </div>
+        <div class="form-row">
+            <ul style="min-width: 500px; margin-bottom: 20px;" id="node-config-kafkajs-nc-broker-tabs"></ul>
+        </div>
+        <div id="node-config-kafkajs-nc-broker-tabs-content" style="min-height: 170px;">
+
+            <!-- Connection -->
+            <div id="kafkajs-nc-broker-tab-connection" style="display: none;">
+                <div class="form-row">
+                    <label for="node-config-input-brokers"><i class="fa fa-server"></i> Brokers</label>
+                    <input type="text" id="node-config-input-brokers" placeholder="broker1:9092, broker2:9092" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-tips">
+                    Comma-separated <code>host:port</code> list (port 9092 is assumed when missing). Prefixes such as
+                    <code>SASL_SSL://</code> are accepted and ignored: security is set on the <i>Security</i> tab.
+                    Use <code>${KAFKA_BROKERS}</code> to read the list from an environment variable.
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-clientId"><i class="fa fa-id-badge"></i> Client ID</label>
+                    <input type="text" id="node-config-input-clientId" placeholder="node-red" style="width: calc(100% - 160px);">
+                </div>
+            </div>
+
+            <!-- Security -->
+            <div id="kafkajs-nc-broker-tab-security" style="display: none;">
+                <div class="kafkajs-nc-section"><i class="fa fa-key"></i> Authentication</div>
+                <div class="form-row">
+                    <label for="node-config-input-authMechanism"><i class="fa fa-sign-in"></i> Mechanism</label>
+                    <select id="node-config-input-authMechanism" style="width: calc(100% - 160px);">
+                        <option value="none">None</option>
+                        <option value="plain">SASL/PLAIN</option>
+                        <option value="scram-sha-256">SASL/SCRAM-SHA-256</option>
+                        <option value="scram-sha-512">SASL/SCRAM-SHA-512</option>
+                    </select>
+                </div>
+                <div class="form-row kafkajs-nc-sasl-row">
+                    <label for="node-config-input-username"><i class="fa fa-user"></i> Username</label>
+                    <input type="text" id="node-config-input-username" placeholder="user name or API key" autocomplete="off" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-row kafkajs-nc-sasl-row">
+                    <label for="node-config-input-password"><i class="fa fa-lock"></i> Password</label>
+                    <input type="password" id="node-config-input-password" placeholder="password or API secret" autocomplete="new-password" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-tips kafkajs-nc-sasl-row">
+                    Both are required. Credentials are stored encrypted, never in the flow file; <code>${KAFKA_USER}</code> /
+                    <code>${KAFKA_PASSWORD}</code> read them from environment variables.
+                </div>
+                <div class="form-tips kafkajs-nc-warn" id="kafkajs-nc-plain-warning">
+                    <i class="fa fa-exclamation-triangle"></i> SASL/PLAIN without TLS sends the password in clear text.
+                    Enable TLS unless this is a trusted local network.
+                </div>
+
+                <div class="kafkajs-nc-section"><i class="fa fa-shield"></i> Encryption</div>
+                <div class="form-row">
+                    <label for="node-config-input-tls" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-config-input-tls">Use TLS (for <code>SSL</code> and <code>SASL_SSL</code> listeners)
+                    </label>
+                </div>
+                <div class="form-row kafkajs-nc-tls-row">
+                    <label for="node-config-input-tlsConfig"><i class="fa fa-certificate"></i> TLS configuration</label>
+                    <input type="text" id="node-config-input-tlsConfig" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-tips kafkajs-nc-tls-row">
+                    Optional. Leave it on <i>none</i> to trust the system's CA certificates and verify the server
+                    (Confluent Cloud, Amazon MSK and other public services). Select a TLS configuration to add a private CA,
+                    a client certificate (mTLS), or to accept a self-signed certificate (untick
+                    <i>Verify server certificate</i> there).
+                </div>
+                <div class="form-tips">
+                    <b>Recipes</b> &mdash; Confluent Cloud: SASL/PLAIN with the API key and secret + TLS.
+                    Amazon MSK (SASL/SCRAM): SCRAM-SHA-512 + TLS. Local Docker broker: None, no TLS.
+                </div>
+            </div>
+
+            <!-- Advanced -->
+            <div id="kafkajs-nc-broker-tab-advanced" style="display: none;">
+                <div class="kafkajs-nc-section"><i class="fa fa-clock-o"></i> Timeouts</div>
+                <div class="form-row">
+                    <label for="node-config-input-connectionTimeout">Connect</label>
+                    <input type="text" id="node-config-input-connectionTimeout" placeholder="10000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Time to establish a TCP/TLS connection to a broker (100 - 300000). kafkajs' own default of 1 s is too short for TLS or remote brokers."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-authenticationTimeout">Authentication</label>
+                    <input type="text" id="node-config-input-authenticationTimeout" placeholder="10000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Time allowed for the SASL handshake (100 - 300000)."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-requestTimeout">Request</label>
+                    <input type="text" id="node-config-input-requestTimeout" placeholder="30000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Time to wait for a broker to answer a request (1000 - 600000)."></i>
+                </div>
+
+                <div class="kafkajs-nc-section"><i class="fa fa-repeat"></i> Retries per operation (kafkajs)</div>
+                <div class="form-row">
+                    <label for="node-config-input-retries">Retries</label>
+                    <input type="text" id="node-config-input-retries" placeholder="5" style="width: 110px;">
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="How often kafkajs retries one operation before giving up (0 - 50). The nodes then keep reconnecting on their own (see Reconnect below), so a small number is best."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-initialRetryTime">First retry after</label>
+                    <input type="text" id="node-config-input-initialRetryTime" placeholder="300" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-maxRetryTime">Longest retry wait</label>
+                    <input type="text" id="node-config-input-maxRetryTime" placeholder="30000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                </div>
+
+                <div class="kafkajs-nc-section"><i class="fa fa-refresh"></i> Reconnect (never gives up)</div>
+                <div class="form-row">
+                    <label for="node-config-input-reconnectMin">First wait</label>
+                    <input type="text" id="node-config-input-reconnectMin" placeholder="1000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="After a lost or failed connection the nodes wait this long, doubling the wait after each failure up to the maximum (with some jitter)."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-reconnectMax">Longest wait</label>
+                    <input type="text" id="node-config-input-reconnectMax" placeholder="60000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-authRetryMin">After auth/config errors</label>
+                    <input type="text" id="node-config-input-authRetryMin" placeholder="60000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Minimum wait after authentication, authorisation, TLS or configuration errors, which rarely fix themselves. Avoids account lock-outs and log spam."></i>
+                </div>
+
+                <div class="kafkajs-nc-section"><i class="fa fa-file-text-o"></i> Logging and safety</div>
+                <div class="form-row">
+                    <label for="node-config-input-logLevel">kafkajs log level</label>
+                    <select id="node-config-input-logLevel" style="width: 160px;">
+                        <option value="off">Off</option>
+                        <option value="error">Errors</option>
+                        <option value="warn">Warnings (default)</option>
+                        <option value="info">Info</option>
+                        <option value="debug">Debug (very verbose)</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label for="node-config-input-safetyNet" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-config-input-safetyNet">Crash safety net for unhandled kafkajs errors (recommended)
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+</script>
+
+<script type="text/javascript">
+(function () {
+    'use strict';
+
+    var ENV_REF = /^\s*(\$\{[^}]+\}|\$\([^)]+\))\s*$/;
+    var SCHEMES = ['plaintext', 'ssl', 'sasl_ssl', 'sasl_plaintext', 'kafka', 'tcp'];
+
+    function isBlank(v) {
+        return v === undefined || v === null || String(v).trim() === '';
+    }
+
+    /**
+     * Validator for whole numbers in [min, max]. Blank means "use the default"
+     * and ${ENV} references are resolved at runtime, so both are valid. Returns
+     * a reason string on Node-RED >= 3.1 (which passes `opt`), else a boolean.
+     */
+    function intRange(min, max) {
+        return function (v, opt) {
+            if (isBlank(v) || ENV_REF.test(String(v))) {
+                return true;
+            }
+            var n = Number(v);
+            if (isFinite(n) && Math.floor(n) === n && n >= min && n <= max) {
+                return true;
+            }
+            return opt ? 'must be a whole number from ' + min + ' to ' + max : false;
+        };
+    }
+
+    /** Same rules as the runtime (lib/client-config.js parseBrokers). */
+    function validBrokers(v, opt) {
+        var s = isBlank(v) ? '' : String(v).trim();
+        if (s === '') {
+            return opt ? 'at least one broker (host:port) is required' : false;
+        }
+        if (ENV_REF.test(s)) {
+            return true;
+        }
+        var bad = [];
+        s.split(/[\s,]+/).forEach(function (token) {
+            if (token === '') {
+                return;
+            }
+            var rest = token;
+            var scheme = /^([A-Za-z][A-Za-z0-9+._-]*):\/\//.exec(rest);
+            if (scheme) {
+                if (SCHEMES.indexOf(scheme[1].toLowerCase()) === -1) {
+                    bad.push(token);
+                    return;
+                }
+                rest = rest.slice(scheme[0].length);
+            }
+            rest = rest.replace(/\/+$/, '');
+            var m = /^([A-Za-z0-9._-]+)(?::(\d{1,5}))?$/.exec(rest);
+            if (!m || (m[2] !== undefined && (Number(m[2]) < 1 || Number(m[2]) > 65535))) {
+                bad.push(token);
+            }
+        });
+        if (bad.length === 0) {
+            return true;
+        }
+        return opt ? 'invalid broker address ' + bad.join(', ') + ' (use host:port; IPv6 literals are not supported)' : false;
+    }
+
+    /**
+     * SASL needs a username. Credentials are only available while the dialog
+     * is open, so this can only be checked then (the password cannot be
+     * checked in the editor at all: the runtime reports a missing one).
+     */
+    function validMechanism(v, opt) {
+        if (isBlank(v) || v === 'none') {
+            return true;
+        }
+        if (['plain', 'scram-sha-256', 'scram-sha-512'].indexOf(v) === -1) {
+            return opt ? 'unknown SASL mechanism' : false;
+        }
+        var user = $('#node-config-input-username');
+        if (user.length === 0 || !isBlank(user.val())) {
+            return true;
+        }
+        return opt ? 'SASL needs a username' : false;
+    }
+
+    RED.nodes.registerType('kafkajs-nc-broker', {
+        category: 'config',
+        color: '#c7d8e6',
+        icon: 'kafka.svg',
+        paletteLabel: 'kafka broker',
+        defaults: {
+            name: { value: '' },
+            brokers: { value: 'localhost:9092', required: true, label: 'Brokers', validate: validBrokers },
+            clientId: { value: 'node-red' },
+            authMechanism: { value: 'none', label: 'Authentication', validate: validMechanism },
+            tls: { value: false },
+            tlsConfig: { value: '', type: 'tls-config', required: false, label: 'TLS configuration' },
+            connectionTimeout: { value: 10000, label: 'Connect timeout', validate: intRange(100, 300000) },
+            authenticationTimeout: { value: 10000, label: 'Authentication timeout', validate: intRange(100, 300000) },
+            requestTimeout: { value: 30000, label: 'Request timeout', validate: intRange(1000, 600000) },
+            retries: { value: 5, label: 'Retries', validate: intRange(0, 50) },
+            initialRetryTime: { value: 300, label: 'First retry after', validate: intRange(50, 60000) },
+            maxRetryTime: { value: 30000, label: 'Longest retry wait', validate: intRange(100, 600000) },
+            reconnectMin: { value: 1000, label: 'Reconnect first wait', validate: intRange(100, 600000) },
+            reconnectMax: { value: 60000, label: 'Reconnect longest wait', validate: intRange(100, 3600000) },
+            authRetryMin: { value: 60000, label: 'Wait after auth/config errors', validate: intRange(1000, 3600000) },
+            logLevel: { value: 'warn' },
+            safetyNet: { value: true }
+        },
+        credentials: {
+            username: { type: 'text' },
+            password: { type: 'password' }
+        },
+        label: function () {
+            return this.name || this.brokers || 'kafka broker';
+        },
+        oneditprepare: function () {
+            var node = this;
+            var tabs = RED.tabs.create({
+                id: 'node-config-kafkajs-nc-broker-tabs',
+                onchange: function (tab) {
+                    $('#node-config-kafkajs-nc-broker-tabs-content').children().hide();
+                    $('#' + tab.id).show();
+                }
+            });
+            tabs.addTab({ id: 'kafkajs-nc-broker-tab-connection', label: 'Connection' });
+            tabs.addTab({ id: 'kafkajs-nc-broker-tab-security', label: 'Security' });
+            tabs.addTab({ id: 'kafkajs-nc-broker-tab-advanced', label: 'Advanced' });
+            setTimeout(function () {
+                tabs.resize();
+            }, 0);
+
+            // Nodes imported from older/hand-written flows may lack these properties.
+            if (isBlank(node.authMechanism)) {
+                $('#node-config-input-authMechanism').val('none');
+            }
+            if (isBlank(node.logLevel)) {
+                $('#node-config-input-logLevel').val('warn');
+            }
+            if (node.safetyNet === undefined) {
+                $('#node-config-input-safetyNet').prop('checked', true);
+            }
+
+            function updateSections() {
+                var mechanism = $('#node-config-input-authMechanism').val();
+                var sasl = !!mechanism && mechanism !== 'none';
+                var tls = $('#node-config-input-tls').is(':checked');
+                $('.kafkajs-nc-sasl-row').toggle(sasl);
+                $('.kafkajs-nc-tls-row').toggle(tls);
+                $('#kafkajs-nc-plain-warning').toggle(mechanism === 'plain' && !tls);
+            }
+            $('#node-config-input-authMechanism').on('change', updateSections);
+            $('#node-config-input-tls').on('change', updateSections);
+            // the mechanism validator looks at the username: re-validate it ('change' does that)
+            $('#node-config-input-username').on('change keyup', function () {
+                $('#node-config-input-authMechanism').trigger('change');
+            });
+            updateSections();
+
+            if (RED.popover && typeof RED.popover.tooltip === 'function') {
+                $('.kafkajs-nc-help').each(function () {
+                    RED.popover.tooltip($(this), $(this).attr('data-tip'));
+                });
+            } else {
+                $('.kafkajs-nc-help').each(function () {
+                    $(this).attr('title', $(this).attr('data-tip'));
+                });
+            }
+        },
+        oneditsave: function () {
+            // Without TLS a TLS configuration is meaningless: do not keep a
+            // reference to it (it would also list this node as one of its users).
+            // '_ADD_' is the value of the select's "none" entry.
+            if (!$('#node-config-input-tls').is(':checked')) {
+                $('#node-config-input-tlsConfig').val('_ADD_');
+            }
+        }
+    });
+})();
+</script>
+
+<script type="text/markdown" data-help-name="kafkajs-nc-broker">
+Connection settings shared by the Kafka producer, consumer and admin nodes: brokers, SASL authentication, TLS, timeouts and how to reconnect.
+
+### Details
+
+Every node that uses this configuration opens its own connection and, when Kafka cannot be reached, keeps
+reconnecting with an increasing wait. It never gives up. Problems are shown in the node status and logged once,
+instead of crashing Node-RED.
+
+A broken configuration (for example SASL selected but no password, an environment variable that is not set, or an
+invalid broker address) is reported as **config error**. The reason is written to the Node-RED log, and the nodes do
+not try to connect until it is fixed.
+
+#### Connection
+
+- **Brokers**: comma- or space-separated `host:port` list. Port `9092` is used when it is missing. Prefixes such as
+  `PLAINTEXT://` or `SASL_SSL://` are accepted and ignored; security is chosen on the *Security* tab. IPv6 literal
+  addresses are not supported by kafkajs: use a host name.
+- **Client ID**: sent to Kafka with every request; visible in broker logs and used for quotas. Default `node-red`.
+
+#### Security
+
+- **Mechanism**: none, SASL/PLAIN, SASL/SCRAM-SHA-256 or SASL/SCRAM-SHA-512. Username and password are both required;
+  a missing one is reported as a configuration error.
+- **Use TLS**: encrypt the connection. Needed for `SSL` and `SASL_SSL` listeners.
+- **TLS configuration**: optional. Without one, the system CA certificates are trusted and the server certificate is
+  verified. Use a standard *TLS configuration* node for a private CA, a client certificate (mutual TLS), a different
+  server name, or to accept a self-signed certificate (untick *Verify server certificate*).
+
+Common setups:
+
+- **Confluent Cloud**: SASL/PLAIN, username = API key, password = API secret, *Use TLS* on, no TLS configuration.
+- **Amazon MSK with SASL/SCRAM**: SCRAM-SHA-512, *Use TLS* on.
+- **Self-signed broker certificate**: *Use TLS* on, with a TLS configuration that contains the CA certificate or that
+  has *Verify server certificate* unticked (test systems only).
+- **Local Docker broker**: mechanism none, TLS off.
+
+SASL/PLAIN without TLS sends the password in clear text; a warning is logged.
+
+#### Environment variables
+
+Any field can be set to `${NAME}` to read an environment variable, for example Brokers `${KAFKA_BROKERS}`, Username
+`${KAFKA_USER}` and Password `${KAFKA_PASSWORD}`. Node-RED only replaces a field that consists of the whole
+reference. A variable that is not set is reported as `environment variable NAME is not set`.
+
+#### Advanced
+
+- **Timeouts**: *Connect* (default 10000 ms) for setting up the TCP/TLS connection, *Authentication* (10000 ms) for
+  the SASL handshake, *Request* (30000 ms) for each broker request.
+- **Retries per operation**: how often kafkajs itself retries one operation (default 5, the first retry after
+  300 ms, waiting at most 30000 ms). Keep this small: the nodes reconnect on their own afterwards.
+- **Reconnect**: the wait before reconnecting starts at *First wait* (1000 ms) and doubles after each failure up to
+  *Longest wait* (60000 ms). After authentication, authorisation, TLS or configuration errors, which rarely fix
+  themselves, the nodes wait at least *After auth/config errors* (60000 ms) to avoid account lock-outs and log spam.
+- **kafkajs log level**: kafkajs messages go to the Node-RED log. *Warnings* is a good default; identical lines are
+  logged at most once a minute. *Debug* is very verbose.
+- **Crash safety net**: Node-RED stops completely on any unhandled error. These nodes handle their errors themselves,
+  but as a second line of defence the safety net catches unhandled errors that come from kafkajs (or from these
+  nodes) and logs them as a warning instead. Errors from other nodes are not affected. Recommended.
+
+### References
+
+- [KafkaJS client configuration](https://kafka.js.org/docs/configuration)
+- [Node-RED configuration nodes](https://nodered.org/docs/user-guide/editor/workspace/config-nodes)
+- [Using environment variables in Node-RED](https://nodered.org/docs/user-guide/environment-variables)
+</script>
