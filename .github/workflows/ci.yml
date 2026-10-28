@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    name: test (Node ${{ matrix.node }}, Node-RED ${{ matrix.node-red }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { node: 18.x, node-red: 4 }
+          - { node: 20.x, node-red: 4 }
+          - { node: 22.x, node-red: 4 }
+          - { node: 22.x, node-red: 5 }
+          - { node: 24.x, node-red: 5 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Use Node-RED ${{ matrix.node-red }}
+        if: matrix.node-red != 4
+        run: npm install --no-save node-red@${{ matrix.node-red }}
+      - run: npm test
+
+  e2e:
+    name: e2e (real Kafka broker)
+    runs-on: ubuntu-latest
+    services:
+      kafka:
+        image: apache/kafka:3.9.1
+        ports:
+          - 9092:9092
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/9092) >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "Kafka did not start" >&2
+          exit 1
+      - run: npm run test:e2e
+        env:
+          KAFKA_E2E_BROKERS: localhost:9092

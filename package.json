@@ -1,0 +1,71 @@
+{
+    "name": "node-red-kafkajs-no-crash",
+    "version": "1.0.0",
+    "description": "Crash-proof Kafka nodes for Node-RED built on KafkaJS: auto-reconnect, clear errors, and a disk-backed offline queue that stores messages while Kafka is unreachable and replays them in order when the connection comes back.",
+    "main": "nodes/kafka-broker.js",
+    "scripts": {
+        "test": "mocha \"test/**/*.spec.js\"",
+        "test:unit": "mocha \"test/unit/**/*.spec.js\"",
+        "test:nodes": "mocha \"test/nodes/**/*.spec.js\"",
+        "test:e2e": "mocha --timeout 180000 \"test/e2e/**/*.e2e.js\"",
+        "lint": "eslint .",
+        "kafka:start": "bash scripts/kafka/start.sh",
+        "kafka:stop": "bash scripts/kafka/stop.sh"
+    },
+    "keywords": [
+        "node-red",
+        "kafka",
+        "kafkajs",
+        "apache-kafka",
+        "producer",
+        "consumer",
+        "offline",
+        "store-and-forward",
+        "queue",
+        "sasl",
+        "tls",
+        "iot"
+    ],
+    "node-red": {
+        "version": ">=3.0.0",
+        "nodes": {
+            "kafkajs-nc-broker": "nodes/kafka-broker.js",
+            "kafkajs-nc-producer": "nodes/kafka-producer.js",
+            "kafkajs-nc-consumer": "nodes/kafka-consumer.js",
+            "kafkajs-nc-admin": "nodes/kafka-admin.js"
+        }
+    },
+    "engines": {
+        "node": ">=18.5.0"
+    },
+    "files": [
+        "nodes/",
+        "lib/",
+        "examples/",
+        "docs/",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE"
+    ],
+    "dependencies": {
+        "kafkajs": "^2.2.4"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.0",
+        "eslint": "^9.39.0",
+        "globals": "^16.5.0",
+        "mocha": "^11.7.0",
+        "node-red": "^4.1.17",
+        "node-red-node-test-helper": "^0.3.6"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git"
+    },
+    "bugs": {
+        "url": "https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues"
+    },
+    "homepage": "https://github.com/patel-deepanshu/node-red-kafkajs-no-crash#readme",
+    "author": "Deepanshu Patel",
+    "license": "MIT"
+}
