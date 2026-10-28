@@ -1,11 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const path = require('node:path');
 const K = require('kafkajs/src/errors');
 const { createErrorFromCode, errorCodes } = require('kafkajs/src/protocol/error');
 const {
     ConfigError, MessageError, QueueFullError, ErrorKind, flatten, classifyError, shortMessage, describeError,
-    toPlainError, isKafkaJsError, problemText, connectionKind, topicKind, asConfigError
+    toPlainError, isKafkaJsError, problemText, connectionKind, topicKind, asConfigError, REASON_MAX
 } = require('../../lib/errors');
 
 // ---------------------------------------------------------------------------
@@ -136,8 +137,10 @@ const CASES = [
     ['group ACL missing', () => proto('GROUP_AUTHORIZATION_FAILED'), { op: 'run' }, AUTH, 'GROUP_AUTHORIZATION_FAILED'],
     ['cluster ACL missing', () => nonRetriableWrap(proto('CLUSTER_AUTHORIZATION_FAILED')), { op: 'admin' }, AUTH,
         'CLUSTER_AUTHORIZATION_FAILED'],
-    ['group coordinator not found (hidden GROUP_AUTHORIZATION_FAILED)',
-        () => new K.KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator'), { op: 'run' }, AUTH,
+    // ERR-1: kafkajs throws it for a coordinator that is not available (yet) as well as for a missing group
+    // ACL, so it gets the normal backoff instead of a whole auth-retry period
+    ['group coordinator not found (coordinator not available, or a hidden GROUP_AUTHORIZATION_FAILED)',
+        () => new K.KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator'), { op: 'run' }, TRANSIENT,
         'GROUP_COORDINATOR_NOT_FOUND'],
 
     // --- topic ---
@@ -188,7 +191,13 @@ const CASES = [
             'Failed to connect: Port should be >= 0 and < 65536. Received type number (NaN).', { broker: 'localhost:undefined' })),
         { op: 'connect' }, CONFIG, 'CONFIG'],
     ['garbage TLS key/cert (PEM)', () => retriesExceeded(new K.KafkaJSConnectionError(
-        'Failed to connect: error:0480006C:PEM routines::no start line', { broker: BROKER })), {}, CONFIG, 'CONFIG'],
+        'Failed to connect: error:0480006C:PEM routines::no start line', { broker: BROKER })), {}, CONFIG, 'TLS_CONFIG'],
+    // ERR-2: OpenSSL errors thrown while the secure context is built (kafkajs drops the Node error code)
+    ['client key does not match the client certificate', () => retriesExceeded(new K.KafkaJSConnectionError(
+        'Failed to connect: error:05800074:x509 certificate routines::key values mismatch', { broker: BROKER })),
+    { op: 'connect' }, CONFIG, 'TLS_CONFIG'],
+    ['PEM-armoured but invalid key (OpenSSL 3 DECODER)', () => retriesExceeded(new K.KafkaJSConnectionError(
+        'Failed to connect: error:1E08010C:DECODER routines::unsupported', { broker: BROKER })), {}, CONFIG, 'TLS_CONFIG'],
     ['empty brokers array', () => new K.KafkaJSNonRetriableError('Failed to connect: brokers array is empty'), {},
         CONFIG, 'CONFIG'],
     ['invalid broker entry', () => new K.KafkaJSNonRetriableError('Failed to connect: broker at index 0 is invalid "number"'),
@@ -342,7 +351,11 @@ describe('lib/errors', function () {
             [retriesExceeded(conn('ENOTFOUND', 'getaddrinfo ENOTFOUND nope.invalid')), 'broker unreachable (DNS)'],
             [retriesExceeded(conn('DEPTH_ZERO_SELF_SIGNED_CERT', 'self-signed certificate')), 'TLS: self-signed cert'],
             [conn('ERR_TLS_CERT_ALTNAME_INVALID', 'Hostname/IP does not match'), 'TLS: hostname mismatch'],
-            [conn('ERR_SSL_SOMETHING', 'x'), 'TLS: ERR_SSL_SOMETHING'],
+            [conn('ERR_SSL_SOMETHING', 'x'), 'TLS: something'],
+            [conn('ERR_SSL_TLSV1_ALERT_UNKNOWN_CA', 'x'), 'TLS: alert unknown ca'],
+            [retriesExceeded(new K.KafkaJSConnectionError(
+                'Failed to connect: error:05800074:x509 certificate routines::key values mismatch')),
+            'TLS: invalid cert, key or CA'],
             [retriesExceeded(new K.KafkaJSConnectionError('Connection timeout', { broker: BROKER })), 'connection timeout'],
             [conn('ECONNRESET', 'Client network socket disconnected before secure TLS connection was established'),
                 'TLS handshake failed'],
@@ -370,7 +383,47 @@ describe('lib/errors', function () {
             const s = shortMessage(new Error('x'.repeat(200)), 20);
             assert.equal(s.length, 20);
             assert.ok(s.endsWith('…'));
-            assert.ok(shortMessage(new Error('y'.repeat(200))).length <= 40);
+            assert.equal(shortMessage(new Error('y'.repeat(200))).length, REASON_MAX, 'default: REASON_MAX');
+        });
+
+        it('every fixed reason text fits REASON_MAX (32) characters, so status lines can show it whole', function () {
+            assert.equal(REASON_MAX, 32);
+            const texts = new Map();
+            const add = (err) => texts.set(shortMessage(err, 1000), describeError(err));
+            for (const { type } of errorCodes) add(proto(type));
+            for (const code of ['DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+                'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'UNABLE_TO_DECRYPT_CERT_SIGNATURE',
+                'UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY', 'CERT_SIGNATURE_FAILURE', 'CERT_NOT_YET_VALID', 'CERT_HAS_EXPIRED',
+                'CERT_UNTRUSTED', 'CERT_REJECTED', 'CERT_REVOKED', 'INVALID_CA', 'PATH_LENGTH_EXCEEDED', 'INVALID_PURPOSE',
+                'HOSTNAME_MISMATCH', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_TLS_CERT_ALTNAME_FORMAT', 'EPROTO',
+                'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE', 'ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED',
+                'ERR_OSSL_X509_KEY_VALUES_MISMATCH',
+                'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ENOTFOUND', 'ECONNREFUSED']) {
+                add(conn(code, 'x', ''));
+            }
+            for (const make of [
+                () => new K.KafkaJSSASLAuthenticationError('SASL PLAIN authentication failed: Invalid username or password'),
+                () => new K.KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator'),
+                () => new K.KafkaJSNotImplemented('ZSTD compression not implemented'),
+                () => new K.KafkaJSServerDoesNotSupportApiKey('x', { apiKey: 0, apiName: 'Produce' }),
+                () => new K.KafkaJSError('The producer is disconnected'),
+                () => new K.KafkaJSNonRetriableError("The producer is disconnecting; therefore, it can't safely accept messages anymore"),
+                () => conn('ECONNRESET', 'Client network socket disconnected before secure TLS connection was established'),
+                () => new K.KafkaJSConnectionError('Failed to connect: error:0480006C:PEM routines::no start line'),
+                () => new K.KafkaJSConnectionClosedError('Closed connection', { host: 'h', port: 1 }),
+                () => new K.KafkaJSRequestTimeoutError('Request timed out', { broker: BROKER, correlationId: 1 }),
+                () => new K.KafkaJSNoBrokerAvailableError(),
+                () => new K.KafkaJSBrokerNotFound('Broker not found'),
+                () => new K.KafkaJSLockTimeout('Timeout while acquiring lock'),
+                () => new K.KafkaJSConnectionError('Connection timeout', { broker: BROKER }),
+                () => new ConfigError('a long description of a configuration problem'),
+                () => new QueueFullError('Offline queue is full (100 messages queued)')
+            ]) {
+                add(make());
+                texts.set(problemText(make(), 1000), 'problemText ' + describeError(make()));
+            }
+            const tooLong = [...texts].filter(([text]) => text.length > 32);
+            assert.deepEqual(tooLong, []);
         });
 
         it('never throws', function () {
@@ -549,9 +602,20 @@ describe('lib/errors', function () {
             }
             assert.equal(thrown.name, 'TypeError');
             assert.equal(isKafkaJsError(thrown), true);
+            const kafkajsDir = path.dirname(require.resolve('kafkajs/package.json'));
             const fake = new TypeError('x');
-            fake.stack = 'TypeError: x\n    at C:\\app\\node_modules\\kafkajs\\src\\index.js:1:1';
+            fake.stack = `TypeError: x\n    at Runner.start (${path.join(kafkajsDir, 'src', 'consumer', 'runner.js')}:1:1)`;
             assert.equal(isKafkaJsError(fake), true);
+        });
+
+        it('does not take any folder named "kafkajs" for kafkajs (SAFETY-1)', function () {
+            // e.g. Node-RED installed under /home/pi/kafkajs/: every node there has '/kafkajs/' in its stack frames
+            const other = new TypeError("Cannot read properties of undefined (reading 'toUpperCase')");
+            other.stack = 'TypeError: x\n    at Function.x (/home/pi/kafkajs/.node-red/node_modules/node-red-contrib-foo/foo.js:1:1)';
+            assert.equal(isKafkaJsError(other), false);
+            const windows = new TypeError('x');
+            windows.stack = 'TypeError: x\n    at C:\\kafkajs\\node-red\\node_modules\\other\\index.js:1:1';
+            assert.equal(isKafkaJsError(windows), false);
         });
 
         it('rejects everything else', function () {

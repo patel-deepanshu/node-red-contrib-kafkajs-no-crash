@@ -19,9 +19,9 @@
  * being used: no zombie group members after a redeploy. We pass
  * `restartOnFailure: async () => false`, so kafkajs never restarts a consumer
  * by itself; the supervisor creates a fresh one instead (which also makes
- * pausing survive restarts, see 5-kafkajs-internals.md §3).
+ * pausing survive restarts, see docs/ARCHITECTURE.md, kafkajs pitfalls).
  *
- * Crash safety (SPEC §0): the input and close handlers are not async, every
+ * Crash safety (docs/ARCHITECTURE.md, Design goals): the input and close handlers are not async, every
  * promise has a rejection handler, kafkajs listeners go through safeOn(),
  * eachMessage never throws (a throw there would stop the consumer or make
  * kafkajs re-deliver the same message forever), and close always calls
@@ -29,13 +29,14 @@
  */
 
 const { Backoff } = require('../lib/backoff');
-const { StatusReporter } = require('../lib/status');
+const { StatusReporter, MAX_TEXT: STATUS_TEXT_MAX } = require('../lib/status');
 const {
     ErrorKind, MessageError, classifyError, describeError, shortMessage, problemText, connectionKind, asConfigError
 } = require('../lib/errors');
 const { decodeValue, fromKafkaHeaders } = require('../lib/serialize');
 const {
-    toInt, toNumber, toBool, safeOn, once, withTimeout, noop, sanitizeName, truncate, formatDelay: fmtDelay
+    toInt, toNumber, toBool, safeOn, once, withTimeout, noop, sanitizeName, truncate, formatDelay: fmtDelay,
+    envProblem, envReference
 } = require('../lib/util');
 
 /**
@@ -47,6 +48,8 @@ const TIMEOUTS = {
     disconnect: 5000,
     /** close: done() is called after this long whatever happens (Node-RED gives up after 15 s) */
     closeTotal: 10000,
+    /** a seek looks up the partition's offsets with a short-lived admin client: connect + fetchTopicOffsets */
+    offsetLookup: 15000,
     /**
      * A consumer that stayed in its group this long counts as healthy: its next
      * failure starts a new outage (backoff from the minimum, logged as an
@@ -66,7 +69,8 @@ const DEFAULT_EVENTS = Object.freeze({
     GROUP_JOIN: 'consumer.group_join',
     CRASH: 'consumer.crash',
     REBALANCING: 'consumer.rebalancing',
-    START_BATCH_PROCESS: 'consumer.start_batch_process'
+    START_BATCH_PROCESS: 'consumer.start_batch_process',
+    COMMIT_OFFSETS: 'consumer.commit_offsets'
 });
 
 const ACTIONS = ['pause', 'resume', 'stop', 'start', 'restart', 'seek', 'commit'];
@@ -74,9 +78,6 @@ const ACTION_LIST = ACTIONS.join(', ');
 
 /** Kafka topic names: letters, digits, '.', '_' and '-', at most 249 characters. */
 const TOPIC_RE = /^[A-Za-z0-9._-]{1,249}$/;
-/** Node-RED replaces `${VAR}` / `$(VAR)` only when it is the whole value, and leaves it as-is when VAR is not set. */
-const ENV_REF_WHOLE = /^\s*(?:\$\{([^}]*)\}|\$\(([^)]*)\))\s*$/;
-const ENV_REF_ANY = /\$\{([^}]*)\}/;
 
 /** Allowed ranges of the numeric settings (the editor saves strings; kafkajs needs numbers). */
 const LIMITS = Object.freeze({
@@ -108,7 +109,9 @@ const DEFAULTS = Object.freeze({
 
 /** Extra explanations for errors whose kafkajs text does not say what to do. */
 const HINTS = {
-    GROUP_COORDINATOR_NOT_FOUND: 'this usually means the user is not authorised for the consumer group',
+    // kafkajs reports both causes the same way (see classifyError in lib/errors.js)
+    GROUP_COORDINATOR_NOT_FOUND: 'the group coordinator is not available (brokers starting or recovering, ' +
+        '__consumer_offsets offline), or the user is not authorised for the consumer group',
     GROUP_AUTHORIZATION_FAILED: 'the user is not authorised for the consumer group',
     UNKNOWN_TOPIC_OR_PARTITION: 'check that the topic exists, or allow automatic topic creation',
     TOPIC_AUTHORIZATION_FAILED: 'the user is not authorised to read the topic',
@@ -123,10 +126,14 @@ function choice(value, allowed, def) {
     return allowed.includes(v) ? v : def;
 }
 
-/** A leftover `${VAR}` means the environment variable was not set. */
-function envProblem(value) {
-    const m = ENV_REF_WHOLE.exec(value) || ENV_REF_ANY.exec(value);
-    return m ? `environment variable ${(m[1] || m[2] || '').trim()} is not set` : null;
+/**
+ * The `${VAR}` problem of a topic regular expression, or null. A regex may
+ * legitimately contain '$' and '{', so only a reference that makes up the
+ * whole value (ignoring spaces, which stop Node-RED from replacing it) counts.
+ */
+function regexEnvProblem(value) {
+    const ref = envReference(value.trim());
+    return ref && ref.whole ? envProblem(value) : null;
 }
 
 /**
@@ -156,20 +163,23 @@ function parseConfig(config, nodeId) {
     const problems = [];
     const warnings = [];
 
-    let topicsText = '';
+    // Node-RED leaves a `${VAR}` untouched when VAR is not set, and also when
+    // the reference is not the whole value (spaces around it, or inside a
+    // list): both are reported by the shared envProblem() wording.
+    let topicsRaw = '';
     try {
-        topicsText = Array.isArray(c.topics) ? c.topics.join(',') : (c.topics == null ? '' : String(c.topics));
+        topicsRaw = Array.isArray(c.topics) ? c.topics.join(',') : (c.topics == null ? '' : String(c.topics));
     } catch (_) {
-        topicsText = '';
+        topicsRaw = '';
     }
-    topicsText = topicsText.trim();
+    const topicsText = topicsRaw.trim();
     const topicIsRegex = toBool(c.topicIsRegex, false);
     let topics = [];
     let regex = null;
     if (topicsText === '') {
         problems.push('No topic configured: set the topic(s) to subscribe to');
     } else if (topicIsRegex) {
-        const env = ENV_REF_WHOLE.test(topicsText) ? envProblem(topicsText) : null;
+        const env = regexEnvProblem(topicsRaw);
         if (env) {
             problems.push(`Topic: ${env}`);
         } else {
@@ -180,13 +190,13 @@ function parseConfig(config, nodeId) {
             }
         }
     } else {
+        const env = envProblem(topicsRaw);
+        if (env) problems.push(`Topic: ${env}`);
         const seen = new Set();
-        for (const token of topicsText.split(/[\s,]+/)) {
+        for (const token of env ? [] : topicsText.split(/[\s,]+/)) {
             if (token === '' || seen.has(token)) continue;
             seen.add(token);
-            const env = envProblem(token);
-            if (env) problems.push(`Topic: ${env}`);
-            else if (!TOPIC_RE.test(token) || token === '.' || token === '..') {
+            if (!TOPIC_RE.test(token) || token === '.' || token === '..') {
                 problems.push(`Invalid topic name ${JSON.stringify(truncate(token, 60))} ` +
                     '(letters, digits, ".", "_" and "-", at most 249 characters)');
             } else {
@@ -197,14 +207,21 @@ function parseConfig(config, nodeId) {
         if (problems.length > 0) topics = [];
     }
 
-    let groupId = c.groupId == null ? '' : String(c.groupId).trim();
-    if (groupId !== '' && ENV_REF_WHOLE.test(groupId)) {
-        problems.push(`Group ID: ${envProblem(groupId)}`);
+    let groupId = '';
+    try {
+        groupId = c.groupId == null ? '' : String(c.groupId);
+    } catch (_) {
+        groupId = '';
+    }
+    const groupEnv = envProblem(groupId);
+    groupId = groupId.trim();
+    if (groupEnv) {
+        problems.push(`Group ID: ${groupEnv}`);
         groupId = '';
     }
     // Stable across restarts and redeploys (the node id does not change), so
     // the group's committed offsets are found again. A random id would skip
-    // or replay messages and leave orphan groups behind (3-static-audit D6).
+    // or replay messages and leave orphan groups behind.
     if (groupId === '') groupId = `node-red-${sanitizeName(nodeId)}`;
 
     const num = (name) => toInt(c[name], DEFAULTS[name], LIMITS[name]);
@@ -298,11 +315,22 @@ function controlTopic(value, cfg, where, field) {
         (cfg.regex ? 'a topic pattern' : 'several topics'));
 }
 
-const SPECIAL_SEEK = new Map([['earliest', '-2'], ['beginning', '-2'], ['latest', '-1'], ['end', '-1'], ['-2', '-2'], ['-1', '-1']]);
+/** Whether the node's subscription covers `topic` (the regex flags g/y are dropped, so test() is stateless). */
+function subscribes(cfg, topic) {
+    return cfg.regex ? cfg.regex.test(topic) : cfg.topics.includes(topic);
+}
+
+/** The names a 'seek' offset may have besides a number (and kafkajs' -2 / -1 markers for them). */
+const SPECIAL_SEEK = new Map([['earliest', 'earliest'], ['beginning', 'earliest'], ['-2', 'earliest'],
+    ['latest', 'latest'], ['end', 'latest'], ['-1', 'latest']]);
 
 /**
- * msg.payload of a 'seek' control message → kafkajs seek() argument.
- * Offsets: a number >= 0, or 'earliest' / 'latest'.
+ * msg.payload of a 'seek' control message → `{ topic, partition, offset }`
+ * where offset is a decimal string, 'earliest' or 'latest'. kafkajs 2.2.4
+ * does not seek to its -2/-1 markers: it treats them as "no position" and
+ * applies the subscription's fromBeginning instead (and commits that in auto
+ * commit mode), so the names are resolved to real offsets before seeking
+ * (see seekOffset()).
  */
 function parseSeek(payload, cfg) {
     const where = 'seek';
@@ -323,27 +351,108 @@ function parseSeek(payload, cfg) {
 }
 
 /**
- * A 'commit' control message → the kafkajs commitOffsets() entry. Takes
- * topic/partition/offset from msg.kafka (as set on every output message), else
- * from msg. Kafka stores the offset of the NEXT message to read, hence +1.
+ * The offset to seek to, from the partition's current offsets (as returned by
+ * admin.fetchTopicOffsets()). A number outside low..high is refused: kafkajs
+ * would answer the fetch with OffsetOutOfRange and then COMMIT its default
+ * position, also in manual commit mode, silently replacing the position the
+ * flow committed.
+ *
+ * @param {{topic: string, partition: number, offset: string}} target from parseSeek()
+ * @param {Array<{partition: number, low: string, high: string}>} offsets
+ * @returns {string}
+ */
+function seekOffset(target, offsets) {
+    const where = `${target.topic}[${target.partition}]`;
+    const entry = Array.isArray(offsets) ? offsets.find((o) => o && Number(o.partition) === target.partition) : null;
+    if (!entry) throw new MessageError(`seek: partition ${target.partition} of topic "${target.topic}" does not exist`);
+    let low;
+    let high;
+    try {
+        low = BigInt(entry.low);
+        high = BigInt(entry.high);
+    } catch (_) {
+        throw new Error(`seek: Kafka returned unusable offsets for ${where}: ${describeValue(entry.low)} to ${describeValue(entry.high)}`);
+    }
+    if (target.offset === 'earliest') return low.toString();
+    if (target.offset === 'latest') return high.toString();
+    const offset = BigInt(target.offset);
+    if (offset < low || offset > high) {
+        throw new MessageError(`seek: offset ${offset} is outside the offsets of ${where} (${low} to ${high}); ` +
+            'use "earliest", "latest" or an offset in that range');
+    }
+    return offset.toString();
+}
+
+/**
+ * A 'commit' control message → the kafkajs commitOffsets() entry. Kafka
+ * stores the offset of the NEXT message to read, hence +1.
+ *
+ * The position comes from msg.kafka, which must be the one this consumer set
+ * on its output message (same group ID): a producer node replaces msg.kafka
+ * with its delivery report (output topic, partition and offset), and
+ * committing that would store a position on the wrong topic while the input
+ * topic is never committed. Fields are never mixed between msg.kafka and msg;
+ * msg.topic / msg.partition / msg.offset are only used when msg.kafka is not
+ * an object. Either way the topic must be one this node subscribes to.
  */
 function parseCommit(msg, cfg) {
     const where = 'commit';
-    const k = msg.kafka !== null && typeof msg.kafka === 'object' ? msg.kafka : {};
-    const pick = (name) => (k[name] !== undefined && k[name] !== null ? k[name] : msg[name]);
-    const topic = controlTopic(pick('topic'), cfg, where, 'msg.kafka.topic (or msg.topic)');
-    const rawPartition = pick('partition');
+    let source = msg;
+    let prefix = 'msg';
+    if (msg.kafka !== null && typeof msg.kafka === 'object') {
+        source = msg.kafka;
+        prefix = 'msg.kafka';
+        const groupId = source.groupId;
+        if (groupId === undefined || groupId === null || groupId === '') {
+            throw new MessageError('commit: msg.kafka is not a message of this consumer (it has no groupId). A producer ' +
+                'node replaces msg.kafka with its delivery report: keep a copy of the consumer\'s msg.kafka before the ' +
+                'producer and put it back before the commit');
+        }
+        if (groupId !== cfg.groupId) {
+            throw new MessageError(`commit: msg.kafka is a message of consumer group ${describeValue(groupId)}, ` +
+                `not of this consumer's group "${cfg.groupId}"`);
+        }
+    }
+    const topic = controlTopic(source.topic, cfg, where, `${prefix}.topic`);
+    if (!subscribes(cfg, topic)) {
+        throw new MessageError(`commit: this consumer does not subscribe to topic "${truncate(topic, 60)}"`);
+    }
+    const rawPartition = source.partition;
     if (rawPartition === undefined || rawPartition === null || rawPartition === '') {
-        throw new MessageError('commit: msg.kafka.partition (or msg.partition) is required');
+        throw new MessageError(`commit: ${prefix}.partition is required`);
     }
     const partition = parsePartition(rawPartition, where);
-    const rawOffset = pick('offset');
+    const rawOffset = source.offset;
     if (rawOffset === undefined || rawOffset === null || rawOffset === '') {
-        throw new MessageError('commit: msg.kafka.offset (or msg.offset) is required');
+        throw new MessageError(`commit: ${prefix}.offset is required`);
     }
     const processed = parseOffset(rawOffset, where);
     if (processed >= MAX_OFFSET) throw new MessageError(`commit: offset ${processed} is too large`);
     return { topic, partition, offset: (processed + 1n).toString() };
+}
+
+/**
+ * Settle with `promise`, or reject with `makeError()` after `ms`. The timer
+ * is cleared and unref()'d; a late rejection of `promise` is handled.
+ */
+function rejectAfter(promise, ms, makeError) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            try {
+                reject(makeError());
+            } catch (err) {
+                reject(err); // never throw out of a timer
+            }
+        }, ms);
+        if (timer && typeof timer.unref === 'function') timer.unref();
+        promise.then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        }, (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +520,18 @@ class ConsumerRuntime {
         /** topics to pause/resume: the configured ones plus those seen in assignments (regex subscriptions) */
         this.knownTopics = new Set();
         this.highWatermarks = new Map();
+        /**
+         * topic → Set of partitions assigned to this member by the last GROUP_JOIN. kafkajs keeps a seek
+         * on any other partition and applies it whenever that partition is assigned later (possibly hours
+         * later, after a rebalance), so seeks are only accepted for these.
+         */
+        this.assignment = new Map();
+        /** the 'no partitions' warning was logged for the current run of empty assignments */
+        this.noPartitionsWarned = false;
+        /** commit control messages waiting for kafkajs' COMMIT_OFFSETS event: { consumer, entry, confirmed } */
+        this.commitWaiters = new Set();
+        /** short-lived admin clients of seeks that are looking up offsets (disconnected on close) */
+        this.lookups = new Set();
 
         // failure bookkeeping (log de-duplication, status)
         this.failures = 0;
@@ -537,15 +658,18 @@ class ConsumerRuntime {
             case 'connected':
                 if (this.rebalancing) this.status.waiting('rebalancing…');
                 else if (this.pauseWanted) this.status.set('yellow', 'dot', `paused · ${topics}`);
+                else if (this.assignment.size === 0) this.status.set('yellow', 'dot', 'connected · no partitions');
                 else this.status.connected(`connected · ${topics}`);
                 break;
             case 'waiting': {
                 const retry = ` · retry ${fmtDelay(this.retryInMs)}`;
+                // the reason gets whatever the status budget leaves after the suffix (as in the producer)
+                const room = Math.max(16, STATUS_TEXT_MAX - retry.length);
                 if (this.lastKind === ErrorKind.AUTH || this.lastKind === ErrorKind.CONFIG) {
                     // needs a human: 'auth failed', 'config error', 'TLS: self-signed cert', ...
-                    this.status.error(problemText(this.lastError, 28) + retry);
+                    this.status.error(problemText(this.lastError, room) + retry);
                 } else {
-                    this.status.waiting(shortMessage(this.lastError, 28) + retry);
+                    this.status.waiting(shortMessage(this.lastError, room) + retry);
                 }
                 break;
             }
@@ -594,6 +718,7 @@ class ConsumerRuntime {
         this.joining = false;
         this.rebalancing = false;
         this.joinedAt = 0;
+        this.assignment = new Map();
         this.render();
         this.connectAttempt(gen).catch((err) => this.bug('connect', err));
     }
@@ -729,6 +854,7 @@ class ConsumerRuntime {
             if (!p || p.highWatermark === undefined || p.highWatermark === null) return;
             this.highWatermarks.set(`${p.topic}\u0000${p.partition}`, String(p.highWatermark));
         });
+        on('COMMIT_OFFSETS', (e) => this.onCommitOffsets(consumer, e && e.payload));
     }
 
     onGroupJoin(gen, consumer, payload) {
@@ -743,24 +869,78 @@ class ConsumerRuntime {
         this.joining = false;
         this.rebalancing = false;
         if (!this.joinedAt) this.joinedAt = Date.now();
+        const assigned = new Map();
         try {
             const assignment = payload && payload.memberAssignment;
             if (assignment && typeof assignment === 'object') {
-                for (const topic of Object.keys(assignment)) this.knownTopics.add(topic);
+                for (const topic of Object.keys(assignment)) {
+                    this.knownTopics.add(topic);
+                    const partitions = Array.isArray(assignment[topic]) ? assignment[topic].map(Number) : [];
+                    if (partitions.length > 0) assigned.set(topic, new Set(partitions));
+                }
             }
         } catch (_) {
-            // the assignment only helps pausing regex subscriptions
+            // a malformed assignment only means that seeks are refused
         }
+        this.assignment = assigned;
         if (this.failures > 0 && !this.recoveryLogged) {
             this.log(`Connected to Kafka after ${this.failures + 1} attempts`);
             this.recoveryLogged = true;
         }
         this.debug(`Joined consumer group "${this.cfg.groupId}"`);
+        this.noteAssignment();
         if (this.pauseWanted) {
             const err = this.applyPause(consumer);
             if (err) this.warn(`Could not pause the Kafka consumer after joining the group: ${describeError(err)}`);
         }
         this.render();
+    }
+
+    /**
+     * Tell the user when this member got no partition. kafkajs resolves a topic
+     * regex only once, at subscribe time: a pattern that matches nothing (a
+     * typo, or topics that do not exist yet) would otherwise show a green
+     * status and never consume. With a topic list this is normal for a
+     * standby member (more members than partitions), so it is only logged at
+     * debug level then.
+     */
+    noteAssignment() {
+        if (this.assignment.size > 0) {
+            this.noPartitionsWarned = false;
+            return;
+        }
+        if (this.noPartitionsWarned) return;
+        this.noPartitionsWarned = true;
+        if (this.cfg.regex) {
+            this.warn(`No partition is assigned to this consumer: the topic pattern ${this.cfg.topicsLabel} matches no ` +
+                `topic, or other members of group "${this.cfg.groupId}" have all partitions. Topics created later are ` +
+                'only picked up after a restart (msg.action "restart") or a redeploy');
+        } else {
+            this.debug(`No partition is assigned to this consumer: other members of group "${this.cfg.groupId}" ` +
+                'have all partitions');
+        }
+    }
+
+    /**
+     * kafkajs' COMMIT_OFFSETS event: confirms the commit control messages it
+     * covers. kafkajs resolves commitOffsets() WITHOUT committing when its
+     * runner is stopping (runner.js commitOffsets returns early), so only
+     * this event proves that the position was stored.
+     */
+    onCommitOffsets(consumer, payload) {
+        if (this.commitWaiters.size === 0) return;
+        const topics = payload && Array.isArray(payload.topics) ? payload.topics : [];
+        for (const waiter of this.commitWaiters) {
+            if (waiter.consumer !== consumer) continue;
+            const { topic, partition, offset } = waiter.entry;
+            for (const t of topics) {
+                if (!t || t.topic !== topic || !Array.isArray(t.partitions)) continue;
+                // kafkajs passes the offset as a Long: compare the decimal text
+                if (t.partitions.some((p) => p && Number(p.partition) === partition && String(p.offset) === offset)) {
+                    waiter.confirmed = true;
+                }
+            }
+        }
     }
 
     onCrash(gen, consumer, payload) {
@@ -792,8 +972,10 @@ class ConsumerRuntime {
         this.joining = false;
         this.rebalancing = false;
 
-        // TOPIC ⇒ AUTH (a subscribed topic is missing or not authorised: retry
-        // slowly), MESSAGE ⇒ UNKNOWN (no single message to blame); same as the producer
+        // connectionKind() maps a missing subscribed topic to TRANSIENT (it may
+        // be created soon), a topic that is not authorised to AUTH (retry
+        // slowly) and MESSAGE to UNKNOWN (no single message to blame); the
+        // producer uses the same mapping
         const kind = forcedKind || connectionKind(err, 'consume');
         this.state = 'waiting';
         this.scheduleRetry(err, kind, context);
@@ -845,7 +1027,9 @@ class ConsumerRuntime {
             const hint = HINTS[c.reason] || HINTS[c.type];
             const text = `${describeError(err)}${hint ? ` (${hint})` : ''}`;
             if (this.failures === 1 || key !== this.lastFailKey) {
-                this.error(`${what}: ${text} — retrying in ${fmtDelay(delay)}`);
+                // a missing topic is usually temporary (e.g. a producer in the same flow is about to create it)
+                if (c.reason === 'UNKNOWN_TOPIC_OR_PARTITION') this.warn(`${what}: ${text} — retrying in ${fmtDelay(delay)}`);
+                else this.error(`${what}: ${text} — retrying in ${fmtDelay(delay)}`);
             } else if (this.failures % 10 === 0) {
                 this.warn(`Kafka still failing after ${this.failures} attempts: ${text} — retrying in ${fmtDelay(delay)}`);
             } else {
@@ -879,17 +1063,21 @@ class ConsumerRuntime {
         if (this.consumer === consumer) this.consumer = null;
         const gate = this.runPending.get(consumer);
         const ready = gate || (defer ? new Promise((resolve) => setImmediate(resolve)) : Promise.resolve());
-        const p = ready.then(() => this.disconnectQuietly(consumer));
+        return this.trackDisconnect(ready.then(() => this.disconnectQuietly(consumer)));
+    }
+
+    /** Remember a running disconnect (never rejects): close and the next connect attempt wait for it. */
+    trackDisconnect(p) {
         this.pendingDisconnects.add(p);
         p.then(() => this.pendingDisconnects.delete(p));
         return p;
     }
 
-    /** consumer.disconnect(), bounded by TIMEOUTS.disconnect and never rejecting. */
-    disconnectQuietly(consumer) {
+    /** client.disconnect() (consumer or admin), bounded by TIMEOUTS.disconnect and never rejecting. */
+    disconnectQuietly(client) {
         let p;
         try {
-            p = consumer.disconnect();
+            p = client.disconnect();
         } catch (_) {
             return Promise.resolve();
         }
@@ -1062,32 +1250,128 @@ class ConsumerRuntime {
             this.connect(); // waits for the old consumer to leave the group first
             finish();
             break;
-        case 'seek': {
-            const target = parseSeek(msg.payload, this.cfg);
-            this.requireRunning('seek');
-            this.consumer.seek(target);
-            finish();
+        case 'seek':
+            this.seek(msg, finish);
             break;
-        }
-        case 'commit': {
-            const entry = parseCommit(msg, this.cfg);
-            this.requireRunning('commit');
-            // commitOffsets() is async in kafkajs (it rejects when not running) but
-            // may also throw synchronously: both end in done(err)
-            Promise.resolve(this.consumer.commitOffsets([entry])).then(
-                () => finish(),
-                (err) => finish(err || new Error('commit failed'))
-            );
+        case 'commit':
+            this.commit(msg, finish);
             break;
-        }
         default:
             finish(new MessageError(`Unknown msg.action "${action}": use one of ${ACTION_LIST}`));
         }
     }
 
+    /**
+     * 'seek': check that the partition is ours, look up its offsets (to
+     * resolve 'earliest'/'latest' and to refuse an offset out of range, see
+     * seekOffset()), then seek. Throws synchronously for invalid requests;
+     * everything after the lookup ends in `finish`.
+     */
+    seek(msg, finish) {
+        const target = parseSeek(msg.payload, this.cfg);
+        this.requireAssigned('seek', target.topic, target.partition);
+        const consumer = this.consumer;
+        const gen = this.gen;
+        this.lookupOffsets(target.topic).then((offsets) => {
+            if (this.closing) return; // the flow is gone: nothing to seek, nobody to tell
+            const offset = seekOffset(target, offsets);
+            // the consumer may have stopped, restarted or rebalanced during the lookup
+            if (gen !== this.gen || consumer !== this.consumer) {
+                throw new Error('Cannot seek: the Kafka consumer restarted while the offsets were looked up; try again');
+            }
+            this.requireAssigned('seek', target.topic, target.partition);
+            consumer.seek({ topic: target.topic, partition: target.partition, offset });
+        }).then(() => finish(), (err) => finish(err || new Error('seek failed')));
+    }
+
+    /**
+     * The low/high offsets of every partition of `topic` (admin
+     * fetchTopicOffsets) from a short-lived admin client of the same broker
+     * configuration. Bounded by TIMEOUTS.offsetLookup; the client is always
+     * disconnected, also when its connect() completes after the timeout.
+     *
+     * @returns {Promise<Array<{partition: number, low: string, high: string}>>}
+     */
+    lookupOffsets(topic) {
+        let admin;
+        try {
+            admin = this.broker.createKafka(this.node).admin();
+        } catch (err) {
+            return Promise.reject(asConfigError(err, 'Could not create a Kafka admin client to look up the offsets'));
+        }
+        this.lookups.add(admin);
+        let abandoned = false;
+        const lookup = (async () => {
+            await admin.connect();
+            if (abandoned || this.closing) {
+                // timed out or closed meanwhile: this late connection must not stay open
+                this.trackDisconnect(this.disconnectQuietly(admin));
+                throw new Error('offset lookup abandoned');
+            }
+            return admin.fetchTopicOffsets(topic);
+        })();
+        const limited = rejectAfter(lookup, TIMEOUTS.offsetLookup,
+            () => new Error(`Cannot seek: looking up the offsets of topic "${topic}" timed out after ${TIMEOUTS.offsetLookup}ms`));
+        const done = () => {
+            try {
+                abandoned = true;
+                this.lookups.delete(admin);
+                this.trackDisconnect(this.disconnectQuietly(admin));
+            } catch (err) {
+                this.bug('offset lookup', err);
+            }
+        };
+        limited.then(done, done);
+        return limited;
+    }
+
+    /**
+     * 'commit': commitOffsets() for the position after the processed message.
+     * kafkajs resolves commitOffsets() without committing anything while its
+     * runner is stopping (a crash or a stop in progress, while the node still
+     * says connected), so done() is only called without an error when the
+     * COMMIT_OFFSETS event confirmed the commit (see onCommitOffsets()).
+     */
+    commit(msg, finish) {
+        const entry = parseCommit(msg, this.cfg);
+        this.requireRunning('commit');
+        const consumer = this.consumer;
+        const waiter = { consumer, entry, confirmed: false };
+        this.commitWaiters.add(waiter);
+        const settle = (err) => {
+            this.commitWaiters.delete(waiter);
+            finish(err);
+        };
+        let pending;
+        try {
+            pending = Promise.resolve(consumer.commitOffsets([entry]));
+        } catch (err) {
+            pending = Promise.reject(err); // kafkajs may also throw synchronously
+        }
+        pending.then(
+            () => settle(waiter.confirmed ? null : new Error('Commit not stored: the Kafka consumer was stopping. ' +
+                'The messages after the last stored position are delivered again when it has reconnected')),
+            (err) => settle(err || new Error('commit failed'))
+        );
+    }
+
     requireRunning(action) {
         if (this.state !== 'connected' || !this.consumer) {
             throw new Error(`Cannot ${action}: the Kafka consumer is not running (${this.state})`);
+        }
+    }
+
+    /** Running, not rebalancing, and `partition` of `topic` is assigned to this member (else throws). */
+    requireAssigned(action, topic, partition) {
+        this.requireRunning(action);
+        if (this.rebalancing) {
+            throw new Error(`Cannot ${action}: the consumer group is rebalancing; try again when the status shows connected`);
+        }
+        const partitions = this.assignment.get(topic);
+        if (!partitions || !partitions.has(partition)) {
+            const assigned = Array.from(this.assignment, ([t, ps]) => `${t}[${Array.from(ps).sort((a, b) => a - b).join(',')}]`);
+            throw new MessageError(`${action}: partition ${partition} of topic "${truncate(topic, 60)}" is not assigned to ` +
+                `this consumer (assigned: ${assigned.length > 0 ? truncate(assigned.join(' '), 200) : 'none'})`);
         }
     }
 
@@ -1115,6 +1399,8 @@ class ConsumerRuntime {
             this.clearRetryTimer();
             this.status.dispose();
             this.dropConsumer(this.consumer);
+            for (const admin of this.lookups) this.trackDisconnect(this.disconnectQuietly(admin));
+            this.lookups.clear();
             // The group member leaves before a redeployed node joins again
             // (bounded: a hung broker must not block the redeploy).
             withTimeout(Promise.all(Array.from(this.pendingDisconnects)), TIMEOUTS.disconnect).then(finish, finish);
@@ -1207,6 +1493,7 @@ module.exports._internals = {
     parseConfig,
     parseTopicRegex,
     parseSeek,
+    seekOffset,
     parseCommit,
     fmtDelay,
     ConsumerRuntime,

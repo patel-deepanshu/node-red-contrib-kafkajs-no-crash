@@ -21,7 +21,7 @@ const adminNode = require('../../nodes/kafka-admin.js');
 const { sleep, waitFor, nextStatus, statusMark } = require('../helpers/common');
 const {
     helper, uniqueName, requireKafka, createTopic, readAll, groupMembers, broker, useNodeRed, brokerConfig,
-    outcomeNodes, collect, expectOk, calls
+    outcomeNodes, collect, outcome, expectOk, calls
 } = require('./e2e-helpers');
 
 const NODES = [brokerNode, producerNode, consumerNode, adminNode];
@@ -168,6 +168,39 @@ describe('e2e: broker outages (broker stopped, killed, frozen)', function () {
         const duplicates = assertCompleteAndOrdered(values, total);
         // the in-flight request succeeded late; its copy at the head of the queue was removed (ackSentHead)
         assert.equal(duplicates, 0, `${duplicates} duplicate(s) in ${values.length} stored messages`);
+    });
+
+    it('a request that times out is sent again whole by the node (kafkajs\' produce retry is off): sent, nothing lost (LOSS-1)', async function () {
+        // kafkajs 2.2.4's own produce retry can report success without writing the messages of partitions whose
+        // leader moved, so the producer turns it off and resends the whole request itself. A broker frozen for a
+        // moment makes a real request time out (KafkaJSRequestTimeoutError, a Kafka error that clears by itself).
+        const topic = uniqueName('out-retry');
+        await createTopic(topic, 1);
+        await helper.load(NODES, [
+            brokerConfig({ requestTimeout: '1000' }),
+            { id: 'p1', type: 'kafkajs-nc-producer', broker: 'b1', topic, wires: [['reports']] },
+            { id: 'reports', type: 'helper' },
+            ...outcomeNodes(['p1'])
+        ]);
+        const p1 = helper.getNode('p1');
+        await nextStatus(p1, (s) => s.fill === 'green', 60000);
+        assert.equal((await expectOk('p1', { payload: 'before' })).kafka.status, 'sent'); // metadata cached
+        const retried = () => calls(p1, 'debug').some((l) => /sending its 1 message\(s\) again in .* \(retry 1 of 3\)/.test(l));
+
+        let pending;
+        await broker.pause();
+        try {
+            pending = outcome('p1', { payload: 'during' }, 60000);
+            await waitFor(retried, { timeout: 15000, message: 'the node resends the timed-out request' });
+        } finally {
+            await broker.resume();
+        }
+        const r = await pending;
+        assert.ok(r.ok, `expected success, got: ${r.error && r.error.error && r.error.error.message}`);
+        assert.equal(r.ok.kafka.status, 'sent', 'a later retry of the node got through');
+        const values = (await readAll(topic)).map((x) => x.value.toString());
+        // at least once: the timed-out attempts may have been written too, after the broker woke up
+        assert.deepEqual([...new Set(values)], ['before', 'during'], `stored: ${values}`);
     });
 
     it('redeploy during an outage: the backlog survives on disk and is delivered after the broker is back', async function () {

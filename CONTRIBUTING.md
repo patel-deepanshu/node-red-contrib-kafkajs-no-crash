@@ -30,7 +30,9 @@ Everyone taking part is expected to follow the [Code of Conduct](CODE_OF_CONDUCT
 ## Development setup
 
 You need Node.js 18.5 or newer (Node.js 22 or 24 recommended; Node-RED 5 needs 22.9 or newer), npm and git. For the
-end-to-end tests you also need bash, curl and a Java runtime (CI uses Java 21).
+end-to-end tests you also need bash, curl and a Java runtime (CI uses Java 21). The palette supports Node-RED 3.1 or
+newer (`node-red.version` in `package.json`): 3.0 gives nodes inside subflows a new id on every start, which the
+default queue directory and consumer group depend on.
 
 ```sh
 git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
@@ -83,11 +85,11 @@ npx mocha test/nodes/producer.spec.js -g "queue"  # tests whose title matches
 which an unhandled rejection or an uncaught exception happens, because in production each of them would stop
 Node-RED. If you see a `CrashTrapError`, you have found a crash bug, not a flaky test.
 
-`npm test` uses the Node-RED version from `devDependencies` (4.1). CI also runs the suite with Node-RED 3 and 5. To
-do that locally:
+`npm test` uses the Node-RED version from `devDependencies` (4.1). CI also runs the suite with Node-RED 3.1 (the
+oldest supported version) and 5. To do that locally:
 
 ```sh
-npm install --no-save node-red@3   # or node-red@5 (needs Node.js 22.9+)
+npm install --no-save node-red@3.1   # or node-red@5 (needs Node.js 22.9+)
 npm test
 npm ci                             # back to the locked versions
 ```
@@ -226,6 +228,11 @@ status, log and `done(err)`. The crash trap does the rest.
 6. **Documentation:** the README settings table (and the status or FAQ sections if relevant), the guides in
    [`docs/`](docs) if behaviour changes, and the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md).
 
+**Removing an option** works the other way round: remove it from the editor `defaults`, the help, the examples, the
+migration script's defaults and the documentation, but keep the runtime accepting flows that still contain it.
+Ignore the old value and log one warning at deploy that says what happens instead (see how the producer handles the
+former `idempotent` property), and test that such a flow still loads.
+
 ## Commits and pull requests
 
 - Fork, create a branch from `main`, and keep each pull request to one topic.
@@ -251,10 +258,12 @@ For maintainers:
 
    In [CHANGELOG.md](CHANGELOG.md), rename `Unreleased` to the new version with today's date, add an empty
    `Unreleased` section above it, and update the comparison links at the bottom.
-3. Check what will be published (`nodes/`, `lib/`, `examples/`, `docs/`, `README.md`, `CHANGELOG.md`, `LICENSE`):
+3. Check what will be published (`nodes/`, `lib/`, `examples/`, `docs/`, `scripts/migrate-flows.js`, `README.md`,
+   `CHANGELOG.md`, `LICENSE`), and that the migration command works from the package:
 
    ```sh
    npm pack --dry-run
+   npm pack && npx -p ./node-red-contrib-kafkajs-no-crash-<version>.tgz kafkajs-nc-migrate-flows --help
    ```
 
 4. Commit, tag and push:

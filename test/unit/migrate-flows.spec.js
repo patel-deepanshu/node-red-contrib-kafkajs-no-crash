@@ -735,7 +735,17 @@ describe('scripts/migrate-flows.js', function () {
             assert.match(usage.stderr, /Unknown option --frobnicate[\s\S]*Usage:/);
             const help = run(['--help'], dir);
             assert.equal(help.code, 0);
-            assert.match(help.stdout, /^Usage: node migrate-flows\.js <flows\.json>/);
+            assert.match(help.stdout, /^Usage: kafkajs-nc-migrate-flows <flows\.json>/);
+            assert.match(help.stdout, /node migrate-flows\.js <flows\.json>/);
+            assert.match(help.stdout, /npx -p node-red-contrib-kafkajs-no-crash kafkajs-nc-migrate-flows/);
+        });
+
+        it('is shipped as the kafkajs-nc-migrate-flows command (package.json bin)', function () {
+            const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+            assert.equal(pkg.bin['kafkajs-nc-migrate-flows'], 'scripts/migrate-flows.js');
+            assert.ok(pkg.files.includes('scripts/migrate-flows.js'), 'the script is in the published files');
+            assert.match(fs.readFileSync(SCRIPT, 'utf8'), /^#!\/usr\/bin\/env node\n/);
+            if (process.platform !== 'win32') assert.ok(fs.statSync(SCRIPT).mode & 0o111, 'executable');
         });
     });
 

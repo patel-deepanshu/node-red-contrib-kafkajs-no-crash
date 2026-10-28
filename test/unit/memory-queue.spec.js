@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 
-const { MemoryQueue } = require('../../lib/memory-queue');
+const { MemoryQueue, DEAD_LETTER_KEEP } = require('../../lib/memory-queue');
 const { runQueueContract, captureLogger } = require('./queue-contract');
 
 runQueueContract({
@@ -69,7 +69,22 @@ describe('MemoryQueue', function () {
         assert.equal(dl[99].error, 'expired');
         assert.match(dl[98].error.message, /e118/);
         assert.equal(q.stats().deadLettered, 120);
+        assert.equal(DEAD_LETTER_KEEP, 100);
         await q.close();
+    });
+
+    it('getDeadLetters() returns copies, also after close() (MAINT-7: the only place their content is kept)', async function () {
+        const q = new MemoryQueue();
+        await q.deadLetter({ record: { id: 1, value: 'payload' }, pos: { seg: 0, end: 1 } }, 'expired');
+        const first = q.getDeadLetters();
+        first[0].record.value = 'changed by a caller';
+        first.push({ bogus: true });
+        await q.close();
+        const again = q.getDeadLetters();
+        assert.equal(again.length, 1);
+        assert.deepEqual(again[0].record, { id: 1, value: 'payload' });
+        assert.equal(again[0].error, 'expired');
+        assert.ok(!Number.isNaN(Date.parse(again[0].ts)));
     });
 
     it('warns when it is closed with unsent records', async function () {

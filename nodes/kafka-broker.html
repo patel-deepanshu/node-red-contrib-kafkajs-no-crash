@@ -34,8 +34,9 @@
                     <input type="text" id="node-config-input-brokers" placeholder="broker1:9092, broker2:9092" style="width: calc(100% - 160px);">
                 </div>
                 <div class="form-tips">
-                    Comma-separated <code>host:port</code> list (port 9092 is assumed when missing). Prefixes such as
-                    <code>SASL_SSL://</code> are accepted and ignored: security is set on the <i>Security</i> tab.
+                    <code>host:port</code> list separated by commas, semicolons or spaces (port 9092 is assumed when
+                    missing). Prefixes such as <code>SASL_SSL://</code> are accepted, but security is set on the
+                    <i>Security</i> tab (a prefix that contradicts it is logged as a warning).
                     Use <code>${KAFKA_BROKERS}</code> to read the list from an environment variable.
                 </div>
                 <div class="form-row">
@@ -158,7 +159,7 @@
                 </div>
                 <div class="form-row">
                     <label for="node-config-input-safetyNet" class="kafkajs-nc-check">
-                        <input type="checkbox" id="node-config-input-safetyNet">Crash safety net for unhandled kafkajs errors (recommended)
+                        <input type="checkbox" id="node-config-input-safetyNet">Crash safety net for unhandled kafkajs promise rejections (recommended)
                     </label>
                 </div>
             </div>
@@ -170,8 +171,29 @@
 (function () {
     'use strict';
 
-    var ENV_REF = /^\s*(\$\{[^}]+\}|\$\([^)]+\))\s*$/;
+    // Exactly what Node-RED replaces: a whole-value ${NAME} or $(NAME), no spaces around it.
+    var ENV_REF = /^\$\{\S+\}$|^\$\(\S+\)$/;
     var SCHEMES = ['plaintext', 'ssl', 'sasl_ssl', 'sasl_plaintext', 'kafka', 'tcp'];
+    var MECHANISMS = ['plain', 'scram-sha-256', 'scram-sha-512'];
+    var LOG_LEVELS = ['off', 'error', 'warn', 'info', 'debug'];
+
+    /** The runtime's reading of a boolean setting (lib/util.js toBool): flows may hold 'true'/'false' strings. */
+    function toBool(v, def) {
+        if (v === true || v === 1) {
+            return true;
+        }
+        if (v === false || v === 0) {
+            return false;
+        }
+        var s = typeof v === 'string' ? v.trim().toLowerCase() : null;
+        if (['true', '1', 'on', 'yes'].indexOf(s) !== -1) {
+            return true;
+        }
+        if (['false', '0', '', 'off', 'no'].indexOf(s) !== -1) {
+            return false;
+        }
+        return def;
+    }
 
     function isBlank(v) {
         return v === undefined || v === null || String(v).trim() === '';
@@ -197,15 +219,16 @@
 
     /** Same rules as the runtime (lib/client-config.js parseBrokers). */
     function validBrokers(v, opt) {
-        var s = isBlank(v) ? '' : String(v).trim();
-        if (s === '') {
+        var s = isBlank(v) ? '' : String(v);
+        if (s.trim() === '') {
             return opt ? 'at least one broker (host:port) is required' : false;
         }
         if (ENV_REF.test(s)) {
             return true;
         }
         var bad = [];
-        s.split(/[\s,]+/).forEach(function (token) {
+        var credentials = false;
+        s.split(/[\s,;]+/).forEach(function (token) {
             if (token === '') {
                 return;
             }
@@ -219,11 +242,18 @@
                 rest = rest.slice(scheme[0].length);
             }
             rest = rest.replace(/\/+$/, '');
+            if (rest.indexOf('@') !== -1) {
+                credentials = true; // never echo it: it may contain a password
+                return;
+            }
             var m = /^([A-Za-z0-9._-]+)(?::(\d{1,5}))?$/.exec(rest);
             if (!m || (m[2] !== undefined && (Number(m[2]) < 1 || Number(m[2]) > 65535))) {
                 bad.push(token);
             }
         });
+        if (credentials) {
+            return opt ? 'credentials do not belong in the broker address: set them on the Security tab' : false;
+        }
         if (bad.length === 0) {
             return true;
         }
@@ -236,10 +266,12 @@
      * checked in the editor at all: the runtime reports a missing one).
      */
     function validMechanism(v, opt) {
-        if (isBlank(v) || v === 'none') {
+        // the runtime accepts any case ('PLAIN', 'SCRAM-SHA-256'): so does the editor
+        var mechanism = isBlank(v) ? 'none' : String(v).trim().toLowerCase();
+        if (mechanism === 'none') {
             return true;
         }
-        if (['plain', 'scram-sha-256', 'scram-sha-512'].indexOf(v) === -1) {
+        if (MECHANISMS.indexOf(mechanism) === -1) {
             return opt ? 'unknown SASL mechanism' : false;
         }
         var user = $('#node-config-input-username');
@@ -296,16 +328,20 @@
                 tabs.resize();
             }, 0);
 
-            // Nodes imported from older/hand-written flows may lack these properties.
-            if (isBlank(node.authMechanism)) {
-                $('#node-config-input-authMechanism').val('none');
+            // Nodes imported from older or hand-written flows may lack these properties, or hold values the
+            // runtime accepts in another spelling ('PLAIN', 'DEBUG', 'nothing', the string 'false'). Show what
+            // the runtime will use, so that opening and saving the dialog never changes the behaviour.
+            var mechanism = isBlank(node.authMechanism) ? 'none' : String(node.authMechanism).trim().toLowerCase();
+            if (mechanism === 'none' || MECHANISMS.indexOf(mechanism) !== -1) {
+                $('#node-config-input-authMechanism').val(mechanism);
             }
-            if (isBlank(node.logLevel)) {
-                $('#node-config-input-logLevel').val('warn');
+            var logLevel = isBlank(node.logLevel) ? 'warn' : String(node.logLevel).trim().toLowerCase();
+            if (logLevel === 'nothing') {
+                logLevel = 'off';
             }
-            if (node.safetyNet === undefined) {
-                $('#node-config-input-safetyNet').prop('checked', true);
-            }
+            $('#node-config-input-logLevel').val(LOG_LEVELS.indexOf(logLevel) !== -1 ? logLevel : 'warn');
+            $('#node-config-input-safetyNet').prop('checked', toBool(node.safetyNet, true));
+            $('#node-config-input-tls').prop('checked', toBool(node.tls, false));
 
             function updateSections() {
                 var mechanism = $('#node-config-input-authMechanism').val();
@@ -360,8 +396,10 @@ not try to connect until it is fixed.
 
 #### Connection
 
-- **Brokers**: comma- or space-separated `host:port` list. Port `9092` is used when it is missing. Prefixes such as
-  `PLAINTEXT://` or `SASL_SSL://` are accepted and ignored; security is chosen on the *Security* tab. IPv6 literal
+- **Brokers**: `host:port` list separated by commas, semicolons or spaces. Port `9092` is used when it is missing.
+  Prefixes such as `PLAINTEXT://` or `SASL_SSL://` are accepted, but security is chosen on the *Security* tab; a
+  prefix that contradicts it (for example `SASL_SSL://` with *Use TLS* off) is logged as a warning, because the
+  connection would otherwise just keep closing. Credentials (`user:password@host`) do not belong here. IPv6 literal
   addresses are not supported by kafkajs: use a host name.
 - **Client ID**: sent to Kafka with every request; visible in broker logs and used for quotas. Default `node-red`.
 
@@ -388,22 +426,29 @@ SASL/PLAIN without TLS sends the password in clear text; a warning is logged.
 
 Any field can be set to `${NAME}` to read an environment variable, for example Brokers `${KAFKA_BROKERS}`, Username
 `${KAFKA_USER}` and Password `${KAFKA_PASSWORD}`. Node-RED only replaces a field that consists of the whole
-reference. A variable that is not set is reported as `environment variable NAME is not set`.
+reference, without spaces around it. A variable that is not set is reported as
+`environment variable NAME is not set`; a reference inside a longer value (such as `kafka-${REGION}:9092`) is never
+replaced and is reported as `${REGION} is only replaced by Node-RED when it is the whole value`.
 
 #### Advanced
 
 - **Timeouts**: *Connect* (default 10000 ms) for setting up the TCP/TLS connection, *Authentication* (10000 ms) for
   the SASL handshake, *Request* (30000 ms) for each broker request.
-- **Retries per operation**: how often kafkajs itself retries one operation (default 5, the first retry after
-  300 ms, waiting at most 30000 ms). Keep this small: the nodes reconnect on their own afterwards.
+- **Retries per operation**: how often kafkajs itself retries one operation such as connecting (default 5, the
+  first retry after 300 ms, waiting at most 30000 ms). Keep this small: the nodes reconnect on their own afterwards.
+  Produce requests are not retried by kafkajs; the producer node resends them itself.
 - **Reconnect**: the wait before reconnecting starts at *First wait* (1000 ms) and doubles after each failure up to
   *Longest wait* (60000 ms). After authentication, authorisation, TLS or configuration errors, which rarely fix
   themselves, the nodes wait at least *After auth/config errors* (60000 ms) to avoid account lock-outs and log spam.
 - **kafkajs log level**: kafkajs messages go to the Node-RED log. *Warnings* is a good default; identical lines are
   logged at most once a minute. *Debug* is very verbose.
-- **Crash safety net**: Node-RED stops completely on any unhandled error. These nodes handle their errors themselves,
-  but as a second line of defence the safety net catches unhandled errors that come from kafkajs (or from these
-  nodes) and logs them as a warning instead. Errors from other nodes are not affected. Recommended.
+- **Crash safety net**: Node-RED stops completely on an unhandled promise rejection. These nodes handle their errors
+  themselves, but as a second line of defence the safety net catches unhandled promise rejections that come from
+  kafkajs (or from these nodes) and logs them as a warning instead. It covers promise rejections only, not uncaught
+  exceptions. Rejections from other nodes are handled by Node.js exactly as without this palette, except kafkajs
+  errors raised by another palette that also uses kafkajs: they cannot be told apart from ours and are logged too.
+  When Node-RED runs with `--unhandled-rejections=strict`, Node.js stops before any handler runs: the net cannot
+  help then, and a warning says so. Recommended.
 
 ### References
 

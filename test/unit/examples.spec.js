@@ -265,6 +265,16 @@ describe('example flows (examples/*.json)', function () {
         assert.deepEqual(nonConfig.filter((t) => !used.has(t)), [], 'node types not used in any example');
     });
 
+    it('do not describe or set behaviour that changed before 1.0 (idempotent producer, "at most once" auto commit)', function () {
+        for (const file of FILES) {
+            const text = JSON.stringify(readExample(file));
+            // the producer option was removed (kafkajs needs its lossy produce retry for it)
+            assert.doesNotMatch(text, /idempotent/i, file);
+            // automatic commits re-deliver the records handed over since the last stored position
+            assert.doesNotMatch(text, /at most once/i, file);
+        }
+    });
+
     for (const file of FILES) {
         describe(file, function () {
             let flow;

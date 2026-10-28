@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { node: 18.x, node-red: 3 }
+          - { node: 18.x, node-red: '3.1' }  # the oldest supported Node-RED
           - { node: 18.x, node-red: 4 }
           - { node: 20.x, node-red: 4 }
           - { node: 22.x, node-red: 4 }

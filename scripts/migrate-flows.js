@@ -7,6 +7,11 @@
  *
  *   node scripts/migrate-flows.js <flows.json> [--out <file>] [--credentials <flows_cred.json>] [--in-place]
  *
+ * The package installs it as the command `kafkajs-nc-migrate-flows` (package.json
+ * "bin"), so it also runs without a checkout:
+ *
+ *   npx -p node-red-contrib-kafkajs-no-crash kafkajs-nc-migrate-flows flows.json
+ *
  * - kafkajs-client   → kafkajs-nc-broker   (+ a core tls-config node when it used TLS files)
  * - kafkajs-producer → kafkajs-nc-producer
  * - kafkajs-consumer → kafkajs-nc-consumer
@@ -74,7 +79,6 @@ const PRODUCER_DEFAULTS = Object.freeze({
     ackTimeout: 30000,
     compression: 'none',
     partitioner: 'default',
-    idempotent: false,
     allowAutoTopicCreation: true,
     batchSize: 100,
     queueMode: 'disk',
@@ -768,7 +772,10 @@ function formatReport(report, files) {
 // ---------------------------------------------------------------------------
 // command line
 
-const USAGE = `Usage: node migrate-flows.js <flows.json> [--out <file>] [--credentials <flows_cred.json>] [--in-place]
+const USAGE = `Usage: kafkajs-nc-migrate-flows <flows.json> [--out <file>] [--credentials <flows_cred.json>] [--in-place]
+   or: node migrate-flows.js <flows.json> [options]   (from a git checkout or a copy of the script)
+
+Without installing anything: npx -p node-red-contrib-kafkajs-no-crash kafkajs-nc-migrate-flows <flows.json>
 
 Converts node-red-contrib-kafkajs nodes (kafkajs-client, kafkajs-producer,
 kafkajs-consumer) to node-red-contrib-kafkajs-no-crash nodes.

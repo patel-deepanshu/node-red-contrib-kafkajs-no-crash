@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const kafkajs = require('kafkajs');
 const {
-    DEFAULTS, parseBrokers, normalizeBrokerConfig, validateBrokerConfig, buildClientOptions, summarize
+    DEFAULTS, parseBrokers, schemeWarnings, normalizeBrokerConfig, validateBrokerConfig, buildClientOptions, summarize
 } = require('../../lib/client-config');
 
 /**
@@ -41,13 +41,35 @@ describe('lib/client-config', function () {
             assert.deepEqual(r.brokers, expected, `brokers for ${JSON.stringify(input)}`);
         };
 
-        it('splits on commas and/or whitespace, ignoring empty entries', function () {
+        it('splits on commas, semicolons and/or whitespace, ignoring empty entries', function () {
             ok('localhost:9092', ['localhost:9092']);
             ok('a:1,b:2', ['a:1', 'b:2']);
             ok(' a:1 , b:2 ', ['a:1', 'b:2']);
             ok('a:1,,b:2,', ['a:1', 'b:2']);
             ok('a:1 b:2\nc:3\t d:4', ['a:1', 'b:2', 'c:3', 'd:4']);
             ok(',a:1,', ['a:1']);
+            // CFG-2: a separator other tools use; it used to be reported as an 'IPv6 literal'
+            ok('kafka1:9092;kafka2:9092', ['kafka1:9092', 'kafka2:9092']);
+            ok('a:1; b:2 ;c:3', ['a:1', 'b:2', 'c:3']);
+        });
+
+        it('reports credentials in an address without echoing them (CFG-2)', function () {
+            for (const v of ['SASL_SSL://user:secret@b1:9093', 'user:secret@b1', 'user@b1:9093']) {
+                const r = parseBrokers(v);
+                assert.deepEqual(r.brokers, [], v);
+                assert.deepEqual(r.errors, ['Invalid broker: credentials do not belong in the broker address (found "@"); ' +
+                    'set them on the Security tab'], v);
+                assert.ok(!r.errors[0].includes('secret') && !r.errors[0].includes('user'), r.errors[0]);
+            }
+        });
+
+        it('reports a host:port:port entry as such, not as an IPv6 literal (CFG-2)', function () {
+            assert.deepEqual(parseBrokers('b1:9092:9093').errors, ['Invalid broker "b1:9092:9093": use host:port']);
+        });
+
+        it('reports the scheme prefixes it saw (lower case, once each)', function () {
+            assert.deepEqual(parseBrokers('SASL_SSL://a:1, sasl_ssl://b:2, SSL://c, d:4').schemes, ['sasl_ssl', 'ssl']);
+            assert.deepEqual(parseBrokers('a:1').schemes, []);
         });
 
         it('accepts arrays (also with comma lists inside)', function () {
@@ -82,7 +104,7 @@ describe('lib/client-config', function () {
         });
 
         it('rejects IPv6 literals (kafkajs splits on ":")', function () {
-            for (const v of ['[::1]:9092', '::1', 'fe80::1:9092', '[2001:db8::1]']) {
+            for (const v of ['[::1]:9092', '::1', 'fe80::1:9092', '[2001:db8::1]', '2001:db8:0:0:0:0:0:1']) {
                 const r = parseBrokers(v);
                 assert.deepEqual(r.brokers, []);
                 assert.equal(r.errors.length, 1);
@@ -92,11 +114,19 @@ describe('lib/client-config', function () {
 
         it('reports leftover ${VAR} references', function () {
             assert.deepEqual(parseBrokers('${KAFKA_BROKERS}'),
-                { brokers: [], errors: ['environment variable KAFKA_BROKERS is not set'] });
-            assert.deepEqual(parseBrokers('a:1,${B2}').errors, ['environment variable B2 is not set']);
+                { brokers: [], errors: ['environment variable KAFKA_BROKERS is not set'], schemes: [] });
             assert.deepEqual(parseBrokers('$(OLD_STYLE)').errors, ['environment variable OLD_STYLE is not set']);
-            assert.deepEqual(parseBrokers('kafka-${STAGE}:9092').errors, ['environment variable STAGE is not set'],
-                'a partial reference can never form a valid host');
+            assert.deepEqual(parseBrokers(['a:1', '${B2}']).errors, ['environment variable B2 is not set'],
+                'Node-RED replaces whole-value references per array element');
+        });
+
+        it('says that a ${VAR} inside a longer value is never replaced, instead of "not set" (MAINT-2)', function () {
+            // Node-RED only substitutes a whole-value reference: these stay literal even when the variable is set
+            assert.deepEqual(parseBrokers('kafka-${STAGE}:9092').errors,
+                ['${STAGE} is only replaced by Node-RED when it is the whole value']);
+            assert.deepEqual(parseBrokers('a:1,${B2}').errors, ['${B2} is only replaced by Node-RED when it is the whole value']);
+            assert.deepEqual(parseBrokers(' ${KB}').errors, ['${KB} is only replaced by Node-RED when it is the whole value'],
+                'spaces around the reference stop Node-RED from replacing it');
         });
 
         it('reports invalid ports and hosts', function () {
@@ -118,7 +148,8 @@ describe('lib/client-config', function () {
 
         it('reports an empty list', function () {
             for (const v of ['', '   ', ' , , ', undefined, null, [], [''], {}]) {
-                assert.deepEqual(parseBrokers(v), { brokers: [], errors: ['No brokers configured'] }, JSON.stringify(v));
+                assert.deepEqual(parseBrokers(v), { brokers: [], errors: ['No brokers configured'], schemes: [] },
+                    JSON.stringify(v));
             }
         });
 
@@ -171,8 +202,10 @@ describe('lib/client-config', function () {
         it('accepts credentials that merely contain "${" (Node-RED only substitutes whole values)', function () {
             assert.deepEqual(validateBrokerConfig({ authMechanism: 'plain', tls: true },
                 { username: 'user', password: 'pa${ss}word' }).errors, []);
+            // spaces around it stop Node-RED from replacing the reference (MAINT-2: not 'is not set')
             assert.deepEqual(validateBrokerConfig({ authMechanism: 'plain', tls: true },
-                { username: 'user', password: ' ${KAFKA_PASSWORD} ' }).errors, ['environment variable KAFKA_PASSWORD is not set']);
+                { username: 'user', password: ' ${KAFKA_PASSWORD} ' }).errors,
+            ['${KAFKA_PASSWORD} is only replaced by Node-RED when it is the whole value']);
             assert.deepEqual(validateBrokerConfig({ authMechanism: 'plain', tls: true },
                 { username: '$(KUSER)', password: 'x' }).errors, ['environment variable KUSER is not set']);
         });
@@ -190,8 +223,33 @@ describe('lib/client-config', function () {
         });
 
         it('collects ALL errors at once', function () {
-            const r = validateBrokerConfig({ brokers: '[::1]:9092, ${B}', authMechanism: 'plain' }, {});
+            const r = validateBrokerConfig({ brokers: '[::1]:9092, bad:0', authMechanism: 'plain' }, {});
             assert.equal(r.errors.length, 4);
+        });
+
+        it('warns when a broker scheme prefix contradicts the TLS/SASL settings (CFG-1)', function () {
+            const creds = { username: 'u', password: 'p' };
+            assert.deepEqual(validateBrokerConfig({ brokers: 'SASL_SSL://pkc-1.confluent.cloud:9092' }, {}).warnings, [
+                'Brokers are given as SASL_SSL:// but "Use TLS" is off',
+                'Brokers are given as SASL_SSL:// but no SASL mechanism is selected'
+            ]);
+            assert.deepEqual(validateBrokerConfig({ brokers: 'SASL_PLAINTEXT://b:9093', tls: true, authMechanism: 'scram-sha-512' },
+                creds).warnings, ['Brokers are given as SASL_PLAINTEXT:// but "Use TLS" is on']);
+            assert.deepEqual(validateBrokerConfig({ brokers: 'SSL://b:9093', tls: true, authMechanism: 'scram-sha-512' }, creds)
+                .warnings, ['Brokers are given as SSL:// (no SASL) but SASL SCRAM-SHA-512 is selected']);
+            // matching settings, neutral prefixes and no prefix: nothing to say
+            for (const [config, c] of [
+                [{ brokers: 'SASL_SSL://b:9093, SASL_SSL://c:9093', tls: true, authMechanism: 'plain' }, creds],
+                [{ brokers: 'SSL://b:9093', tls: true }, {}],
+                [{ brokers: 'PLAINTEXT://b:9092, kafka://c, tcp://d' }, {}],
+                [{ brokers: 'b:9093', tls: true, authMechanism: 'scram-sha-256' }, creds]
+            ]) {
+                assert.deepEqual(validateBrokerConfig(config, c).warnings, [], JSON.stringify(config));
+            }
+            assert.deepEqual(schemeWarnings(['plaintext'], true, 'plain'), [
+                'Brokers are given as PLAINTEXT:// but "Use TLS" is on',
+                'Brokers are given as PLAINTEXT:// (no SASL) but SASL PLAIN is selected'
+            ]);
         });
 
         it('warns about SASL PLAIN without TLS', function () {
@@ -222,6 +280,16 @@ describe('lib/client-config', function () {
                 'retries: environment variable RETRIES is not set; using 5',
                 'Unknown log level "verbose"; using "warn"'
             ]);
+        });
+
+        it('words a ${VAR} inside a numeric field or the client ID as never replaced (MAINT-2)', function () {
+            const r = validateBrokerConfig({ requestTimeout: '${RT}000', clientId: 'node-red-${HOST}' }, {});
+            assert.deepEqual(r.warnings, [
+                'clientId: ${HOST} is only replaced by Node-RED when it is the whole value; using "node-red"',
+                'requestTimeout: ${RT} is only replaced by Node-RED when it is the whole value; using 30000'
+            ]);
+            assert.deepEqual(validateBrokerConfig({ clientId: '${CID}' }, {}).warnings,
+                ['clientId: environment variable CID is not set; using "node-red"']);
         });
 
         it('never throws', function () {

@@ -13,6 +13,8 @@ converts a `flows.json` file for you; the tables below show exactly what it does
 
 ## Before you start
 
+- **Node-RED 3.1 or newer** is needed (and Node.js 18.5 or newer). Upgrade Node-RED first if you are on 3.0 or
+  older; node-red-contrib-kafkajs itself works with the newer versions too.
 - **Both palettes can be installed at the same time.** The node types are different (`kafkajs-nc-*` here), so
   nothing conflicts. Install this palette first, migrate, check, then uninstall the old one.
 - **Do not run the old and the new consumer with the same group ID at the same time.** They would join the same
@@ -48,11 +50,12 @@ Most differences are fixes. Some of them change what your flows receive, so chec
 ## Using the migration script
 
 [`scripts/migrate-flows.js`](../scripts/migrate-flows.js) converts the three node types in a flows file, keeps every
-other node as it is, and prints a report of everything that needs your attention. It only uses Node.js itself (no
-`npm install` needed) and never changes the input file unless you ask for `--in-place`.
+other node as it is, and prints a report of everything that needs your attention. It only uses Node.js itself and
+never changes the input file unless you ask for `--in-place`. The npm package installs it as the command
+`kafkajs-nc-migrate-flows`:
 
 ```
-node migrate-flows.js <flows.json> [--out <file>] [--credentials <flows_cred.json>] [--in-place]
+kafkajs-nc-migrate-flows <flows.json> [--out <file>] [--credentials <flows_cred.json>] [--in-place]
 ```
 
 | Option | Meaning |
@@ -68,28 +71,44 @@ or written, or the output would overwrite the input, `2` wrong options.
 
 ### Getting the script
 
-The script is not part of the npm package. Use it from a clone of the repository:
+The script ships with the npm package. Any of these works; it needs Node.js 18 or newer, which every Node-RED
+installation that runs this palette already has.
+
+- **With npx, without installing anything** (npx downloads the package into its cache):
+
+  ```sh
+  npx -p node-red-contrib-kafkajs-no-crash kafkajs-nc-migrate-flows ~/.node-red/flows.json
+  ```
+
+- **After installing the palette** in the Node-RED user directory (step 1 below), npm has put the command into
+  `node_modules/.bin`:
+
+  ```sh
+  cd ~/.node-red
+  npx kafkajs-nc-migrate-flows flows.json
+  # the same: node node_modules/node-red-contrib-kafkajs-no-crash/scripts/migrate-flows.js flows.json
+  ```
+
+- **From a git checkout** of the repository:
+
+  ```sh
+  git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
+  node node-red-kafkajs-no-crash/scripts/migrate-flows.js ~/.node-red/flows.json
+  ```
+
+- **As a single file**: the script has no dependencies, so a copy works on its own (`node migrate-flows.js ...`):
+
+  ```sh
+  curl -fsSLO https://raw.githubusercontent.com/patel-deepanshu/node-red-kafkajs-no-crash/main/scripts/migrate-flows.js
+  node migrate-flows.js ~/.node-red/flows.json
+  ```
+
+With the official Docker image (user directory `/data` on the volume `node_red_data`) and the palette installed
+there, either convert into a new file while the container runs and [import it](#importing-instead):
 
 ```sh
-git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
-node node-red-kafkajs-no-crash/scripts/migrate-flows.js ~/.node-red/flows.json
-```
-
-or download just that one file, which has no dependencies:
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/patel-deepanshu/node-red-kafkajs-no-crash/main/scripts/migrate-flows.js
-node migrate-flows.js ~/.node-red/flows.json
-```
-
-It needs Node.js 18 or newer, which every Node-RED installation that runs this palette already has.
-
-With the official Docker image (user directory `/data` on the volume `node_red_data`), either convert into a new
-file while the container runs and [import it](#importing-instead):
-
-```sh
-docker cp migrate-flows.js mynodered:/data/
-docker exec mynodered node /data/migrate-flows.js /data/flows.json --out /data/flows-new.json
+docker exec mynodered node /data/node_modules/node-red-contrib-kafkajs-no-crash/scripts/migrate-flows.js \
+    /data/flows.json --out /data/flows-new.json
 docker cp mynodered:/data/flows-new.json .    # the editor imports files from your computer
 ```
 
@@ -97,8 +116,8 @@ or stop the container and convert in place with a throw-away container on the sa
 
 ```sh
 docker stop mynodered
-docker run --rm -v node_red_data:/data -v "$PWD/migrate-flows.js:/migrate-flows.js:ro" \
-    --entrypoint node nodered/node-red /migrate-flows.js /data/flows.json --in-place
+docker run --rm -v node_red_data:/data --entrypoint node nodered/node-red \
+    /data/node_modules/node-red-contrib-kafkajs-no-crash/scripts/migrate-flows.js /data/flows.json --in-place
 docker start mynodered
 ```
 
@@ -112,13 +131,13 @@ docker start mynodered
 
    ```sh
    cd ~/.node-red
-   node /path/to/migrate-flows.js flows.json --in-place
+   npx kafkajs-nc-migrate-flows flows.json --in-place
    ```
 
    or into a new file that you import later (see [Importing instead](#importing-instead)):
 
    ```sh
-   node /path/to/migrate-flows.js flows.json --out flows-new.json
+   npx kafkajs-nc-migrate-flows flows.json --out flows-new.json
    ```
 
 4. **Read the report.** It has three sections (see [The report](#the-report)). Fix the *Needs your attention* items
@@ -255,7 +274,7 @@ same flow (`z`) as the client.
 | `allowautotopiccreation` | `allowAutoTopicCreation` | always `true`: the old node ignored the setting and topics were auto-created |
 | `advancedoptions`, `transactiontimeout`, `metadatamaxage` | – | dropped (they had no effect) |
 | – | `partitioner` | `legacy` (the kafkajs 1.x mapping of 0.0.7) |
-| – | `compression`, `idempotent`, `batchSize`, `queueMode`, `queueDir`, `queueName`, `queueMaxMB`, `queueMaxMessages`, `queueOverflow`, `queueMaxAgeHours`, `queueFsync` | new settings with their defaults (none, off, 100, disk, empty, empty, 100, 0, drop-oldest, 0, on) |
+| – | `compression`, `batchSize`, `queueMode`, `queueDir`, `queueName`, `queueMaxMB`, `queueMaxMessages`, `queueOverflow`, `queueMaxAgeHours`, `queueFsync` | new settings with their defaults (none, 100, disk, empty, empty, 100, 0, drop-oldest, 0, on) |
 | `wires: []` | `wires: [[]]` | the new node has an output (the delivery report), unconnected |
 
 ### `kafkajs-consumer` → `kafkajs-nc-consumer`
