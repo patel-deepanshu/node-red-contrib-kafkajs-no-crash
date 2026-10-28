@@ -27,6 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { node: 18.x, node-red: 3 }
           - { node: 18.x, node-red: 4 }
           - { node: 20.x, node-red: 4 }
           - { node: 22.x, node-red: 4 }
@@ -45,28 +46,39 @@ jobs:
       - run: npm test
 
   e2e:
-    name: e2e (real Kafka broker)
+    name: e2e (real Kafka broker, SASL, outages)
     runs-on: ubuntu-latest
-    services:
-      kafka:
-        image: apache/kafka:3.9.1
-        ports:
-          - 9092:9092
+    env:
+      KAFKA_VERSION: 3.9.1
+      KAFKA_CACHE_DIR: ${{ github.workspace }}/.kafka-cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22.x
           cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
       - run: npm ci
-      - name: Wait for Kafka
+      - name: Cache Kafka distribution
+        uses: actions/cache@v4
+        with:
+          path: .kafka-cache
+          key: kafka-${{ env.KAFKA_VERSION }}
+      - name: Download and start Kafka (KRaft, PLAINTEXT + SASL listeners)
         run: |
-          for i in $(seq 1 60); do
-            (echo > /dev/tcp/127.0.0.1/9092) >/dev/null 2>&1 && exit 0
-            sleep 2
-          done
-          echo "Kafka did not start" >&2
-          exit 1
+          echo "KAFKA_HOME=$(bash scripts/kafka/kafka-download.sh | tail -n1)" >> "$GITHUB_ENV"
+      - run: npm run kafka:start
       - run: npm run test:e2e
         env:
-          KAFKA_E2E_BROKERS: localhost:9092
+          KAFKA_E2E_BROKERS: 127.0.0.1:19092
+          KAFKA_E2E_SASL_BROKERS: 127.0.0.1:19093
+          KAFKA_E2E_CONTROL: '1'
+      - name: Kafka broker log (on failure)
+        if: failure()
+        run: tail -n 200 .kafka-local/logs/server.out || true
+      - name: Stop Kafka
+        if: always()
+        run: npm run kafka:stop || true

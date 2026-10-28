@@ -587,14 +587,19 @@ describe('kafkajs-nc-consumer node', function () {
             assert.ok(callsOf(k1, 'error').some((e) => /Kafka connection failed: KafkaJSSASLAuthenticationError/.test(e)));
         });
 
-        it('a missing topic on subscribe is treated like an auth problem (slow retry, hint in the log)', async function () {
+        it('a missing topic on subscribe uses the normal backoff (it may be created soon) with a hint in the log', async function () {
             fake.behaviour.subscribeError = () => fake.errors.protocol('UNKNOWN_TOPIC_OR_PARTITION');
             await helper.load([brokerNode, consumerNode], flow());
             const k1 = helper.getNode('k1');
-            const s = await nextStatus(k1, (st) => st.fill === 'red');
-            assert.equal(s.text, 'unknown topic/partition · retry 1s');
+            const s = await nextStatus(k1, (st) => st.fill === 'yellow' && / · retry /.test(st.text));
+            assert.match(s.text, /^unknown topic\/partition · retry /);
             await waitFor(() => callsOf(k1, 'error').some((e) => /check that the topic exists/.test(e)));
             assert.equal(fake.consumers[0].state, 'disconnected');
+            // not the slow auth retry (authRetryMin is 1 s here): the next attempt comes quickly
+            await waitFor(() => fake.consumers.length >= 2, { timeout: 700 });
+            // once the topic exists the consumer joins without a redeploy
+            fake.behaviour.subscribeError = null;
+            await nextStatus(k1, (st) => st.fill === 'green', 3000);
         });
 
         it('a group ACL problem (group coordinator not found) is retried slowly with a hint', async function () {
