@@ -1,0 +1,213 @@
+<style>
+    .kafkajs-nc-admin-form .form-row > label { width: 110px; }
+    .kafkajs-nc-admin-form .kafkajs-nc-unit { margin-left: 6px; color: var(--red-ui-secondary-text-color, #777); }
+    .kafkajs-nc-admin-form #kafkajs-nc-admin-hint pre {
+        margin: 6px 0 0;
+        padding: 4px 6px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 0.9em;
+    }
+</style>
+
+<script type="text/html" data-template-name="kafkajs-nc-admin">
+    <div class="kafkajs-nc-admin-form">
+        <div class="form-row">
+            <label for="node-input-broker"><i class="fa fa-server"></i> Broker</label>
+            <input type="text" id="node-input-broker" style="width: calc(100% - 120px);">
+        </div>
+        <div class="form-row">
+            <label for="node-input-action"><i class="fa fa-wrench"></i> Action</label>
+            <select id="node-input-action" style="width: calc(100% - 120px);">
+                <option value="">set by msg.action</option>
+                <optgroup label="Topics">
+                    <option value="listTopics">List topics</option>
+                    <option value="createTopics">Create topics</option>
+                    <option value="deleteTopics">Delete topics</option>
+                    <option value="createPartitions">Add partitions</option>
+                    <option value="fetchTopicMetadata">Topic metadata</option>
+                </optgroup>
+                <optgroup label="Offsets">
+                    <option value="fetchTopicOffsets">Topic offsets (low / high watermark)</option>
+                    <option value="fetchTopicOffsetsByTimestamp">Topic offsets at a time</option>
+                    <option value="fetchOffsets">Consumer group offsets</option>
+                    <option value="resetOffsets">Reset group offsets (earliest / latest)</option>
+                    <option value="setOffsets">Set group offsets</option>
+                </optgroup>
+                <optgroup label="Consumer groups">
+                    <option value="listGroups">List groups</option>
+                    <option value="describeGroups">Describe groups</option>
+                    <option value="deleteGroups">Delete groups</option>
+                </optgroup>
+                <optgroup label="Cluster">
+                    <option value="describeCluster">Describe cluster</option>
+                    <option value="describeConfigs">Describe configs</option>
+                </optgroup>
+            </select>
+        </div>
+        <div class="form-tips" id="kafkajs-nc-admin-hint"></div>
+        <div class="form-row">
+            <label for="node-input-timeout"><i class="fa fa-clock-o"></i> Timeout</label>
+            <input type="text" id="node-input-timeout" placeholder="30000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+        </div>
+        <div class="form-row">
+            <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+            <input type="text" id="node-input-name" placeholder="Name" style="width: calc(100% - 120px);">
+        </div>
+    </div>
+</script>
+
+<script type="text/javascript">
+(function () {
+    'use strict';
+
+    var ENV_REF = /^\s*(\$\{[^}]+\}|\$\([^)]+\))\s*$/;
+
+    /** What each action expects in msg.payload, shown under the Action select. */
+    var HINTS = {
+        '': 'The action is taken from <code>msg.action</code> (for example <code>"listTopics"</code>), its ' +
+            'parameters from <code>msg.payload</code>. See the help for every action.',
+        listTopics: 'No parameters. Outputs an array of topic names.',
+        createTopics: 'A topic name, an array of names, or:' +
+            '<pre>{"topics": [{"topic": "orders", "numPartitions": 3,\n  "replicationFactor": 1,\n  "configEntries": {"retention.ms": "86400000"}}]}</pre>' +
+            'Outputs <code>true</code>, or <code>false</code> when the topics already existed.',
+        deleteTopics: 'A topic name, an array of names, or <code>{"topics": ["orders"]}</code>.',
+        createPartitions: 'Raises the number of partitions (it can never be lowered):' +
+            '<pre>{"topicPartitions": [{"topic": "orders", "count": 6}]}</pre>',
+        fetchTopicMetadata: 'Optional topic name(s), or <code>{"topics": ["orders"]}</code>. Empty: all topics.',
+        fetchTopicOffsets: 'A topic name or <code>{"topic": "orders"}</code>. Outputs the low and high offset of every partition.',
+        fetchTopicOffsetsByTimestamp: 'The first offsets at or after a point in time ' +
+            '(milliseconds, a Date or an ISO date string):' +
+            '<pre>{"topic": "orders", "timestamp": 1700000000000}</pre>',
+        fetchOffsets: 'Committed offsets of a consumer group:' +
+            '<pre>{"groupId": "my-group", "topics": ["orders"]}</pre>',
+        resetOffsets: 'Moves a consumer group to the start (<code>earliest: true</code>) or the end of a topic. ' +
+            'The group must have no running consumers:' +
+            '<pre>{"groupId": "my-group", "topic": "orders", "earliest": true}</pre>',
+        setOffsets: 'Moves a consumer group to given offsets. The group must have no running consumers:' +
+            '<pre>{"groupId": "my-group", "topic": "orders",\n "partitions": [{"partition": 0, "offset": "42"}]}</pre>',
+        listGroups: 'No parameters. Outputs <code>{groups: [{groupId, protocolType}]}</code>.',
+        describeGroups: 'A group id, an array of ids, or <code>{"groupIds": ["my-group"]}</code>.',
+        deleteGroups: 'A group id, an array of ids, or <code>{"groupIds": ["my-group"]}</code>. ' +
+            'Only groups without running consumers can be deleted.',
+        describeCluster: 'No parameters. Outputs the brokers, the controller and the cluster id.',
+        describeConfigs: 'Resource type <code>TOPIC</code>, <code>BROKER</code> or <code>BROKER_LOGGER</code>:' +
+            '<pre>{"resources": [{"type": "TOPIC", "name": "orders"}]}</pre>'
+    };
+
+    function isBlank(v) {
+        return v === undefined || v === null || String(v).trim() === '';
+    }
+
+    /** Whole number in [min, max]; blank = default; ${ENV} is resolved at runtime. */
+    function intRange(min, max) {
+        return function (v, opt) {
+            if (isBlank(v) || ENV_REF.test(String(v))) {
+                return true;
+            }
+            var n = Number(v);
+            if (isFinite(n) && Math.floor(n) === n && n >= min && n <= max) {
+                return true;
+            }
+            return opt ? 'must be a whole number from ' + min + ' to ' + max : false;
+        };
+    }
+
+    RED.nodes.registerType('kafkajs-nc-admin', {
+        category: 'kafka',
+        color: '#c7d8e6',
+        defaults: {
+            name: { value: '' },
+            broker: { value: '', type: 'kafkajs-nc-broker', required: true, label: 'Broker' },
+            action: { value: '' },
+            timeout: { value: 30000, label: 'Timeout', validate: intRange(100, 600000) }
+        },
+        inputs: 1,
+        outputs: 1,
+        icon: 'kafka.svg',
+        paletteLabel: 'kafka admin',
+        inputLabels: 'action',
+        outputLabels: ['result'],
+        label: function () {
+            return this.name || (this.action ? 'kafka ' + this.action : 'kafka admin');
+        },
+        labelStyle: function () {
+            return this.name ? 'node_label_italic' : '';
+        },
+        oneditprepare: function () {
+            function updateHint() {
+                var action = $('#node-input-action').val() || '';
+                $('#kafkajs-nc-admin-hint').html(HINTS[action] || HINTS['']);
+            }
+            // a hand-written flow may name an action this editor does not list
+            if (!isBlank(this.action) && !HINTS[this.action]) {
+                $('<option></option>').val(this.action).text(this.action + ' (unknown)').appendTo('#node-input-action');
+                $('#node-input-action').val(this.action);
+            }
+            $('#node-input-action').on('change', updateHint);
+            updateHint();
+        }
+    });
+})();
+</script>
+
+<script type="text/markdown" data-help-name="kafkajs-nc-admin">
+Runs Kafka admin operations: list, create and delete topics, read and move offsets, inspect consumer groups and the cluster.
+
+### Inputs
+
+: action (string) : the action to run when the node's *Action* is set to "set by msg.action". The node setting wins otherwise.
+: payload (object | string | array) : the parameters of the action, see the table below.
+
+### Outputs
+
+: payload (any) : the result returned by Kafka. Actions without a result output `true`.
+: kafka (object) : `{ action, durationMs }` of the operation.
+
+The rest of the incoming message is passed through unchanged.
+
+### Details
+
+The node connects on the first message and then stays connected. Messages are handled one after another in arrival
+order. If an action fails, the error goes to a **Catch** node together with the original message, and the next message
+is processed normally. After a connection problem or a timeout the node reconnects with the next message.
+
+The *Timeout* (default 30000 ms) limits each message, including connecting to Kafka.
+
+| Action | msg.payload | Result |
+|---|---|---|
+| `listTopics` | none | array of topic names |
+| `createTopics` | `"orders"`, `["a", "b"]` or `{"topics": [{"topic": "orders", "numPartitions": 3, "replicationFactor": 1, "configEntries": {"retention.ms": "86400000"}}]}`; optional `validateOnly`, `waitForLeaders`, `timeout` | `true`, or `false` when the topics already existed |
+| `deleteTopics` | topic name, array of names or `{"topics": [...]}` | `true` |
+| `createPartitions` | `{"topicPartitions": [{"topic": "orders", "count": 6}]}` (count is the new total) | `true` |
+| `fetchTopicMetadata` | optional topic name(s) or `{"topics": [...]}`; none means all topics | `{topics: [{name, partitions}]}` |
+| `fetchTopicOffsets` | topic name or `{"topic": "orders"}` | `[{partition, offset, high, low}]` |
+| `fetchTopicOffsetsByTimestamp` | `{"topic": "orders", "timestamp": 1700000000000}`; a Date or an ISO date string works too | `[{partition, offset}]` |
+| `fetchOffsets` | `{"groupId": "my-group", "topics": ["orders"]}`; topics are optional | `[{topic, partitions}]` |
+| `resetOffsets` | `{"groupId": "my-group", "topic": "orders", "earliest": true}` | `true` |
+| `setOffsets` | `{"groupId": "my-group", "topic": "orders", "partitions": [{"partition": 0, "offset": "42"}]}` | `true` |
+| `listGroups` | none | `{groups: [{groupId, protocolType}]}` |
+| `describeGroups` | group id, array of ids or `{"groupIds": [...]}` | `{groups: [...]}` |
+| `deleteGroups` | group id, array of ids or `{"groupIds": [...]}` | `[{groupId, errorCode}]` |
+| `describeCluster` | none | `{brokers, controller, clusterId}` |
+| `describeConfigs` | `{"resources": [{"type": "TOPIC", "name": "orders"}]}`; type `TOPIC`, `BROKER` or `BROKER_LOGGER`; optional `configNames` and `includeSynonyms` | `{resources: [...]}` |
+
+Notes:
+
+- `resetOffsets` moves the group to the **latest** offset unless `earliest` is `true`.
+- `resetOffsets`, `setOffsets` and `deleteGroups` only work while the consumer group has no running consumers.
+- Unknown actions and missing parameters are reported to the Catch node with a message that explains what is
+  expected. Nothing is sent to Kafka in that case.
+
+#### Status
+
+- *ready*: waiting for a message.
+- *connecting…*, *running …*: working on a message.
+- *ok · action*: the last action succeeded.
+- red: the last action failed (the reason is in the status and in the error sent to Catch nodes).
+- *config error*, *no broker config*: fix the broker configuration and deploy again.
+
+### References
+
+- [KafkaJS admin client](https://kafka.js.org/docs/admin)
+</script>
