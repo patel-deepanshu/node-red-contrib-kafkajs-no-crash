@@ -1,0 +1,422 @@
+[
+    {
+        "id": "081c701efbf9361d",
+        "type": "tab",
+        "label": "Kafka 02: offline queue",
+        "disabled": false,
+        "info": "The producer stores messages on disk while Kafka cannot be reached and sends them, in their original order, when the connection is back. Use the buttons to look at the queue, flush it or clear it.",
+        "env": []
+    },
+    {
+        "id": "e6765b38de0328bb",
+        "type": "comment",
+        "z": "081c701efbf9361d",
+        "name": "Example 02: offline queue (store and forward) - select me and open the Info sidebar",
+        "info": "## Offline queue (store and forward)\n\nWhile Kafka cannot be reached, the **kafka producer** does not lose messages: it appends them to its *offline queue* and reports them as `queued`. When the connection is back, it sends the queue oldest-first and then goes back to sending directly, so the order of the messages is kept. With the queue *On disk* (the default) the messages also survive a restart of Node-RED or of the machine.\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 02)*) and change **Brokers**. Then click **Deploy**.\n\n**Topics:** the producer creates `example-queue` with its first message if the broker allows automatic topic creation (Apache Kafka does by default, many managed services do not). Until a topic exists, the consumer shows `unknown topic/partition · retry …` (yellow) and keeps retrying, waiting a little longer each time; it starts at the first retry after the topic was created. To create topics yourself, use the admin node (example 06) or your Kafka tools.\n\n### Try it\n\n1. Click **send 1 message** a few times: the delivery reports say `kafka.status: \"sent\"` and the consumer prints the messages, numbered `n: 1, 2, 3...`.\n2. Stop Kafka (for example `docker stop <your Kafka container>`), then click **send 100 messages**. The producer notices the outage when it tries to send: after a few seconds (kafkajs retries first) the messages are moved to the queue, the reports say `queued` and the status shows something like `offline · 100 queued · retry 8s`. Messages sent from now on go straight to the queue. Click **queue-status** to see the statistics of the queue.\n3. Start Kafka again. At the next retry the producer reconnects and sends the queue (`flushing · … queued`, then `connected`); the consumer receives every message, in order. Click **flush now** to retry immediately instead of waiting.\n\n### Delivery guarantee\n\n*At least once*: a message is reported `sent` only after Kafka acknowledged it, and `queued` only once it is stored. If the connection breaks after Kafka wrote a message but before its answer arrived, the message is sent again later, so in rare cases a consumer sees a duplicate.\n\nThe *Offline queue* tab of the producer also has a size limit (default 100 MB), an optional message limit and expiry, and what to do when the queue is full. *In memory* keeps the queue only while Node-RED runs; *Off* fails messages (catchable with a *catch* node) while Kafka is unreachable.",
+        "x": 370,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "f235240582efef53",
+        "type": "comment",
+        "z": "081c701efbf9361d",
+        "name": "Where are the queued messages stored? (select me)",
+        "info": "## Where the queue lives\n\nThe queue is a directory: `<directory>/<queue name>`.\n\n- **Directory** (producer, *Offline queue* tab) defaults to `kafkajs-nc-queue` inside the Node-RED user directory, usually `~/.node-red/kafkajs-nc-queue`. A relative directory is relative to the user directory. An administrator can change the default with `kafkajsNcProducerQueueDir` in `settings.js`.\n- **Queue name** is `example-queue` in this example, so the files are in `~/.node-red/kafkajs-nc-queue/example-queue/`. Without a queue name the node id is used, and copying or re-importing the node (which gives it a new id) then starts a new, empty queue. Two producers must never share a queue name.\n\nFiles in the directory:\n\n- `seg-*.jsonl`: the queued messages, one JSON object per line, spread over segment files. A segment file is deleted once all its messages were sent.\n- `cursor.json`: how far the queue has been sent. When the queue is empty, the segment files and the cursor are removed.\n- `dead-letter.jsonl`: queued messages Kafka refused for good (for example *message too large*) or that expired. They are moved here so that they do not block the messages behind them; a warning is logged.\n\n**queue-status** shows the directory in `msg.payload.queueDir`.",
+        "x": 800,
+        "y": 320,
+        "wires": []
+    },
+    {
+        "id": "ab36ab462bdb50c2",
+        "type": "comment",
+        "z": "081c701efbf9361d",
+        "name": "Send numbered messages",
+        "info": "The function numbers the messages (`n` keeps counting across clicks) so you can check the order on the consumer side.",
+        "x": 180,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "553bccf4d2cb2fb0",
+        "type": "inject",
+        "z": "081c701efbf9361d",
+        "name": "send 1 message",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "1",
+        "payloadType": "num",
+        "x": 140,
+        "y": 140,
+        "wires": [
+            [
+                "7d4d4192050c7928"
+            ]
+        ]
+    },
+    {
+        "id": "242c623bea795547",
+        "type": "inject",
+        "z": "081c701efbf9361d",
+        "name": "send 100 messages",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "100",
+        "payloadType": "num",
+        "x": 160,
+        "y": 180,
+        "wires": [
+            [
+                "7d4d4192050c7928"
+            ]
+        ]
+    },
+    {
+        "id": "7d4d4192050c7928",
+        "type": "function",
+        "z": "081c701efbf9361d",
+        "name": "numbered messages",
+        "func": "// Sends msg.payload messages, numbered 1, 2, 3... The number keeps\n// counting across clicks, so the order is easy to check later.\nconst count = Math.max(1, Math.min(10000, Number(msg.payload) || 1));\nlet n = context.get('n') || 0;\nfor (let i = 0; i < count; i++) {\n    n += 1;\n    node.send({ payload: { n: n, createdAt: new Date().toISOString() } });\n}\ncontext.set('n', n);\nreturn null;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 440,
+        "y": 160,
+        "wires": [
+            [
+                "3d7efd26b3e99b14"
+            ]
+        ]
+    },
+    {
+        "id": "15a0628220fcfd37",
+        "type": "comment",
+        "z": "081c701efbf9361d",
+        "name": "Control messages (msg.action)",
+        "info": "Messages with `msg.action` set to `queue-status`, `flush`, `reconnect` or `queue-clear` are commands for the producer instead of Kafka messages.\n\n- **queue-status** outputs `msg.payload = { size, bytes, segments, droppedTotal, deadLettered, oldestTs, state, mode, queueMode, queueDir, pending, ... }`.\n- **flush now** (`flush`) retries the connection now instead of waiting for the next attempt, or starts sending the queue.\n- **queue-clear** deletes every queued message without sending it (a warning is logged), then outputs the statistics. Use it with care.",
+        "x": 190,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "e262c5a36d4c64c6",
+        "type": "inject",
+        "z": "081c701efbf9361d",
+        "name": "queue-status",
+        "props": [
+            {
+                "p": "action",
+                "v": "queue-status",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 130,
+        "y": 280,
+        "wires": [
+            [
+                "3d7efd26b3e99b14"
+            ]
+        ]
+    },
+    {
+        "id": "1d2ef82f571fe715",
+        "type": "inject",
+        "z": "081c701efbf9361d",
+        "name": "flush now",
+        "props": [
+            {
+                "p": "action",
+                "v": "flush",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 120,
+        "y": 320,
+        "wires": [
+            [
+                "3d7efd26b3e99b14"
+            ]
+        ]
+    },
+    {
+        "id": "a36f78943c799f85",
+        "type": "inject",
+        "z": "081c701efbf9361d",
+        "name": "queue-clear",
+        "props": [
+            {
+                "p": "action",
+                "v": "queue-clear",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 130,
+        "y": 360,
+        "wires": [
+            [
+                "3d7efd26b3e99b14"
+            ]
+        ]
+    },
+    {
+        "id": "3d7efd26b3e99b14",
+        "type": "kafkajs-nc-producer",
+        "z": "081c701efbf9361d",
+        "name": "producer with disk queue",
+        "broker": "eb2c3434e5cdee87",
+        "topic": "example-queue",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "idempotent": false,
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "example-queue",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 720,
+        "y": 260,
+        "wires": [
+            [
+                "357bad1959942e25"
+            ]
+        ]
+    },
+    {
+        "id": "357bad1959942e25",
+        "type": "switch",
+        "z": "081c701efbf9361d",
+        "name": "msg.action set?",
+        "property": "action",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "nnull"
+            },
+            {
+                "t": "else"
+            }
+        ],
+        "checkall": "false",
+        "repair": false,
+        "outputs": 2,
+        "x": 990,
+        "y": 260,
+        "wires": [
+            [
+                "cd3bae5228203dec"
+            ],
+            [
+                "31c9cb336528ec0b"
+            ]
+        ]
+    },
+    {
+        "id": "cd3bae5228203dec",
+        "type": "debug",
+        "z": "081c701efbf9361d",
+        "name": "queue statistics",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1230,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "31c9cb336528ec0b",
+        "type": "debug",
+        "z": "081c701efbf9361d",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1220,
+        "y": 280,
+        "wires": []
+    },
+    {
+        "id": "a981f2bca3c6d644",
+        "type": "comment",
+        "z": "081c701efbf9361d",
+        "name": "Watch the producer status",
+        "info": "A *status* node receives every status change of the producer: `msg.status = { fill, shape, text, source }`.",
+        "x": 180,
+        "y": 420,
+        "wires": []
+    },
+    {
+        "id": "0021e2d129111ee9",
+        "type": "status",
+        "z": "081c701efbf9361d",
+        "name": "producer status",
+        "scope": [
+            "3d7efd26b3e99b14"
+        ],
+        "x": 140,
+        "y": 460,
+        "wires": [
+            [
+                "8f3291d3ad2aa318"
+            ]
+        ]
+    },
+    {
+        "id": "8f3291d3ad2aa318",
+        "type": "debug",
+        "z": "081c701efbf9361d",
+        "name": "status changes",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "status",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 420,
+        "y": 460,
+        "wires": []
+    },
+    {
+        "id": "4595a02f9125a55e",
+        "type": "comment",
+        "z": "081c701efbf9361d",
+        "name": "Read the messages back",
+        "info": "Uses *Parsed JSON*, so `msg.payload` is an object again.",
+        "x": 170,
+        "y": 520,
+        "wires": []
+    },
+    {
+        "id": "97411b7b118ca344",
+        "type": "kafkajs-nc-consumer",
+        "z": "081c701efbf9361d",
+        "name": "",
+        "broker": "eb2c3434e5cdee87",
+        "topics": "example-queue",
+        "topicIsRegex": false,
+        "groupId": "example-queue-reader",
+        "fromBeginning": true,
+        "autoStart": true,
+        "payloadFormat": "json",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 170,
+        "y": 560,
+        "wires": [
+            [
+                "9fe411519fcb2850"
+            ]
+        ]
+    },
+    {
+        "id": "9fe411519fcb2850",
+        "type": "debug",
+        "z": "081c701efbf9361d",
+        "name": "received (check n)",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 430,
+        "y": 560,
+        "wires": []
+    },
+    {
+        "id": "eb2c3434e5cdee87",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 02)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]

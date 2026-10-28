@@ -1,0 +1,280 @@
+[
+    {
+        "id": "dc667dfa2edf20de",
+        "type": "tab",
+        "label": "Kafka 01: produce and consume",
+        "disabled": false,
+        "info": "Send messages to a Kafka topic with the **kafka producer** node and read them back with the **kafka consumer** node. Start here if you are new to Kafka or to this palette.\n\nSelect the comment nodes and open the *Info* sidebar for step-by-step instructions.",
+        "env": []
+    },
+    {
+        "id": "0cd527a97b29e2e9",
+        "type": "comment",
+        "z": "dc667dfa2edf20de",
+        "name": "Example 01: produce and consume the basics (select me and open the Info sidebar)",
+        "info": "## Produce and consume: the basics\n\nKafka stores messages in **topics**. A **producer** writes messages to a topic, a **consumer** reads them. This example writes a few messages to the topic `example-basics` and reads them back.\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 01)*) and change **Brokers**. Then click **Deploy**.\n\n### Steps\n\n1. Click the button of **create topic example-basics** once. The debug sidebar shows `true` (created) or `false` (it already existed). Many brokers also create a topic automatically when a producer first writes to it, but creating it yourself is more reliable.\n2. Click **send a text** and **send a JSON object**. The *delivery report* shows `kafka.status: \"sent\"` together with the partition and offset Kafka gave the message.\n3. The consumer prints every message it receives, with its `topic`, `key`, `partition`, `offset`, `timestamp` and `headers`. Until the topic exists, its status shows `unknown topic/partition · retry …` (yellow): it keeps retrying and starts at the first retry after the topic was created.\n\n### Good to know\n\n- The node status under each Kafka node tells you what it is doing: `connected` (green), `connecting…` or a retry countdown (yellow), or a problem that needs you, such as `auth failed` (red). The nodes reconnect on their own and never crash Node-RED.\n- While Kafka cannot be reached, the producer keeps messages in its offline queue and sends them later (see example 02).\n- The consumer belongs to the consumer group `example-basics-reader`. Kafka remembers how far a group has read, so after a restart it continues where it stopped. *Read from the beginning* is ticked, so a new group starts with the oldest message of the topic.",
+        "x": 370,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "3f75a9b910c56d5b",
+        "type": "comment",
+        "z": "dc667dfa2edf20de",
+        "name": "1. Create the topic (once)",
+        "info": "Uses the **kafka admin** node with its *Action* set to *Create topics*. `msg.payload` is the topic name; the broker's default number of partitions and replication factor are used. Example 06 shows more admin actions.",
+        "x": 170,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "5872efc883f8aca6",
+        "type": "inject",
+        "z": "dc667dfa2edf20de",
+        "name": "create topic example-basics",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "example-basics",
+        "payloadType": "str",
+        "x": 180,
+        "y": 140,
+        "wires": [
+            [
+                "0d9eecd51c1b8b31"
+            ]
+        ]
+    },
+    {
+        "id": "0d9eecd51c1b8b31",
+        "type": "kafkajs-nc-admin",
+        "z": "dc667dfa2edf20de",
+        "name": "create topic",
+        "broker": "c8ab2cc5d15bc0c7",
+        "action": "createTopics",
+        "timeout": 30000,
+        "x": 430,
+        "y": 140,
+        "wires": [
+            [
+                "64bcafec7deb71b3"
+            ]
+        ]
+    },
+    {
+        "id": "64bcafec7deb71b3",
+        "type": "debug",
+        "z": "dc667dfa2edf20de",
+        "name": "createTopics result",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 740,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "74ff9f6c118ed25b",
+        "type": "comment",
+        "z": "dc667dfa2edf20de",
+        "name": "2. Produce: click the buttons",
+        "info": "The producer's *Topic* is set to `example-basics`. Strings and buffers are sent as they are; objects and arrays are sent as JSON.\n\nThe producer passes every input message on as a *delivery report*: `msg.kafka.status` is `sent` (Kafka confirmed it) or `queued` (Kafka is not reachable right now; the message is stored and sent later).",
+        "x": 180,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "1b6f60ec51324591",
+        "type": "inject",
+        "z": "dc667dfa2edf20de",
+        "name": "send a text",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "Hello Kafka!",
+        "payloadType": "str",
+        "x": 130,
+        "y": 240,
+        "wires": [
+            [
+                "7aa037ec625225db"
+            ]
+        ]
+    },
+    {
+        "id": "220ce0fb5ed4a607",
+        "type": "inject",
+        "z": "dc667dfa2edf20de",
+        "name": "send a JSON object",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"temperature\":21.5,\"unit\":\"C\"}",
+        "payloadType": "json",
+        "x": 160,
+        "y": 280,
+        "wires": [
+            [
+                "7aa037ec625225db"
+            ]
+        ]
+    },
+    {
+        "id": "7aa037ec625225db",
+        "type": "kafkajs-nc-producer",
+        "z": "dc667dfa2edf20de",
+        "name": "",
+        "broker": "c8ab2cc5d15bc0c7",
+        "topic": "example-basics",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "idempotent": false,
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 470,
+        "y": 260,
+        "wires": [
+            [
+                "321e0f3e8d6c1411"
+            ]
+        ]
+    },
+    {
+        "id": "321e0f3e8d6c1411",
+        "type": "debug",
+        "z": "dc667dfa2edf20de",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 720,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "811d5673a1e9eed5",
+        "type": "comment",
+        "z": "dc667dfa2edf20de",
+        "name": "3. Consume: every Kafka message becomes a msg",
+        "info": "The consumer subscribes to `example-basics`. Its *Payload* format is *UTF-8 string*, so the JSON object arrives as text; choose *Parsed JSON* to get an object (see example 03). The debug node shows the complete message.",
+        "x": 260,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "baa716796f49a031",
+        "type": "kafkajs-nc-consumer",
+        "z": "dc667dfa2edf20de",
+        "name": "",
+        "broker": "c8ab2cc5d15bc0c7",
+        "topics": "example-basics",
+        "topicIsRegex": false,
+        "groupId": "example-basics-reader",
+        "fromBeginning": true,
+        "autoStart": true,
+        "payloadFormat": "string",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 170,
+        "y": 380,
+        "wires": [
+            [
+                "434e3a12fd3ed334"
+            ]
+        ]
+    },
+    {
+        "id": "434e3a12fd3ed334",
+        "type": "debug",
+        "z": "dc667dfa2edf20de",
+        "name": "received message",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 450,
+        "y": 380,
+        "wires": []
+    },
+    {
+        "id": "c8ab2cc5d15bc0c7",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 01)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]
