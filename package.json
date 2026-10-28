@@ -3,6 +3,9 @@
     "version": "1.0.0",
     "description": "Crash-proof Kafka nodes for Node-RED built on KafkaJS: auto-reconnect, clear errors, and a disk-backed offline queue that stores messages while Kafka is unreachable and replays them in order when the connection comes back.",
     "main": "nodes/kafka-broker.js",
+    "bin": {
+        "kafkajs-nc-migrate-flows": "scripts/migrate-flows.js"
+    },
     "scripts": {
         "test": "mocha \"test/**/*.spec.js\"",
         "test:unit": "mocha \"test/unit/**/*.spec.js\"",
@@ -30,7 +33,7 @@
         "edge"
     ],
     "node-red": {
-        "version": ">=3.0.0",
+        "version": ">=3.1.0",
         "nodes": {
             "kafkajs-nc-broker": "nodes/kafka-broker.js",
             "kafkajs-nc-producer": "nodes/kafka-producer.js",
@@ -46,6 +49,7 @@
         "lib/",
         "examples/",
         "docs/",
+        "scripts/migrate-flows.js",
         "README.md",
         "CHANGELOG.md",
         "LICENSE"
