@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+.nyc_output/
+*.log
+.DS_Store
+.kafka-local/
+test/.tmp/
+.idea/
+.vscode/
+*.tgz
