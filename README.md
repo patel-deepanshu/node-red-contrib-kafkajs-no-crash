@@ -170,8 +170,9 @@ You need a Kafka broker. For a local test broker, run the official Apache Kafka 
    **Deploy**.
 4. **Send something.** Click the inject button. The producer's debug output shows `msg.kafka.status: "sent"` with the
    partition and offset. The producer creates the topic on first use if the broker allows automatic topic creation,
-   which is Kafka's default. Until the topic exists, the consumer shows `unknown topic/partition · retry …` and keeps
-   trying. At its next retry (within a minute at most) it joins and prints the message.
+   which is Kafka's default: it waits the moment the broker needs for that, so even the first message is reported
+   `sent`. Until the topic exists, the consumer shows `unknown topic/partition · retry …` and keeps trying. At its next
+   retry (within a minute at most) it joins and prints the message.
 5. **Watch it survive an outage.** Run `docker stop kafka` and click inject a few times. The producer reports
    `msg.kafka.status: "queued"` (the first report can take a few seconds while kafkajs retries) and shows
    `offline · 3 queued · retry …`. Run `docker start kafka`. The queued messages are sent in order, and the consumer
@@ -418,10 +419,14 @@ Messages that cannot be sent end with `done(err)`. A *catch* node then receives 
 `msg.error`. This happens for a missing or invalid topic, an `undefined` payload, a partition that does not exist, a
 message too large for the broker, a full queue with *Reject new messages*, or Kafka unreachable with the queue off.
 
-A partition counts as missing only when the producer's connection is less than 10 s old, so that its list of the
-topic's partitions is current. kafkajs keeps that list for up to 5 minutes: after partitions were added, a message for
-a new partition may not be written at first. The producer then reconnects, which fetches the current list, and sends
-that message again.
+A partition counts as missing only when the producer's list of the topic's partitions is current: its connection is
+less than 10 s old, or it reconnected to fetch the list because of exactly this partition. kafkajs keeps that list for
+up to 5 minutes: after partitions were added, a message for a new partition may not be written at first. The producer
+then reconnects at once, which fetches the current list, and sends that message again (logged at debug level; messages
+arriving meanwhile wait behind it). A partition confirmed missing this way is remembered for one minute: a flow that
+keeps sending to a partition that does not exist causes at most one such reconnect per partition per minute, and the
+other messages for it fail at once. Other partitions of the topic are not affected, so a partition that was really
+added is always used.
 
 ### Settings
 
@@ -439,7 +444,7 @@ that message again.
 | Delivery | Compression | `compression` | `none` | `none`, `gzip`, `snappy` or `lz4`. |
 | Delivery | Partitioner | `partitioner` | `default` | `default` (same key-to-partition mapping as the Java client) or `legacy` (kafkajs 1.x mapping). |
 | Delivery | Batch size | `batchSize` | 100 | At most this many messages per produce request (1 – 10000). Used both for messages that pile up while a request is in flight and for sending the queue. |
-| Delivery | Let the broker create missing topics | `allowAutoTopicCreation` | on | Only has an effect if the broker allows it (`auto.create.topics.enable`). |
+| Delivery | Let the broker create missing topics | `allowAutoTopicCreation` | on | Only has an effect if the broker allows it (`auto.create.topics.enable`). While on, the node waits up to about 2.5 s for a new topic to be created (see *New topics* below). |
 | Offline queue | Offline queue | `queueMode` | `disk` | `disk`, `memory` or `off`. See [Offline queue](#offline-queue-store-and-forward). |
 | Offline queue | Directory | `queueDir` | empty | Empty: `kafkajsNcProducerQueueDir` from `settings.js`, else `kafkajs-nc-queue`. Relative paths are relative to the Node-RED user directory. Disk mode only. |
 | Offline queue | Queue name | `queueName` | empty | Empty: the node's id. Disk mode only. |
@@ -473,6 +478,12 @@ why).
   without having written the messages for partitions whose leader moved to a broker that had already answered, and
   nothing reports the loss. Resending the whole request can only cause a duplicate, never a silent loss. The broker
   node's *Retries* setting still applies to connecting.
+- **New topics.** While a broker creates a topic automatically it answers *unknown topic* for a moment (typically
+  0.1 to 1 s). With *Let the broker create missing topics* on, the node sends the request again after 0.05, 0.1, 0.2,
+  0.4, 0.8 and 0.8 s (debug log only), so the first messages to a new topic are reported `sent`. If the topic still
+  does not exist after that (about 2.5 s), the broker does not create topics: the message fails (`msg.topic`) or is
+  queued (the node's *Topic*), and for one minute further messages for that topic do not wait again. With the option
+  off, *unknown topic* is not waited for. All pauses of one request together never exceed 5 s.
 - **No idempotent producer.** kafkajs' idempotent mode only works with its own produce retry switched on, which is
   exactly the retry that can lose messages, so this palette does not offer it. Earlier development versions had an
   *Idempotent producer* option; a flow that still sets it loads normally, the option is ignored, and a warning says
@@ -669,10 +680,12 @@ as queued.
   `connected · queue unavailable` and runs without a queue. A copy of a node keeps its Queue name, so give the copy
   a name of its own.
 - **Orphaned queue.** About 10 s after a disk queue opens, the producer looks at the other directories next to its
-  own and warns once about those that hold messages no running producer uses (`Found N offline queue(s) under
-  <directory> with unsent messages that no running producer uses: <name> (<size>), ...`). If a node lost its queue
-  because it got a new id, set its Queue name to the old directory's name (the old node id). The messages are then
-  sent on the next deploy. Otherwise delete the directory.
+  own and warns once about those that hold messages no producer in the deployed flows uses (`Found N offline queue(s)
+  under <directory> with unsent messages that no producer in the deployed flows uses: <name> (<size>), ...`).
+  Producers that are disabled or in a disabled flow count as using their queue. If a node lost its queue because it
+  got a new id, set its Queue name to the old directory's name (the old node id); the messages are then sent on the
+  next deploy. A listed directory may also belong to a flow you will import again or to another Node-RED instance
+  that uses the same directory: delete it only when you are sure no producer needs those messages.
 - **One Node-RED per directory.** The lock that prevents two producers from sharing a directory only works inside one
   Node-RED process. Never point two Node-RED instances at the same queue directory, for example on a shared network
   drive. Use a local disk.

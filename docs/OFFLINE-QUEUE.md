@@ -459,10 +459,13 @@ once that producer is connected. Only do this with Node-RED's own queue director
 time.
 
 **Finding orphaned queues:** about 10 s after its disk queue opened, a producer looks at the other directories next to
-its own and warns once about those that hold messages no running producer uses: `Found N offline queue(s) under
-<directory> with unsent messages that no running producer uses: <name> (<size>), ...`. The scan only lists the
-directories and reads file sizes (at most 1000 directories), and reports each directory once per Node-RED run. A
-producer in a disabled flow counts as not running, so its queue is listed too.
+its own and warns once about those that hold messages no producer in the deployed flows uses: `Found N offline
+queue(s) under <directory> with unsent messages that no producer in the deployed flows uses: <name> (<size>), ...`.
+The scan only lists the directories and reads file sizes (at most 1000 directories), and reports each directory once
+per Node-RED run. A producer that is disabled, or in a disabled flow, still counts (by its *Queue name* or node id):
+its queue is sent when it runs again, so it is not listed. A listed directory may still belong to a flow you will
+import again (or a disabled producer whose *Queue name* comes from an environment variable) or to another Node-RED
+instance that uses the same directory. Only delete it when you are sure that no producer needs those messages.
 
 Deleting a queue: send `msg.action = "queue-clear"` to the producer, or stop Node-RED and delete the directory.
 

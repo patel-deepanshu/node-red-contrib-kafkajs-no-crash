@@ -251,6 +251,47 @@
     }
 
     /**
+     * The offline queue mode: the dialog's current choice while it is open,
+     * else the saved value (blank and unknown values mean "disk", as at runtime).
+     */
+    function queueModeOf(node) {
+        var mode;
+        try {
+            var field = $('#node-input-queueMode');
+            if (field && field.length) {
+                mode = field.val();
+            }
+        } catch (e) {
+            mode = undefined;
+        }
+        if (mode === undefined || mode === null) {
+            mode = node ? node.queueMode : '';
+        }
+        return String(mode || '').trim().toLowerCase();
+    }
+
+    /**
+     * Queue directory and Queue name: the runtime's checks (pathProblem in
+     * kafka-producer.js). A ${NAME} inside a longer value ('${HOME}/queues') is
+     * never replaced by Node-RED and "~user" is not expanded: the queue would be
+     * unavailable. Only matters for the disk queue.
+     */
+    function validQueuePath(v, opt) {
+        var mode = queueModeOf(this);
+        if (mode === 'memory' || mode === 'off' || isBlank(v) || ENV_REF.test(String(v))) {
+            return true;
+        }
+        var s = String(v);
+        if (/\$\{[^}]*\}/.test(s)) {
+            return opt ? NOT_WHOLE : false;
+        }
+        if (/^~[^/\\]/.test(s.trim())) {
+            return opt ? '"~user" is not expanded: use an absolute path' : false;
+        }
+        return true;
+    }
+
+    /**
      * Saved headers → editable list rows. Reads everything the runtime reads,
      * so opening and saving the dialog never changes what is sent: an object
      * { name: value | [values] } (what this editor saves), an array of
@@ -324,8 +365,8 @@
             allowAutoTopicCreation: { value: true },
             batchSize: { value: 100, label: 'Batch size', validate: numberRange(1, 10000, true) },
             queueMode: { value: 'disk' },
-            queueDir: { value: '' },
-            queueName: { value: '' },
+            queueDir: { value: '', label: 'Queue directory', validate: validQueuePath },
+            queueName: { value: '', label: 'Queue name', validate: validQueuePath },
             queueMaxMB: { value: 100, label: 'Queue maximum size', validate: numberRange(0, 1048576, false) },
             queueMaxMessages: { value: 0, label: 'Queue maximum messages', validate: numberRange(0, 9007199254740991, true) },
             queueOverflow: { value: 'drop-oldest' },
@@ -487,7 +528,8 @@ What happens when the variable is not set depends on the setting:
 - Topic, Key, Partition and Static headers: every message fails with a clear error instead of being sent somewhere
   unexpected.
 - Queue directory and Queue name: the offline queue is unavailable (an error is logged); messages are still sent
-  while Kafka is connected. A `${NAME}` inside a longer path is reported the same way.
+  while Kafka is connected. A `${NAME}` inside a longer path (`${HOME}/queues`) is never replaced: the editor marks
+  the field as invalid and the runtime reports it the same way.
 - Acknowledgement, Compression and Offline queue mode: a warning is logged and the default is used.
 - Other settings (numbers and check boxes): the default is used.
 
@@ -529,7 +571,10 @@ redeployed. *Off* fails messages (`done(err)`) while Kafka is not connected.
 a node gives it a new id and therefore a new, empty queue (set a *Queue name* to keep the same queue). Changing
 *Directory* or *Queue name* leaves the queued messages in the old directory: a warning names it, and setting the old
 values again sends them. When a node with queued messages is deleted, a warning names its directory too, and a
-producer that starts warns about queue directories next to its own that hold messages no running producer uses.
+producer that starts warns about queue directories next to its own that hold messages no producer in the deployed
+flows uses. Producers that are disabled, or in a disabled flow, still count: their queues are sent when they run
+again. A listed directory may also belong to a flow you will import again or to another Node-RED instance using the
+same directory, so only delete it when you are sure no producer needs those messages.
 
 Two producers must never use the same queue. A copy of a node keeps its *Queue name*: while the original exists the
 copy cannot lock that queue, reports an error and runs without a queue, so give the copy its own name. After a
@@ -553,11 +598,21 @@ header.
 Kafka errors that usually clear within a second or two (a partition leader moving during a broker restart, not
 enough in-sync replicas yet, a request timeout) are retried by sending the whole request again, up to 3 times after
 pauses of about 0.2, 0.6 and 1.6 s, before the messages go to the offline queue. kafkajs' own retry is not used,
-because it can lose messages when partition leaders move.
+because it can lose messages when partition leaders move. Retries are logged at debug level only.
+
+**New topics.** With *Let the broker create missing topics* on (the default) and a broker that creates topics
+(Kafka's default), the first message to a new topic creates it. The broker needs a moment for that (typically 0.1 to
+1 s) and answers *unknown topic* meanwhile, so the node sends the request again after 0.05, 0.1, 0.2, 0.4, 0.8 and
+0.8 s (at most about 2.5 s): the first messages are reported `sent`, without an error. If the topic still does not
+exist then, the broker does not create topics: the message fails (topic from `msg.topic`) or is queued (the node's
+Topic) as with the option off, and for the next minute further messages for that topic do not wait again.
 
 A message for an explicit partition that Kafka did not write because the producer's information about the topic may
-be out of date (partitions were added) is sent again after a reconnect; it fails as *partition does not exist* only
-when that is confirmed.
+be out of date (partitions were added) is sent again after a quick reconnect that fetches the current list of
+partitions (logged at debug level; newer messages wait in memory behind it). It fails as *partition does not exist*
+when that is confirmed. After that, further messages for the same missing partition fail at once for one minute, so a
+flow that keeps using a wrong partition does not make the node reconnect again and again. Other partitions of the
+topic are not affected: a partition that was really added is always used.
 
 #### Dead-letter file
 

@@ -1475,7 +1475,9 @@ describe('kafka producer node', function () {
             assert.equal(msg.kafka.status, 'sent');
             assert.equal(msg.kafka.partition, 1);
             assert.deepEqual(fake.sent.map((s) => [s.value, s.partition]), [['to-p1', 1]]);
-            assert.equal(logged(node, 'error', /Partition 1 of topic test-topic is not in the producer's metadata/).length, 1);
+            assert.equal(logged(node, 'debug', /Partition 1 of topic test-topic is not in the producer's metadata .*reconnecting to fetch the current list/).length, 1);
+            assert.deepEqual(logged(node, 'error'), [], 'a metadata refresh is not a failure (R2)');
+            assert.deepEqual(logged(node, 'log', /Connected to Kafka after/), []);
         });
 
         it('live: only the skipped messages of a batch are sent again', async function () {
@@ -1503,6 +1505,312 @@ describe('kafka producer node', function () {
             const values = fake.sent.map((s) => s.value);
             assert.deepEqual(values.slice(0, 2), ['a', 'c'], 'first round: a and c written, to-p1 skipped');
             assert.deepEqual(values.slice(2), ['to-p1', 'c'], 'after the reconnect: from to-p1 on (c again: at-least-once)');
+        });
+    });
+
+    describe('topics that are being created (R1)', function () {
+        /** kafkajs with retries: 0 while the broker is still creating the topic (auto-creation). */
+        function creating() {
+            return fake.errors.retriesExceeded(fake.errors.protocol('UNKNOWN_TOPIC_OR_PARTITION'), { retryCount: 0, retryTime: 300 });
+        }
+        /** The first `n` sends to `topic` fail with `error()`, then the topic exists. */
+        function failFirst(topic, n, error = creating) {
+            let left = n;
+            fake.behaviour.sendError = (args) => (args.topic === topic && left-- > 0 ? error() : null);
+        }
+        function noErrorsOrWarnings(node) {
+            assert.deepEqual(logged(node, 'error'), [], 'no error log');
+            assert.deepEqual(logged(node, 'warn'), [], 'no warning');
+        }
+
+        beforeEach(function () {
+            producerNode.TIMEOUTS.topicRetryMin = 10;
+            producerNode.TIMEOUTS.topicRetryMax = 40;
+        });
+
+        it('msg.topic, queue off: the first messages to a topic being auto-created are sent, not failed', async function () {
+            failFirst('brand-new', 3);
+            const node = await load({ topic: '', queueMode: 'off' });
+            await connected(node);
+            const first = await produce(node, { payload: 'first', topic: 'brand-new' });
+            assert.equal(first.err, null, 'not "This server does not host this topic-partition"');
+            assert.equal(first.msg.kafka.status, 'sent');
+            const second = await produce(node, { payload: 'second', topic: 'brand-new' });
+            assert.equal(second.msg.kafka.status, 'sent');
+            assert.deepEqual(fake.sent.map((s) => s.value), ['first', 'second']);
+            assert.equal(fake.producers.length, 1, 'no reconnect');
+            assert.equal(fake.producers[0].sendCalls.length, 5, 'first: 1 + 3 retries, second: 1');
+            assert.equal(logged(node, 'debug', /while the topic is being created .*sending its 1 message\(s\) again .*\(retry 3 of 6\)/).length, 1);
+            noErrorsOrWarnings(node);
+        });
+
+        it('configured topic, disk queue: sent at once instead of queued with an error and a reconnect', async function () {
+            failFirst('test-topic', 2);
+            const node = await load();
+            await connected(node);
+            const { err, msg } = await produce(node, { payload: 'first' });
+            assert.equal(err, null);
+            assert.equal(msg.kafka.status, 'sent');
+            assert.equal(msg.kafka.offset, '0');
+            assert.equal(fake.producers.length, 1, 'no reconnect');
+            assert.equal(rt(node).queuedCount(), 0);
+            noErrorsOrWarnings(node);
+        });
+
+        it('the flusher waits for a topic being created as well', async function () {
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load({ topic: '' });
+            await waitFor(() => rt(node).state === 'waiting');
+            await produce(node, { payload: 'q1', topic: 'fresh' });
+            failFirst('fresh', 2);
+            delete fake.behaviour.connectError;
+            await waitFor(() => fake.sent.length === 1 && rt(node).mode === 'live', { message: 'flushed' });
+            assert.deepEqual(deadLetters(queueDir(userDir)), [], 'not dead-lettered');
+            assert.deepEqual(logged(node, 'warn'), []);
+        });
+
+        it('"metadata not loaded" is retried too, with or without automatic topic creation', async function () {
+            for (const allowAutoTopicCreation of [true, false]) {
+                fake.reset();
+                const notLoaded = () => fake.errors.retriesExceeded(new fake.KafkaJSMetadataNotLoaded('Producing to topic without metadata'));
+                const topicNotLoaded = () => fake.errors.retriesExceeded(new fake.KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', { topic: 'test-topic' }));
+                const errors = [notLoaded, topicNotLoaded];
+                fake.behaviour.sendError = () => (errors.length > 0 ? errors.shift()() : null);
+                const node = await load({ allowAutoTopicCreation, queueMode: 'off' });
+                await connected(node);
+                const { err, msg } = await produce(node, { payload: 'x' });
+                assert.equal(err, null, `allowAutoTopicCreation ${allowAutoTopicCreation}`);
+                assert.equal(msg.kafka.status, 'sent');
+                assert.equal(fake.producers.length, 1);
+                noErrorsOrWarnings(node);
+                await helper.unload();
+            }
+        });
+
+        it('without automatic topic creation, an unknown topic is not waited for (as before)', async function () {
+            fake.behaviour.sendError = (args, client) => (client === fake.producers[0] ? creating() : null);
+            const node = await load({ topic: '', allowAutoTopicCreation: false });
+            await connected(node);
+            const r = await produce(node, { payload: 'x', topic: 'missing' });
+            assert.match(String(r.err && r.err.message), /does not host this topic-partition/);
+            assert.equal(fake.producers[0].sendCalls.length, 1, 'no retry');
+            await helper.unload();
+            let once = true;
+            fake.behaviour.sendError = () => (once ? ((once = false), creating()) : null);
+            const configured = await load({ allowAutoTopicCreation: false });
+            await connected(configured);
+            const sends = fake.producers[fake.producers.length - 1];
+            const q = await produce(configured, { payload: 'y' });
+            assert.equal(q.msg.kafka.status, 'queued', 'configured topic: queued and retried after a reconnect');
+            assert.equal(sends.sendCalls.length, 1);
+        });
+
+        it('a topic the cluster never creates: bounded wait, then the following messages are not held up again', async function () {
+            fake.behaviour.sendError = (args) => (args.topic === 'never' ? creating() : null);
+            const node = await load({ topic: '', queueMode: 'off' });
+            await connected(node);
+            const p = fake.producers[0];
+            const t0 = Date.now();
+            const first = await produce(node, { payload: 'a', topic: 'never' });
+            assert.match(String(first.err && first.err.message), /does not host this topic-partition/);
+            assert.equal(p.sendCalls.length, 7, '1 attempt + LIMITS.topicRetries (6)');
+            assert.ok(Date.now() - t0 < producerNode.TIMEOUTS.sendRetryTotal);
+            const second = await produce(node, { payload: 'b', topic: 'never' });
+            assert.ok(second.err);
+            assert.equal(p.sendCalls.length, 8, 'not waited for again within TIMEOUTS.topicNotCreated');
+            const other = await produce(node, { payload: 'c', topic: 'exists' });
+            assert.equal(other.msg.kafka.status, 'sent', 'other topics are not affected');
+            producerNode.TIMEOUTS.topicNotCreated = 0;
+            await produce(node, { payload: 'd', topic: 'never' });
+            assert.equal(p.sendCalls.length, 16, 'waited for again once the memory expired');
+            assert.equal(rt(node).state, 'connected', 'the connection is fine');
+        });
+
+        it('the pauses of one batch never add up to more than TIMEOUTS.sendRetryTotal', async function () {
+            producerNode.TIMEOUTS.topicRetryMin = 40;
+            producerNode.TIMEOUTS.topicRetryMax = 40;
+            producerNode.TIMEOUTS.sendRetryTotal = 60; // one pause of 32-48 ms fits, a second does not
+            fake.behaviour.sendError = () => creating();
+            const node = await load({ topic: '', queueMode: 'off' });
+            await connected(node);
+            const r = await produce(node, { payload: 'a', topic: 'never' });
+            assert.ok(r.err);
+            assert.equal(fake.producers[0].sendCalls.length, 2);
+        });
+
+        it('sendRetryReason: topic creation only with automatic topic creation; metadata always', function () {
+            const { sendRetryReason } = internals;
+            assert.equal(sendRetryReason(creating(), true), 'topic');
+            assert.equal(sendRetryReason(creating(), false), null);
+            assert.equal(sendRetryReason(fake.errors.unknownTopic(), true), 'topic');
+            const notLoaded = fake.errors.retriesExceeded(new fake.KafkaJSMetadataNotLoaded('Producing to topic without metadata'));
+            assert.equal(sendRetryReason(notLoaded, false), 'topic');
+            assert.equal(sendRetryReason(new fake.KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded'), false), 'topic');
+            assert.equal(sendRetryReason(fake.errors.protocol('NOT_LEADER_FOR_PARTITION'), true), 'transient');
+            assert.equal(sendRetryReason(fake.errors.topicAuthorizationFailed(), true), null);
+            assert.equal(sendRetryReason(fake.errors.sendDuringOutage(), true), null);
+            assert.equal(sendRetryReason(fake.errors.messageTooLarge(), true), null);
+            assert.equal(sendRetryReason(undefined, true), null);
+        });
+    });
+
+    describe('a partition that really does not exist (R2)', function () {
+        beforeEach(function () {
+            fake.behaviour.partitionCount = 1;
+        });
+
+        it('on an old connection: one metadata refresh per topic, then every such message fails at once, quietly', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 30; // stands for 10 s
+            const node = await load();
+            await connected(node);
+            await sleep(50); // the connection is "old" now
+            const results = [];
+            for (let i = 0; i < 5; i++) {
+                results.push(await produce(node, { payload: `bad${i}`, partition: 5 }));
+                await connected(node);
+                await sleep(50);
+            }
+            assert.ok(results.every((r) => r.err && /Partition 5 does not exist for topic test-topic/.test(r.err.message)),
+                results.map((r) => r.err && r.err.message).join('; '));
+            const connects = fake.producers.reduce((n, p) => n + p.connectCount, 0);
+            assert.equal(connects, 2, 'one refresh, not one reconnect per message');
+            assert.deepEqual(logged(node, 'error'), []);
+            assert.deepEqual(logged(node, 'warn'), []);
+            assert.deepEqual(logged(node, 'log'), [], 'no "Connected to Kafka after 2 attempts"');
+            assert.equal(logged(node, 'debug', /reconnecting to fetch the current list/).length, 1);
+            const ok = await produce(node, { payload: 'good', partition: 0 });
+            assert.equal(ok.msg.kafka.status, 'sent');
+        });
+
+        it('after TIMEOUTS.missingPartition the next miss refreshes again (partitions may have been added)', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 0;
+            producerNode.TIMEOUTS.missingPartition = 150;
+            let added = false; // partitions are added; producers connected after that see them
+            let seenFrom = Infinity;
+            fake.behaviour.partitionCount = () => (fake.producers.filter((p) => p.connectCount > 0).length >= seenFrom ? 2 : 1);
+            const node = await load();
+            await connected(node);
+            assert.ok((await produce(node, { payload: 'a', partition: 1 })).err);
+            assert.ok((await produce(node, { payload: 'b', partition: 1 })).err);
+            assert.equal(fake.producers.length, 2, 'one refresh');
+            added = true;
+            seenFrom = fake.producers.length + 1;
+            await sleep(200);
+            const c = await produce(node, { payload: 'c', partition: 1 });
+            assert.equal(c.err, null);
+            assert.equal(c.msg.kafka.partition, 1);
+            assert.equal(fake.producers.length, 3, 'a second refresh');
+            assert.ok(added);
+        });
+
+        it('a partition added after another partition was confirmed missing is sent, not refused (R2 window)', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 30; // stands for 10 s
+            let seenFrom = Infinity; // producers connected from this one on see the added partitions
+            const connectedCount = () => fake.producers.filter((p) => p.connectCount > 0).length;
+            fake.behaviour.partitionCount = () => (connectedCount() >= seenFrom ? 2 : 1);
+            const node = await load();
+            await connected(node);
+            await sleep(50); // the connection is "old" now
+            const bad = await produce(node, { payload: 'bad', partition: 7 });
+            assert.match(String(bad.err && bad.err.message), /Partition 7 does not exist/);
+            assert.equal(connectedCount(), 2, 'one refresh confirmed partition 7 missing');
+            seenFrom = connectedCount() + 1; // partition 1 is added now
+            await connected(node);
+            await sleep(50);
+            const added = await produce(node, { payload: 'new', partition: 1 });
+            assert.equal(added.err, null, 'the earlier check of partition 7 must not refuse partition 1');
+            assert.equal(added.msg.kafka.partition, 1);
+            assert.equal(connectedCount(), 3, 'one refresh for the new partition');
+            assert.deepEqual(logged(node, 'error'), []);
+        });
+
+        it('flush: one refresh, then queued messages for the missing partition are dead-lettered (no reconnect loop)', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 0; // the metadata always "may be stale"
+            fake.behaviour.connectError = fake.errors.connectionRefused();
+            const node = await load();
+            await waitFor(() => rt(node).state === 'waiting');
+            for (const [payload, partition] of [['a', 0], ['bad1', 5], ['c', 0], ['bad2', 5]]) {
+                await produce(node, { payload, partition });
+            }
+            delete fake.behaviour.connectError;
+            await waitFor(() => rt(node).queuedCount() === 0 && rt(node).mode === 'live', { message: 'flushed' });
+            assert.deepEqual(deadLetters(queueDir(userDir)).map((d) => d.record.m.v.s), ['bad1', 'bad2']);
+            assert.deepEqual(fake.sent.map((s) => s.value), ['a', 'c', 'c'], 'from bad1 on sent again after the refresh');
+            const connected2 = fake.producers.filter((p) => p.connectCount > 0).length;
+            assert.equal(connected2, 2, 'the first connection and one refresh');
+            const live = await produce(node, { payload: 'bad3', partition: 5 });
+            assert.match(String(live.err && live.err.message), /Partition 5 does not exist/);
+            assert.equal(fake.producers.filter((p) => p.connectCount > 0).length, 2, 'no further refresh');
+            assert.deepEqual(logged(node, 'error').filter((e) => !/^Kafka connection failed/.test(e)), []);
+            assert.deepEqual(logged(node, 'error', /metadata|kept in the offline queue/), []);
+        });
+
+        it('close during the refresh: the message waiting for it keeps its place before newer ones (R2 order)', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 40;
+            fake.behaviour.connectDelayMs = (args, client) => (client.index >= 1 ? 300 : 0); // the refresh is slow
+            const node = await load();
+            await connected(node);
+            await sleep(60); // the connection is "old" now
+            const bad = produce(node, { payload: 'old', partition: 5 });
+            await waitFor(() => rt(node).state !== 'connected', { message: 'reconnecting' });
+            const newer = produce(node, { payload: 'newer' });
+            await sleep(20);
+            await helper.unload();
+            const [r1, r2] = await Promise.all([bad, newer]);
+            assert.equal(r1.msg.kafka.status, 'queued');
+            assert.equal(r2.msg.kafka.status, 'queued');
+            await waitFor(() => !queueRegistry.isOwned(queueDir(userDir)));
+            assert.deepEqual(queuedRecords(queueDir(userDir)).map((r) => r.m.v.s), ['old', 'newer'], 'order kept');
+        });
+
+        it('the refresh connect fails: the waiting message goes to the queue first, newer ones behind it', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 40;
+            fake.behaviour.connectError = (args, client) => (client.index >= 1 ? fake.errors.connectionRefused() : null);
+            const node = await load();
+            await connected(node);
+            await sleep(60);
+            const bad = produce(node, { payload: 'old', partition: 5 });
+            await waitFor(() => rt(node).state === 'waiting', { message: 'refresh failed' });
+            const newer = await produce(node, { payload: 'newer' });
+            assert.equal(newer.msg.kafka.status, 'queued');
+            await helper.unload();
+            assert.equal((await bad).msg.kafka.status, 'queued');
+            await waitFor(() => !queueRegistry.isOwned(queueDir(userDir)));
+            assert.deepEqual(queuedRecords(queueDir(userDir)).map((r) => r.m.v.s), ['old', 'newer']);
+        });
+
+        it('queue off: messages arriving during the refresh wait for it instead of failing', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 40;
+            fake.behaviour.connectDelayMs = (args, client) => (client.index >= 1 ? 100 : 0);
+            const node = await load({ queueMode: 'off' });
+            await connected(node);
+            await sleep(60);
+            const bad = produce(node, { payload: 'old', partition: 5 });
+            await waitFor(() => rt(node).state !== 'connected', { message: 'reconnecting' });
+            const newer = await produce(node, { payload: 'newer' });
+            assert.equal(newer.err, null, 'not "Kafka is not connected and the offline queue is off"');
+            assert.equal(newer.msg.kafka.status, 'sent');
+            assert.match(String((await bad).err && (await bad).err.message), /Partition 5 does not exist/);
+            assert.deepEqual(fake.sent.map((s) => s.value), ['newer']);
+        });
+
+        it('a slow request with a skipped partition stays at the head of the queue for the refresh (R2 order)', async function () {
+            producerNode.TIMEOUTS.freshMetadata = 40;
+            producerNode.TIMEOUTS.liveStall = 30;
+            fake.behaviour.sendDelayMs = (args, client) => (client.index === 0 ? 100 : 0);
+            fake.behaviour.connectDelayMs = (args, client) => (client.index >= 1 ? 300 : 0);
+            const node = await load();
+            await connected(node);
+            const bad = produce(node, { payload: 'old', partition: 5 }); // in flight for 100 ms
+            await sleep(50);
+            const newer = produce(node, { payload: 'newer' }); // stalled request: switch to the queue
+            await waitFor(() => rt(node).state !== 'connected', { message: 'reconnecting' });
+            await helper.unload();
+            const [r1, r2] = await Promise.all([bad, newer]);
+            assert.equal(r1.msg.kafka.status, 'queued');
+            assert.equal(r2.msg.kafka.status, 'queued');
+            await waitFor(() => !queueRegistry.isOwned(queueDir(userDir)));
+            assert.deepEqual(queuedRecords(queueDir(userDir)).map((r) => r.m.v.s), ['old', 'newer'], 'order kept');
         });
     });
 
@@ -1628,7 +1936,7 @@ describe('kafka producer node', function () {
             await waitFor(() => logged(node, 'warn', /Found 1 offline queue/).length + logged(helper.getNode('p2'), 'warn', /Found 1 offline queue/).length === 1,
                 { message: 'orphan warning' });
             const warning = [...logged(node, 'warn', /Found/), ...logged(helper.getNode('p2'), 'warn', /Found/)][0];
-            assert.match(warning, /Found 1 offline queue\(s\) under .*kafkajs-nc-queue with unsent messages that no running producer uses: renamed-queue \(\d+ B\)/);
+            assert.match(warning, /Found 1 offline queue\(s\) under .*kafkajs-nc-queue with unsent messages that no producer in the deployed flows uses: renamed-queue \(\d+ B\)/);
             // the next start does not report the same directory again
             await helper.setFlows([brokerConfig(), producerConfig(), ...flowExtra, { id: 'out', type: 'helper' }], 'full');
             await sleep(150);
@@ -1637,8 +1945,82 @@ describe('kafka producer node', function () {
         });
     });
 
+    describe('queues of producers that do not run (LOSS-4 follow-up)', function () {
+        it('the orphan scan leaves out the queues of disabled producers and disabled flows', async function () {
+            producerNode.TIMEOUTS.orphanScan = 30;
+            const base = path.join(userDir, 'kafkajs-nc-queue');
+            for (const name of ['paused-queue', 'p3', 'p4-from-env', 'renamed-queue']) {
+                writeSegment(path.join(base, name), [record(`in ${name}`)]);
+            }
+            process.env.KAFKAJS_NC_TEST_QUEUE = 'p4-from-env';
+            try {
+                const node = await load({}, {
+                    extraNodes: [
+                        // a disabled node with a Queue name
+                        producerConfig({ id: 'p2', d: true, queueName: 'paused-queue', wires: [[]] }),
+                        // a producer in a disabled flow (its queue is named after its id)
+                        { id: 'tab2', type: 'tab', label: 'paused flow', disabled: true },
+                        producerConfig({ id: 'p3', z: 'tab2', wires: [[]] }),
+                        producerConfig({ id: 'p4', z: 'tab2', queueName: '${KAFKAJS_NC_TEST_QUEUE}', wires: [[]] })
+                    ]
+                });
+                assert.equal(helper.getNode('p2'), null, 'p2 does not run');
+                assert.equal(helper.getNode('p3'), null, 'p3 does not run');
+                await waitFor(() => logged(node, 'warn', /Found \d+ offline queue/).length === 1, { message: 'orphan warning' });
+                const [warning] = logged(node, 'warn', /Found/);
+                assert.match(warning, /Found 1 offline queue\(s\) under .* no producer in the deployed flows uses: renamed-queue \(\d+ B\)\./);
+                assert.match(warning, /another Node-RED instance/);
+                assert.match(warning, /Only delete a directory when you are sure no producer will send its messages/);
+                assert.doesNotMatch(warning, /otherwise delete/);
+            } finally {
+                delete process.env.KAFKAJS_NC_TEST_QUEUE;
+            }
+        });
+
+        it('configuredQueueNames never throws and lists the directory each disk-queue producer opens', function () {
+            const { configuredQueueNames } = internals;
+            assert.deepEqual([...configuredQueueNames(undefined)], []);
+            assert.deepEqual([...configuredQueueNames({ nodes: { eachNode() { throw new Error('boom'); } } })], []);
+            process.env.KNC_TEST_QUEUE_NAME = 'from-env';
+            try {
+                const nodes = [
+                    { id: 'a1', type: 'kafkajs-nc-producer', queueName: ' orders ' }, // the Queue name, not the id
+                    { id: 'a2', type: 'kafkajs-nc-producer', queueName: '${UNSET_VARIABLE_FOR_TEST}' }, // unknown here
+                    { id: 'a3', type: 'kafkajs-nc-producer', queueName: 'x-${Y}' }, // opens no queue at all
+                    { id: 'a4', type: 'kafkajs-nc-producer', queueName: '${KNC_TEST_QUEUE_NAME}' },
+                    { id: 'a5', type: 'kafkajs-nc-producer' }, // no Queue name: the node id
+                    { id: 'a6', type: 'kafkajs-nc-producer', queueMode: 'memory' }, // its old disk queue is left behind
+                    { id: 'a7', type: 'kafkajs-nc-producer', queueMode: 'off', queueName: 'old' },
+                    { id: 'a8', type: 'kafkajs-nc-producer', queueMode: 'Disk ' },
+                    { id: 'a9', type: 'kafkajs-nc-producer', queueMode: 'bogus' }, // falls back to disk
+                    { id: 'c1', type: 'kafkajs-nc-consumer' },
+                    null
+                ];
+                const names = configuredQueueNames({ nodes: { eachNode(cb) { nodes.forEach(cb); } } });
+                assert.deepEqual([...names].sort(), ['a5', 'a8', 'a9', 'from-env', 'orders']);
+            } finally {
+                delete process.env.KNC_TEST_QUEUE_NAME;
+            }
+        });
+
+        it('after a restart, the old directory of a renamed producer and of one switched to memory mode is still reported', async function () {
+            producerNode.TIMEOUTS.orphanScan = 30;
+            const base = path.join(userDir, 'kafkajs-nc-queue');
+            writeSegment(path.join(base, 'p1'), [record('left by p1 before its Queue name was set')]);
+            writeSegment(path.join(base, 'p2'), [record('left by p2 before it was switched to memory')]);
+            const node = await load({ queueName: 'renamed' }, {
+                extraNodes: [producerConfig({ id: 'p2', queueMode: 'memory', wires: [[]] })]
+            });
+            await waitFor(() => logged(node, 'warn', /Found 2 offline queue/).length === 1, { message: 'orphan warning' });
+            const warning = logged(node, 'warn', /Found 2 offline queue/)[0];
+            assert.match(warning, /: p1 \(\d+ B\), p2 \(\d+ B\)/);
+        });
+    });
+
     describe('more review fixes', function () {
         it('a queued record for a topic the node no longer uses is dead-lettered instead of blocking the queue (STUCK-1)', async function () {
+            producerNode.TIMEOUTS.topicRetryMin = 5; // the node waits a moment for auto-creation each time
+            producerNode.TIMEOUTS.topicRetryMax = 20;
             fake.behaviour.sendError = (args) => (args.topic === 'ordrs' ? fake.errors.unknownTopic() : null);
             const node = await load({ topic: 'ordrs' }); // typo, topic auto-creation off on the cluster
             await connected(node);
@@ -2046,6 +2428,30 @@ describe('kafka producer editor (kafka-producer.html)', function () {
         for (const [field, v] of [['topic', ' ${TOPIC}'], ['topic', 'orders-${REGION}'], ['partition', '${PARTITION} '],
             ['batchSize', ' ${BATCH}'], ['queueMaxMB', '${MB}0']]) {
             assert.match(String(reason(field, v)), /only replaced when it is the whole value/, `${field} ${JSON.stringify(v)}`);
+        }
+    });
+
+    it('Queue directory and Queue name reject what the runtime rejects: an embedded ${VAR}, "~user"', function () {
+        const d = loadDefinition().defaults;
+        const check = (field, v, node = { queueMode: 'disk' }) => d[field].validate.call(node, v, {});
+        for (const field of ['queueDir', 'queueName']) {
+            for (const v of ['', '/data/queues', 'queues', '${QUEUE_DIR}', '$(QUEUE_DIR)', 'C:\\queues']) {
+                assert.equal(check(field, v), true, `${field} ${JSON.stringify(v)}`);
+            }
+            for (const v of ['${HOME}/queues', ' ${QUEUE_DIR}', 'q-${SITE}', '${QUEUE_DIR} ']) {
+                const reason = check(field, v);
+                assert.match(String(reason), /only replaced when it is the whole value/, `${field} ${JSON.stringify(v)}`);
+                // the runtime reports the same values (queueDirFor → pathProblem)
+                const cfg = internals.parseConfig({ queueDir: field === 'queueDir' ? v : '', queueName: field === 'queueName' ? v : '' });
+                const runtime = internals.queueDirFor(cfg, { settings: {} }, 'p1');
+                assert.equal(runtime.dir, null, `runtime ${field} ${JSON.stringify(v)}`);
+            }
+            assert.match(String(check(field, '~pi/queues')), /not expanded/);
+            assert.equal(d[field].validate.call({ queueMode: 'disk' }, '${HOME}/q'), false, 'boolean on older Node-RED');
+            // only the disk queue uses them
+            assert.equal(check(field, '${HOME}/queues', { queueMode: 'memory' }), true);
+            assert.equal(check(field, '${HOME}/queues', { queueMode: 'off' }), true);
+            assert.match(String(check(field, '${HOME}/queues', {})), /whole value/, 'blank mode means disk');
         }
     });
 

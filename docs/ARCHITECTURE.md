@@ -296,24 +296,46 @@ Details that matter when changing this code:
   nothing for that partition and `send()` resolves as if everything had been written. `sendWithRetry()` therefore
   resends the **whole** batch itself, up to `LIMITS.sendRetries` (3) times with a short backoff (about 0.2, 0.6 and
   1.6 s), when `sendRetriable()` holds: a `transient` Kafka protocol error (leader moved, not enough replicas, ...) or
-  a request timeout. It stops early when the node closes or the connection generation changes. Anything still failing
-  takes the normal failure path (queue and reconnect). A whole-batch resend can only cause duplicates, never a silent
-  loss. This is also why there is no idempotent mode: kafkajs requires retries ≥ 1 for it. A flow that still has the
-  old `idempotent` property loads normally and gets one warning.
+  a request timeout. A second budget (`sendRetryReason()` 'topic', up to `LIMITS.topicRetries` (6) times after
+  0.05 s growing to 0.8 s, about 2.5 s in all) covers a topic that is being created: with automatic topic creation
+  the broker answers `UNKNOWN_TOPIC_OR_PARTITION` for a moment and kafkajs refreshes its metadata meanwhile, and
+  `KafkaJSMetadataNotLoaded` / `KafkaJSTopicMetadataNotLoaded` (thrown before anything is sent) are retried whatever
+  the setting. Without *allow automatic topic creation*, `UNKNOWN_TOPIC_OR_PARTITION` is final for the request. A topic
+  that exhausted the 'topic' budget is remembered for `TIMEOUTS.topicNotCreated` (1 min): the cluster does not create
+  topics, so its next messages do not wait again. All pauses of one batch together stay below
+  `TIMEOUTS.sendRetryTotal` (5 s); retries are logged at debug level only. It stops early when the node closes or the
+  connection generation changes. Anything still failing takes the normal failure path (queue and reconnect, or
+  `done(err)` for a message error). A whole-batch resend can only cause duplicates, never a silent loss. This is also
+  why there is no idempotent mode: kafkajs requires retries ≥ 1 for it. A flow that still has the old `idempotent`
+  property loads normally and gets one warning.
 - **Delivery reports.** `locateMessages()` turns kafkajs' `RecordMetadata[]` into partition/offset per message, but
   only when the answer is exact. `missingPartitions()` detects messages for partitions that do not exist, which
   kafkajs silently skips (see [pitfalls](#kafkajs-pitfalls-we-work-around)). kafkajs caches a topic's partitions
-  for `metadataMaxAge` (5 min), so a missing partition is only final on a connection younger than
-  `TIMEOUTS.freshMetadata` (10 s). On an older connection (`metadataMayBeStale()`) the skipped messages are kept
-  (live: in front of the pending list; flush: the records from the skipped one on stay queued) and the node
-  reconnects to fetch fresh metadata.
+  for `metadataMaxAge` (5 min), so a missing partition is only final (`partitionMissing()`) when the metadata is known
+  to be fresh: the connection is younger than `TIMEOUTS.freshMetadata` (10 s), or it was made by the refresh requested
+  for exactly these partitions (`refreshRequest`, used once, so a slow reconnect cannot loop). A partition confirmed
+  missing is remembered per topic *and partition* for `TIMEOUTS.missingPartition` (1 min); a refresh itself confirms
+  nothing, because it may well find the partition. Otherwise the skipped messages are kept (live: in front of the pending list; a
+  batch that was copied to the queue by `switchToBacklog()`: the whole batch stays at the head of the queue; flush:
+  the records from the skipped one on stay queued) and `refreshMetadata()` reconnects at once to fetch fresh metadata.
+  That is not a failure: no backoff, no error log, no "Connected after N attempts". While it runs, newer messages wait
+  in memory behind the kept ones when nothing is queued (`dispatch()`), so that a close meanwhile stores them in order;
+  if the reconnect fails, the kept messages go to the queue first (`refreshFailed()`). So a flow that keeps using a
+  wrong partition causes at most one refresh per partition per minute, and an earlier check of one partition never
+  makes the node refuse a different partition that was added since.
+- **Memory before queue.** Whenever a message has to go to the queue while older ones are still in memory (pending or
+  in flight) and nothing is queued yet, `dispatch()` first moves those to the queue with `switchToBacklog()`. The
+  close handler appends what is left in memory to the queue, which is only in order if nothing newer is queued.
 - **Queue directory hand-over.** `lib/queue-registry.js` allows one holder per directory. On close the producer marks
   its claim as closing and releases it only after `DiskQueue.close()` has finished (`closeThenRelease()`), so a
   redeployed instance (`whenReleased()`) can never append to a directory the old one is still writing.
 - **Messages left behind.** A module-level map remembers, per node id, a queue that still held messages when the node
   closed; if the next instance uses another directory (Directory or Queue name changed), it warns where they are.
   After a disk queue opens, one cheap scan (`readdir` and `stat` only, at most 1000 directories, once per directory
-  and process) warns about sibling queue directories with messages that no running producer uses.
+  and process) warns about sibling queue directories with messages that no producer in the deployed flows uses.
+  Producers that do not run (disabled node or flow) still count (`configuredQueueNames()` reads every node
+  configuration with `RED.nodes.eachNode`). The warning does not advise deleting a directory without saying that it
+  may belong to a flow imported later or to another Node-RED instance.
 - **Close.** Unsent messages (in flight after 5 s, pending, early) are stored in the disk queue with
   `Stored N unsent message(s) in the offline queue while closing` (or a warning that counts the ones that could not
   be stored or are still being written); with the memory queue or no queue they fail with `done(err)` and a warning.
