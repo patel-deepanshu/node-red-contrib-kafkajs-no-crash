@@ -36,8 +36,12 @@ subflows a new id on every start, which would change their default queue directo
   errors that clear up by themselves (a leader moving, not enough replicas, a request timeout) are retried by the
   node, which resends the whole request up to 3 times (about 0.2, 0.6 and 1.6 s apart) before queueing the messages:
   at worst a duplicate. There is therefore no idempotent mode (kafkajs requires its retry for it); a flow that sets
-  `idempotent` loads normally and logs one warning. A message for a partition added after the connection fetched the
-  topic's metadata is sent again after a reconnect instead of failing as "does not exist".
+  `idempotent` loads normally and logs one warning. The first messages to a topic that the broker creates
+  automatically are sent (the node waits up to about 2.5 s for the new topic, logged at debug level only). A message
+  for a partition added after the connection fetched the topic's metadata is sent again after a quick reconnect
+  instead of failing as "does not exist"; a partition confirmed missing is remembered for a minute, so a flow that
+  keeps using a partition that does not exist gets `done(err)` at once instead of reconnects and log lines, while
+  other partitions of the topic (for example ones added meanwhile) are not affected.
 - **Offline queue** (store-and-forward) in the producer: on disk (default), in memory, or off. Messages are stored
   while Kafka is unreachable or slow and sent in their original order after the reconnect (at-least-once). Size and
   message limits, *drop the oldest* or *reject new messages* when full, expiry, a dead-letter file (its rotation logs
@@ -45,7 +49,9 @@ subflows a new id on every start, which would change their default queue directo
   write with group commit, crash recovery, and the `kafkajsNcProducerQueueDir` setting for the default location. A
   redeployed producer waits until the previous instance has really closed the queue and never writes the directory at
   the same time. Warnings name queued messages left behind by a changed *Directory* or *Queue name* and queue
-  directories with messages that no running producer uses. See [docs/OFFLINE-QUEUE.md](docs/OFFLINE-QUEUE.md).
+  directories with messages that no producer in the deployed flows uses (disabled producers count as using theirs;
+  the old directory of a renamed producer, or of one switched to the memory or off mode, is still reported).
+  See [docs/OFFLINE-QUEUE.md](docs/OFFLINE-QUEUE.md).
 - **Consumer** (`kafkajs-nc-consumer`): output as a UTF-8 string, a Buffer or parsed JSON (keys and header values as
   strings or Buffers); `msg.key`, `msg.headers`, `msg.offset`, `msg.timestamp` and `msg.kafka` (with the high
   watermark); a list of topics or a regular expression; a group ID that stays the same across deploys; read from the

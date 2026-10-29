@@ -547,10 +547,24 @@ describe('kafkajs-nc-broker config node', function () {
             const valid = editorDefinition().def.defaults.brokers.validate;
             assert.equal(valid('kafka1:9092;kafka2:9092', {}), true);
             assert.equal(valid('${KAFKA_BROKERS}', {}), true);
-            assert.match(String(valid(' ${KAFKA_BROKERS}', {})), /invalid broker address/, 'not replaced by Node-RED');
+            assert.match(String(valid(' ${KAFKA_BROKERS}', {})), /^\$\{KAFKA_BROKERS\} is only replaced by Node-RED when it is the whole value/,
+                'not replaced by Node-RED');
             const credentials = valid('SASL_SSL://user:secret@b1:9093', {});
             assert.equal(credentials, 'credentials do not belong in the broker address: set them on the Security tab');
             assert.match(String(valid('b1:9092:9093', {})), /invalid broker address b1:9092:9093/);
+        });
+
+        it('an embedded ${VAR} gets the runtime\'s explanation, not an address or IPv6 hint', function () {
+            const valid = editorDefinition().def.defaults.brokers.validate;
+            const runtime = require('../../lib/client-config').parseBrokers;
+            for (const v of [' ${KB}', 'kafka1:9092,${KB}', '${HOST}:9092', '${KB} ']) {
+                const editor = String(valid(v, {}));
+                assert.doesNotMatch(editor, /IPv6|invalid broker address/, JSON.stringify(v));
+                const [problem] = runtime(v).errors;
+                assert.ok(editor.startsWith(problem), `${JSON.stringify(v)}: editor "${editor}" vs runtime "${problem}"`);
+            }
+            assert.equal(valid(' ${KB}'), false, 'boolean on older Node-RED');
+            assert.equal(valid('${KB}', {}), true);
         });
 
         it('says that the safety net covers promise rejections only (DOC-3)', function () {

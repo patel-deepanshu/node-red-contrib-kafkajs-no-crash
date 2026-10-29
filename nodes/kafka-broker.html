@@ -226,6 +226,12 @@
         if (ENV_REF.test(s)) {
             return true;
         }
+        // as the runtime (lib/util.js envProblem): Node-RED never replaces a reference inside a longer value
+        var embedded = /\$\{([^}]*)\}/.exec(s);
+        if (embedded) {
+            return opt ? '${' + (embedded[1] || '?') + '} is only replaced by Node-RED when it is the whole value ' +
+                '(no spaces or other text around it)' : false;
+        }
         var bad = [];
         var credentials = false;
         s.split(/[\s,;]+/).forEach(function (token) {

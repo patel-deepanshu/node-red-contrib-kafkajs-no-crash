@@ -18,7 +18,7 @@ const consumerNode = require('../../nodes/kafka-consumer.js');
 const { waitFor, nextStatus } = require('../helpers/common');
 const {
     E2E, helper, uniqueName, requireKafka, createTopic, readAll, storedCodecs, useNodeRed, brokerConfig, outcomeNodes,
-    collect, outcome, expectOk
+    collect, outcome, expectOk, calls, withAdmin
 } = require('./e2e-helpers');
 
 /** Input messages with every payload type, and what Kafka must contain for each. */
@@ -156,6 +156,41 @@ describe('e2e: producer node → Kafka → consumer node', function () {
         assert.equal(good.kafka.partition, 1);
         const stored = await readAll(topic);
         assert.deepEqual(stored.map((r) => `${r.partition}:${r.value}`), ['1:kept']);
+    });
+
+    it('a topic that does not exist yet is created on first use: the first messages are sent, no error or warning (R1)', async function () {
+        // the broker auto-creates topics (Kafka's default, auto.create.topics.enable=true); while it does,
+        // it answers UNKNOWN_TOPIC_OR_PARTITION for a moment, which the producer waits out
+        const configured = uniqueName('rt-auto-configured');
+        const fromMsg = uniqueName('rt-auto-msg');
+        const existing = await withAdmin((admin) => admin.listTopics());
+        assert.ok(!existing.includes(configured) && !existing.includes(fromMsg), 'fresh topic names');
+        await helper.load([brokerNode, producerNode], [
+            brokerConfig(),
+            { id: 'p1', type: 'kafkajs-nc-producer', name: 'configured', broker: 'b1', topic: configured, wires: [[]] },
+            { id: 'p2', type: 'kafkajs-nc-producer', name: 'msg.topic', broker: 'b1', topic: '', queueMode: 'off', wires: [[]] },
+            ...outcomeNodes(['p1', 'p2'])
+        ]);
+        const p1 = helper.getNode('p1');
+        const p2 = helper.getNode('p2');
+        await nextStatus(p1, (s) => s.fill === 'green', 30000);
+        await nextStatus(p2, (s) => s.fill === 'green', 30000);
+        // several messages at once: the first request waits for the topic, the rest follow in order
+        const results = await Promise.all([
+            outcome('p1', { payload: 'c1' }), outcome('p1', { payload: 'c2' }),
+            outcome('p2', { payload: 'm1', topic: fromMsg }), outcome('p2', { payload: 'm2', topic: fromMsg })
+        ]);
+        for (const r of results) {
+            assert.ok(r.ok, `failed: ${r.error && r.error.error && r.error.error.message}`);
+            assert.equal(r.ok.kafka.status, 'sent', 'sent, not queued');
+        }
+        assert.deepEqual(results.map((r) => r.ok.kafka.offset), ['0', '1', '0', '1']);
+        for (const node of [p1, p2]) {
+            assert.deepEqual(calls(node, 'error'), [], `${node.name}: no error`);
+            assert.deepEqual(calls(node, 'warn'), [], `${node.name}: no warning`);
+        }
+        assert.deepEqual((await readAll(configured)).map((r) => r.value.toString()), ['c1', 'c2']);
+        assert.deepEqual((await readAll(fromMsg)).map((r) => r.value.toString()), ['m1', 'm2']);
     });
 
     it('JSON consumer output and tombstones', async function () {

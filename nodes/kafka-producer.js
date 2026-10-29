@@ -31,6 +31,9 @@
  * partitions whose leader moved to a broker that had already answered, and
  * nothing reports it (LOSS-1). The node retries instead, always with the
  * WHOLE batch (sendWithRetry): at worst a duplicate, never a silent loss.
+ * This includes a topic that the broker is still creating (auto-creation:
+ * UNKNOWN_TOPIC_OR_PARTITION for a moment) and a topic kafkajs has no
+ * metadata for yet, with a shorter backoff (sendRetryReason).
  */
 
 const crypto = require('crypto');
@@ -85,11 +88,36 @@ const TIMEOUTS = {
     sendRetryMin: 200,
     sendRetryMax: 1600,
     /**
+     * pauses before sending a batch again while its topic is being created
+     * (automatic topic creation) or kafkajs has no metadata for it yet
+     * (LIMITS.topicRetries): about 0.05, 0.1, 0.2, 0.4, 0.8 and 0.8 s. A broker
+     * typically creates a topic within 0.1 to 1 s.
+     */
+    topicRetryMin: 50,
+    topicRetryMax: 800,
+    /** sendWithRetry waits at most this long in total (all pauses of one batch together) */
+    sendRetryTotal: 5000,
+    /**
      * kafkajs fetches a topic's metadata when a connection first uses the topic
      * and then keeps it for metadataMaxAge (5 min). On a connection younger than
      * this, a partition missing from the metadata really does not exist.
      */
     freshMetadata: 10000,
+    /**
+     * After fresh metadata showed that a topic lacks a particular partition, a
+     * message for that same partition fails at once for this long instead of
+     * reconnecting to fetch the metadata again. Other partitions of the topic
+     * are not affected, and a partition added meanwhile is used at the latest
+     * once this has passed.
+     */
+    missingPartition: 60000,
+    /**
+     * A topic that a send kept answering UNKNOWN_TOPIC_OR_PARTITION for although
+     * automatic topic creation is allowed (the cluster does not create topics)
+     * is not waited for again during this long: further messages for it fail
+     * (or are queued) at once instead of each waiting for the topic retries.
+     */
+    topicNotCreated: 60000,
     /** after the queue opened: look for queue directories no running producer uses (LOSS-4) */
     orphanScan: 10000
 };
@@ -99,11 +127,16 @@ const TIMEOUTS = {
  * maxPending: most messages kept in memory (live pending list, messages
  * waiting for the queue to open); beyond it messages go to the offline queue.
  * sendRetries: extra attempts of a produce request after a retriable error.
+ * topicRetries: extra attempts while the topic is being created or kafkajs has
+ * no metadata for it yet (counted separately from sendRetries).
  */
 const LIMITS = {
     maxPending: 10000,
-    sendRetries: 3
+    sendRetries: 3,
+    topicRetries: 6
 };
+/** Entries kept by partitionMissing() (topic + partition) and sendWithRetry() (topic), per map; oldest forgotten first. */
+const TOPIC_MEMORY_MAX = 1000;
 /** A queued batch that keeps failing with an UNKNOWN error is treated as poison after this many attempts. */
 const UNKNOWN_LIMIT = 5;
 /** Version of the queue record format ({v, t, tf, ts, m}). */
@@ -566,15 +599,6 @@ function missingPartitions(messages, results, topic) {
 }
 
 /**
- * The error used to reconnect when kafkajs skipped explicit partitions that
- * may only be missing from stale metadata (partitions added to the topic).
- */
-function staleMetadataError(topic, partitions) {
-    return new Error(`Partition ${partitions.join(', ')} of topic ${topic} is not in the producer's metadata ` +
-        '(partitions added recently?): reconnecting to refresh it');
-}
-
-/**
  * Whether a failed produce request is worth sending again at once: a Kafka
  * error that usually clears within a second or two (leader moved or being
  * elected, not enough in-sync replicas yet, broker-side timeout, ...) or a
@@ -584,6 +608,29 @@ function staleMetadataError(topic, partitions) {
 function sendRetriable(err) {
     const c = classifyError(err, { op: 'send' });
     return c.kind === ErrorKind.TRANSIENT && (c.type !== undefined || c.reason === 'KafkaJSRequestTimeoutError');
+}
+
+/**
+ * Why a failed produce request is sent again at once (sendWithRetry), or null:
+ *  - 'topic': the topic is being created, or kafkajs has no metadata for it
+ *    yet. With automatic topic creation the broker answers
+ *    UNKNOWN_TOPIC_OR_PARTITION until the new topic is ready (about 0.1 to 1 s);
+ *    kafkajs then refreshes its metadata, so the next attempt usually works.
+ *    Without automatic topic creation that error is final for this request
+ *    (msg.topic: the message fails; configured topic: queue and reconnect).
+ *    KafkaJSMetadataNotLoaded / KafkaJSTopicMetadataNotLoaded are thrown before
+ *    anything is sent, so they are always retried.
+ *  - 'transient': sendRetriable().
+ *
+ * @param {*} err
+ * @param {boolean} autoCreate the node's "allow automatic topic creation" setting
+ * @returns {('topic'|'transient'|null)}
+ */
+function sendRetryReason(err, autoCreate) {
+    const c = classifyError(err, { op: 'send' });
+    if (c.reason === 'KafkaJSMetadataNotLoaded' || c.reason === 'KafkaJSTopicMetadataNotLoaded') return 'topic';
+    if (c.type === 'UNKNOWN_TOPIC_OR_PARTITION') return autoCreate ? 'topic' : null;
+    return sendRetriable(err) ? 'transient' : null;
 }
 
 function sleep(ms) {
@@ -620,12 +667,55 @@ function fmtBytes(n) {
 }
 
 /**
+ * The queue directory name each producer in the deployed flows would open
+ * (Queue name, else the node id; the same choice as queueDirFor), also for
+ * producers that do not run: a disabled node or flow keeps its configuration,
+ * and its queue is sent once it is enabled again. Only producers with a disk
+ * queue count: the old directory of a producer that was renamed or switched
+ * to the memory/off mode must still be reported as left behind.
+ * Never throws (an empty set when Node-RED cannot list its nodes).
+ */
+function configuredQueueNames(RED) {
+    const names = new Set();
+    try {
+        RED.nodes.eachNode((n) => {
+            try {
+                if (!n || n.type !== 'kafkajs-nc-producer') return;
+                const mode = text(n.queueMode).trim().toLowerCase();
+                // blank or unknown modes fall back to disk (parseConfig)
+                if (mode !== '' && QUEUE_MODES.has(mode) && mode !== 'disk') return;
+                let name = text(n.queueName).trim();
+                // a whole ${VAR} is only replaced in running nodes: look it up the same way
+                const ref = /^\$\{(\S+)\}$/.exec(name);
+                if (ref) {
+                    name = typeof process.env[ref[1]] === 'string' ? process.env[ref[1]].trim() : '';
+                    // not resolvable here (e.g. a flow or group variable): the warning's caveat covers it
+                    if (name === '') return;
+                }
+                if (name !== '' && envProblem(name)) return; // such a producer opens no queue at all
+                if (name === '') name = typeof n.id === 'string' ? n.id : '';
+                if (name !== '') names.add(sanitizeName(name));
+            } catch (_) {
+                // one odd node configuration must not stop the scan
+            }
+        });
+    } catch (_) {
+        // the exclusion is best effort
+    }
+    return names;
+}
+
+/**
  * Sub-directories of `base` that hold queue segment files (unsent messages)
  * but are not used by any running producer: [{ name, dir, bytes }]. Cheap
  * (readdir and stat only, at most ORPHAN_SCAN_MAX directories). Directories
- * already reported are skipped. Never rejects.
+ * already reported, and those named like the queue of a producer in the
+ * flows (`known`, e.g. one in a disabled flow) are skipped. Never rejects.
+ *
+ * @param {string} base
+ * @param {Set<string>} [known] directory names to leave out
  */
-async function findOrphanQueues(base) {
+async function findOrphanQueues(base, known) {
     const out = [];
     try {
         const entries = await fsp.readdir(base, { withFileTypes: true });
@@ -633,6 +723,7 @@ async function findOrphanQueues(base) {
             if (!entry.isDirectory()) continue;
             const dir = path.join(base, entry.name);
             if (queueRegistry.isOwned(dir) || reportedOrphans.has(dir)) continue;
+            if (known && known.has(entry.name)) continue;
             let bytes = 0;
             try {
                 for (const file of await fsp.readdir(dir)) {
@@ -680,6 +771,17 @@ class ProducerRuntime {
         this.producer = null;
         /** when the current connection was established (ms), see metadataMayBeStale() */
         this.connectedAt = 0;
+        /**
+         * 'topic\u0000partition' → when fresh metadata last showed that this
+         * partition of the topic does not exist (see partitionMissing)
+         */
+        this.partitionChecks = new Map();
+        /** the metadata refresh last requested: { topic, partitions: Set, at } (see partitionMissing) */
+        this.refreshRequest = null;
+        /** a reconnect that only fetches fresh metadata is running (refreshMetadata) */
+        this.refreshing = false;
+        /** topic → when waiting for its automatic creation last gave up (see TIMEOUTS.topicNotCreated) */
+        this.topicsNotCreated = new Map();
         this.retryTimer = null;
         this.flushRetryTimer = null;
 
@@ -1009,7 +1111,10 @@ class ProducerRuntime {
      * LOSS-4: after a while (every producer of this deploy has opened its
      * queue by then), warn once about queue directories next to ours that
      * hold messages but are used by no running producer: a queue that was
-     * renamed or moved, a deleted node, a producer in a disabled flow.
+     * renamed or moved, a deleted node. Queues of producers that are in the
+     * flows but do not run (disabled node or flow) are not reported; they are
+     * sent when that producer runs again. The warning never advises deleting
+     * a directory without saying what else may own it.
      */
     scheduleOrphanScan() {
         const base = path.dirname(this.queue.dir);
@@ -1017,16 +1122,19 @@ class ProducerRuntime {
         orphanScans.add(base);
         const timer = setTimeout(() => {
             if (this.orphanScan) this.orphanScan.timer = null;
-            findOrphanQueues(base).then((list) => {
+            findOrphanQueues(base, configuredQueueNames(this.RED)).then((list) => {
                 orphanScans.delete(base);
                 this.orphanScan = null;
                 if (this.closing || list.length === 0) return;
                 for (const o of list) reportedOrphans.add(o.dir);
                 const names = list.slice(0, 10).map((o) => `${o.name} (${fmtBytes(o.bytes)})`).join(', ') +
                     (list.length > 10 ? ` and ${list.length - 10} more` : '');
-                this.warn(`Found ${list.length} offline queue(s) under ${base} with unsent messages that no running ` +
-                    `producer uses: ${names}. If you renamed a producer's queue or changed its Queue directory, set ` +
-                    'the old value again to send them; otherwise delete the directory.');
+                this.warn(`Found ${list.length} offline queue(s) under ${base} with unsent messages that no producer ` +
+                    `in the deployed flows uses: ${names}. If you renamed a producer's queue or changed its Queue ` +
+                    'directory, set the old value again to send them. A queue may also belong to a producer that is ' +
+                    'not deployed right now (a flow you will import again, a disabled flow whose Queue name comes ' +
+                    'from an environment variable) or to another Node-RED instance using the same directory. Only ' +
+                    'delete a directory when you are sure no producer will send its messages: they are lost then.');
             }).catch((err) => this.bug('orphan scan', err));
         }, TIMEOUTS.orphanScan);
         if (timer && typeof timer.unref === 'function') timer.unref();
@@ -1111,6 +1219,14 @@ class ProducerRuntime {
                 'offline queue is off — message not sent'));
             return;
         }
+        if (this.refreshing && this.pending.length > 0 && this.pending.length < LIMITS.maxPending &&
+            (this.queueState !== 'open' || this.queue.size === 0)) {
+            // The node reconnects only to fetch fresh metadata (refreshMetadata) and
+            // older messages wait in memory for it: wait behind them, so that nothing
+            // overtakes them, also not when the node closes meanwhile.
+            for (const chunk of item.chunks) this.pending.push(chunk);
+            return;
+        }
         if (this.queueState === 'pending') {
             if (this.early.length < LIMITS.maxPending) {
                 this.early.push(item);
@@ -1122,6 +1238,10 @@ class ProducerRuntime {
             return;
         }
         if (this.queueState === 'open') {
+            // Older messages still in memory (or in flight) must stay in front of this
+            // one: with nothing queued yet, store them first (switchToBacklog keeps the
+            // order). Otherwise close would append them after it.
+            if (this.queue.size === 0 && (this.pending.length > 0 || this.inFlight)) this.switchToBacklog();
             this.enqueueItem(item);
             return;
         }
@@ -1394,6 +1514,7 @@ class ProducerRuntime {
         }
         this.state = 'connected';
         this.connectedAt = Date.now();
+        this.refreshing = false;
         if (this.failures > 0 && this.lastFailContext === 'connection') {
             this.log(`Connected to Kafka after ${this.failures + 1} attempts`);
         }
@@ -1450,7 +1571,27 @@ class ProducerRuntime {
         // TRANSIENT, an unauthorised one AUTH (topicKind()), MESSAGE ⇒ UNKNOWN
         const kind = forcedKind || connectionKind(err, 'connect');
         this.state = 'waiting';
+        if (this.refreshing) this.refreshFailed(err);
         this.scheduleReconnect(err, kind, 'connection');
+    }
+
+    /**
+     * The reconnect of a metadata refresh failed (Kafka became unreachable
+     * meanwhile): the messages waiting in memory for it are handled like those
+     * of a failed live request. With nothing queued yet they go to the offline
+     * queue now, in order (durable while the outage lasts); with the queue off
+     * they fail. Messages behind newer queued ones (rare, see liveFailed) stay
+     * in memory and are sent first after the reconnect.
+     */
+    refreshFailed(err) {
+        this.refreshing = false;
+        if (this.queueState === 'open') {
+            this.mode = 'backlog';
+            if (this.queue.size === 0 && this.pending.length > 0) this.switchToBacklog();
+            return;
+        }
+        const chunks = this.pending.splice(0);
+        for (const item of itemsOf(chunks)) this.settleFailed(item, err);
     }
 
     /**
@@ -1508,9 +1649,13 @@ class ProducerRuntime {
             const what = (context === 'send'
                 ? 'Kafka send failed'
                 : (context === 'flush' ? 'Sending queued messages to Kafka failed' : 'Kafka connection failed')) + about;
-            const kept = this.queueState === 'open' && context !== 'connection'
-                ? ' (the messages are kept in the offline queue)'
-                : '';
+            let kept = '';
+            if (this.queueState === 'open' && context !== 'connection') {
+                // rare: older messages behind newer queued ones stay in memory (liveFailed)
+                kept = this.pending.length > 0
+                    ? ' (the messages are kept and sent first after the reconnect)'
+                    : ' (the messages are kept in the offline queue)';
+            }
             const line = `${what}: ${describeError(err)} — retrying in ${fmtDelay(delay)}${kept}`;
             if (this.failures === 1 || key !== this.lastFailKey) {
                 this.error(line);
@@ -1552,28 +1697,74 @@ class ProducerRuntime {
 
     /**
      * producer.send() with the node's own retry (kafkajs' is off, see the file
-     * header): after an error that usually clears within a second or two
-     * (sendRetriable) the WHOLE batch is sent again, up to LIMITS.sendRetries
-     * times. Gives up early when the node closes or the connection was
-     * replaced. A remaining error is thrown for the normal failure handling
-     * (queue + reconnect).
+     * header): the WHOLE batch is sent again after an error that usually
+     * clears within a second or two (sendRetryReason 'transient': up to
+     * LIMITS.sendRetries times, about 0.2, 0.6, 1.6 s apart) or while the topic
+     * is being created / has no metadata yet ('topic': up to
+     * LIMITS.topicRetries times, 0.05 s growing to 0.8 s apart). The pauses
+     * together never exceed TIMEOUTS.sendRetryTotal. Retries are logged at
+     * debug level only. Gives up early when the node closes or the connection
+     * was replaced. A remaining error is thrown for the normal failure handling
+     * (queue + reconnect, or done(err) for a message error).
      *
      * @returns {Promise<object[]>} kafkajs RecordMetadata[]
      */
     async sendWithRetry(gen, producer, topic, messages) {
-        const backoff = new Backoff({ min: TIMEOUTS.sendRetryMin, max: TIMEOUTS.sendRetryMax, factor: 3 });
-        for (let attempt = 1; ; attempt++) {
+        const plans = {
+            transient: {
+                backoff: new Backoff({ min: TIMEOUTS.sendRetryMin, max: TIMEOUTS.sendRetryMax, factor: 3 }),
+                limit: LIMITS.sendRetries,
+                used: 0,
+                why: ''
+            },
+            topic: {
+                backoff: new Backoff({ min: TIMEOUTS.topicRetryMin, max: TIMEOUTS.topicRetryMax, factor: 2 }),
+                limit: LIMITS.topicRetries,
+                used: 0,
+                why: ' while the topic is being created or its metadata is loaded'
+            }
+        };
+        let waited = 0;
+        for (;;) {
+            let results;
             try {
-                return await producer.send(this.sendArgs(topic, messages));
+                results = await producer.send(this.sendArgs(topic, messages));
             } catch (err) {
-                if (attempt > LIMITS.sendRetries || this.stale(gen) || !sendRetriable(err)) throw err;
-                const delay = backoff.next();
-                this.debug(`Kafka send to topic ${topic} failed (${shortMessage(err, 60)}): sending its ` +
-                    `${messages.length} message(s) again in ${fmtDelay(delay)} (retry ${attempt} of ${LIMITS.sendRetries})`);
+                const reason = this.stale(gen) ? null : sendRetryReason(err, this.cfg.allowAutoTopicCreation);
+                const plan = reason ? plans[reason] : null;
+                const notCreated = reason === 'topic' && classifyError(err).type === 'UNKNOWN_TOPIC_OR_PARTITION';
+                if (notCreated && this.recentlyNotCreated(topic)) throw err;
+                const delay = plan && plan.used < plan.limit ? plan.backoff.next() : Infinity;
+                if (waited + delay > TIMEOUTS.sendRetryTotal) {
+                    // the cluster does not create it (auto.create.topics.enable=false): do
+                    // not keep every following message waiting for it as well
+                    if (notCreated) this.rememberTopic(this.topicsNotCreated, topic);
+                    throw err;
+                }
+                plan.used++;
+                waited += delay;
+                this.debug(`Kafka send to topic ${topic} failed (${shortMessage(err, 60)})${plan.why}: sending its ` +
+                    `${messages.length} message(s) again in ${fmtDelay(delay)} (retry ${plan.used} of ${plan.limit})`);
                 await sleep(delay);
                 if (this.stale(gen)) throw err;
+                continue;
             }
+            this.topicsNotCreated.delete(topic);
+            return results;
         }
+    }
+
+    /** Whether waiting for `topic` to be created gave up less than TIMEOUTS.topicNotCreated ago. */
+    recentlyNotCreated(topic) {
+        const at = this.topicsNotCreated.get(topic);
+        return at !== undefined && Date.now() - at < TIMEOUTS.topicNotCreated;
+    }
+
+    /** Remember `topic` (or another key) in `map` (key → time), at most TOPIC_MEMORY_MAX entries. */
+    rememberTopic(map, topic, at = Date.now()) {
+        map.delete(topic); // re-insert: Map order is oldest first
+        map.set(topic, at);
+        if (map.size > TOPIC_MEMORY_MAX) map.delete(map.keys().next().value);
     }
 
     /**
@@ -1582,6 +1773,65 @@ class ProducerRuntime {
      */
     metadataMayBeStale() {
         return Date.now() - this.connectedAt >= TIMEOUTS.freshMetadata;
+    }
+
+    /**
+     * kafkajs skipped messages of `topic` for explicit `partitions` that are not
+     * in its metadata. Are they really missing (the messages fail)?
+     *  - yes when each of these partitions was confirmed missing less than
+     *    TIMEOUTS.missingPartition ago;
+     *  - yes, and confirmed, when the metadata is known to be fresh: the
+     *    connection is younger than TIMEOUTS.freshMetadata, or it was made by
+     *    the refresh requested for exactly these partitions (refreshMetadata;
+     *    used once, so a slow reconnect cannot cause a refresh loop);
+     *  - otherwise the metadata may predate partitions added to the topic
+     *    (PART-1): no, refresh it first.
+     * So a flow that keeps sending to a partition that does not exist causes at
+     * most one refresh per partition per TIMEOUTS.missingPartition, and a
+     * partition that was really added is never refused because another
+     * partition of the topic was checked before.
+     */
+    partitionMissing(topic, partitions) {
+        const now = Date.now();
+        const key = (p) => `${topic}\u0000${p}`;
+        const confirmed = partitions.every((p) => {
+            const checked = this.partitionChecks.get(key(p));
+            return checked !== undefined && now - checked < TIMEOUTS.missingPartition;
+        });
+        if (confirmed) return true;
+        const req = this.refreshRequest;
+        const afterRefresh = req !== null && req.topic === topic && this.connectedAt >= req.at &&
+            partitions.every((p) => req.partitions.has(p));
+        if (!afterRefresh && this.metadataMayBeStale()) return false;
+        if (afterRefresh) this.refreshRequest = null;
+        for (const p of partitions) this.rememberTopic(this.partitionChecks, key(p), now);
+        return true;
+    }
+
+    /**
+     * kafkajs skipped messages for partitions that may only be missing from its
+     * cached metadata (partitions added recently, PART-1): reconnect at once,
+     * which fetches fresh metadata. This is not a failure: no backoff, no error
+     * or "Connected after N attempts" log line. The messages waiting for it stay
+     * where they are (in memory in front of the pending list, or at the head of
+     * the queue); while the new connection is made, newer messages wait in
+     * memory behind them (dispatch), so nothing overtakes them, also not when
+     * the node closes meanwhile.
+     */
+    refreshMetadata(topic, partitions) {
+        if (this.closing || this.state !== 'connected') return;
+        this.healthy(); // the request itself got through
+        // nothing is confirmed here: the new connection decides (partitionMissing),
+        // the refresh may well find the partition
+        this.refreshRequest = { topic, partitions: new Set(partitions), at: Date.now() };
+        this.debug(`Partition ${partitions.join(', ')} of topic ${topic} is not in the producer's metadata ` +
+            '(partitions added recently?): reconnecting to fetch the current list');
+        this.gen++;
+        const old = this.producer;
+        this.producer = null;
+        this.disconnectQuietly(old);
+        this.refreshing = true;
+        this.connect();
     }
 
     // ------------------------------------------------------------ live pipeline
@@ -1667,7 +1917,20 @@ class ProducerRuntime {
             if (flight.queued && await flight.queued.stored) {
                 // We switched to backlog mode meanwhile and this batch is at the
                 // head of the queue already.
-                if (!error) {
+                if (!error && this.needsRefresh(batch[0].topic, messages, results)) {
+                    // Some messages were skipped on metadata that may be stale: the
+                    // whole batch stays at the head of the queue and is sent again
+                    // after the refresh (the written ones twice: at-least-once).
+                    // Keeping them in memory instead would put them behind the newer
+                    // queued messages if the node closed meanwhile.
+                    for (const chunk of batch) {
+                        if (chunk.state === 'inflight') chunk.state = 'queued';
+                    }
+                    for (const item of itemsOf(batch)) this.checkItem(item);
+                    if (gen === this.gen) {
+                        this.refreshMetadata(batch[0].topic, missingPartitions(messages, results, batch[0].topic));
+                    }
+                } else if (!error) {
                     await this.ackSentHead(flight.queued.json);
                     this.liveSent(batch, messages, results, gen);
                 } else {
@@ -1704,12 +1967,22 @@ class ProducerRuntime {
     }
 
     /**
+     * Whether a successful request skipped messages for partitions that may
+     * only be missing from stale metadata (see partitionMissing).
+     */
+    needsRefresh(topic, messages, results) {
+        if (this.cfg.acks === 0) return false;
+        const missing = missingPartitions(messages, results, topic);
+        return missing.length > 0 && !this.partitionMissing(topic, missing);
+    }
+
+    /**
      * A produce request succeeded. kafkajs silently skips messages for an
-     * explicit partition that is not in its metadata: with fresh metadata the
-     * partition does not exist (the message fails); with metadata that may be
-     * stale (partitions added since, PART-1) only the skipped messages are
-     * kept, in front of everything else, and sent again after a reconnect
-     * (which fetches fresh metadata).
+     * explicit partition that is not in its metadata: when the partition is
+     * really missing (partitionMissing) the message fails; when the metadata
+     * may be stale (partitions added since, PART-1) only the skipped messages
+     * are kept, in front of everything else, and sent again after a reconnect
+     * that fetches fresh metadata (refreshMetadata).
      */
     liveSent(batch, messages, results, gen) {
         this.healthy();
@@ -1731,7 +2004,7 @@ class ProducerRuntime {
             if (this.cfg.acks === 0 || item.settled) continue;
             const missing = missingPartitions(chunk.entries.map((e) => e.message), list, chunk.topic);
             if (missing.length === 0) continue;
-            if (this.metadataMayBeStale()) {
+            if (!this.partitionMissing(chunk.topic, missing)) {
                 chunk.entries = chunk.entries.filter((e) => missing.includes(e.message.partition));
                 chunk.state = 'pending';
                 again.push(chunk);
@@ -1744,10 +2017,7 @@ class ProducerRuntime {
         for (const item of touched) this.checkItem(item);
         if (again.length > 0) {
             this.pending.unshift(...again);
-            const topic = again[0].topic;
-            if (gen === this.gen) {
-                this.markDisconnected(staleMetadataError(topic, [...skipped]), ErrorKind.TRANSIENT, 'send');
-            }
+            if (gen === this.gen) this.refreshMetadata(again[0].topic, [...skipped]);
         }
     }
 
@@ -1809,7 +2079,16 @@ class ProducerRuntime {
             .then(() => {
                 this.flushing = false;
                 this.flushPromise = null;
-                if (!this.closing && this.state === 'connected' && this.mode === 'live') this.kickWorker();
+                if (!this.closing && this.state === 'connected') {
+                    if (this.mode === 'live') {
+                        this.kickWorker();
+                    } else if (gen !== this.gen && !this.flushRetryTimer) {
+                        // A new connection (e.g. a metadata refresh) came up while this
+                        // flush was still finishing and could not start its own.
+                        if (this.pending.length > 0) this.kickWorker();
+                        else this.maybeStartFlusher();
+                    }
+                }
                 this.render();
             })
             .catch((err) => this.bug('flush', err));
@@ -1977,8 +2256,8 @@ class ProducerRuntime {
 
     /**
      * After a successful send: the records whose explicit partition kafkajs
-     * did not write (it skips partitions missing from its metadata). With
-     * fresh metadata the partition does not exist: they are marked dead. With
+     * did not write (it skips partitions missing from its metadata). When the
+     * partition is really missing (partitionMissing) they are marked dead. With
      * metadata that may be stale (PART-1) they are left alone (`stale`).
      *
      * @returns {{records: object[], stale: boolean}}
@@ -1987,7 +2266,7 @@ class ProducerRuntime {
         const missing = this.cfg.acks === 0 ? [] : missingPartitions(messages, results, valid[0].topic);
         const records = valid.filter((x) => x.message.partition !== undefined && missing.includes(x.message.partition));
         if (records.length === 0) return { records, stale: false };
-        if (this.metadataMayBeStale()) return { records, stale: true };
+        if (!this.partitionMissing(valid[0].topic, missing)) return { records, stale: true };
         for (const x of records) {
             x.dead = new MessageError(`Partition ${x.message.partition} does not exist for topic ${x.topic}`);
         }
@@ -1997,15 +2276,15 @@ class ProducerRuntime {
     /**
      * Records were skipped for partitions that may only be missing from stale
      * metadata: ack what comes before the first of them (records after it
-     * are sent again: at worst duplicates) and reconnect, which fetches fresh
-     * metadata. Returns -1 (flushing stops).
+     * are sent again: at worst duplicates) and fetch fresh metadata
+     * (refreshMetadata). Returns -1 (flushing stops).
      */
     async stopForMetadata(queue, items, records) {
         const done = items.slice(0, items.indexOf(records[0]));
         await this.deadLetterAll(queue, done.filter((x) => x.dead));
         if (done.length > 0) await queue.ack(done.map((x) => x.entry));
         const partitions = [...new Set(records.map((x) => x.message.partition))];
-        this.markDisconnected(staleMetadataError(records[0].topic, partitions), ErrorKind.TRANSIENT, 'flush');
+        this.refreshMetadata(records[0].topic, partitions);
         return -1;
     }
 
@@ -2029,7 +2308,7 @@ class ProducerRuntime {
                 const results = await this.sendWithRetry(gen, producer, x.topic, [x.message]);
                 const missing = this.checkPartitions([x], [x.message], results);
                 if (missing.stale) {
-                    stop = { err: staleMetadataError(x.topic, [x.message.partition]), kind: ErrorKind.TRANSIENT };
+                    stop = { refresh: [x.message.partition], topic: x.topic };
                     break;
                 }
                 if (x.dead) await this.deadLetterAll(queue, [x]);
@@ -2049,6 +2328,10 @@ class ProducerRuntime {
         }
         if (handled > 0) await queue.ack(items.slice(0, handled).map((x) => x.entry));
         if (sent > 0) this.healthy();
+        if (stop && stop.refresh) {
+            this.refreshMetadata(stop.topic, stop.refresh);
+            return -1;
+        }
         if (stop) {
             this.markDisconnected(stop.err, stop.kind, 'flush', stop.topic);
             return -1;
@@ -2417,6 +2700,8 @@ module.exports._internals = {
     topicProblem,
     fmtDelay,
     sendRetriable,
+    sendRetryReason,
+    configuredQueueNames,
     ProducerRuntime,
     UNKNOWN_LIMIT
 };

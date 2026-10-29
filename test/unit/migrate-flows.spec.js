@@ -119,11 +119,19 @@ const byId = (flows, id) => flows.find((n) => n.id === id);
 const notesFor = (report, id, level) => report.notes.filter((n) => n.id === id && (!level || n.level === level));
 const noteText = (report, id, level) => notesFor(report, id, level).map((n) => n.text).join('\n');
 
+/**
+ * tls-config properties added after Node-RED 4 (Node-RED 5: client certificates from env variables or a PKCS#12
+ * file). Their runtime treats a missing value as the default, so the converted flows leave them out and stay
+ * loadable by every supported Node-RED version.
+ */
+const NEWER_TLS_CONFIG_KEYS = new Set(['certType', 'caEnv', 'certEnv', 'keyEnv', 'p12', 'p12name']);
+
 /** The node has exactly the editor's properties (plus standard ones), all accepted by the editor validators. */
 function assertEditorShape(node) {
     const def = DEFS[node.type];
     assert.ok(def, `no editor definition for ${node.type}`);
     for (const [key, d] of Object.entries(def.defaults)) {
+        if (node.type === 'tls-config' && NEWER_TLS_CONFIG_KEYS.has(key) && !(key in node)) continue;
         assert.ok(Object.prototype.hasOwnProperty.call(node, key), `${node.type} ${node.id}: missing ${key}`);
         if (typeof d.validate === 'function') {
             const verdict = d.validate.call(node, node[key], { label: key });
@@ -147,7 +155,16 @@ describe('scripts/migrate-flows.js', function () {
         });
 
         it("has the editor defaults of Node-RED's core tls-config node", function () {
-            assert.deepEqual({ ...migrate.TLS_CONFIG_DEFAULTS }, defaultsOf('tls-config'));
+            // The script writes the tls-config properties every supported Node-RED version knows (3.1 - 5.x).
+            // Newer versions add optional properties that their runtime defaults when they are missing (Node-RED 5:
+            // certType = "files", the env and p12 variants), exactly as for flows exported from older versions.
+            const installed = defaultsOf('tls-config');
+            for (const [key, value] of Object.entries(migrate.TLS_CONFIG_DEFAULTS)) {
+                assert.deepEqual(value, installed[key], `tls-config default ${key}`);
+            }
+            const extra = Object.keys(installed).filter((k) => !(k in migrate.TLS_CONFIG_DEFAULTS));
+            assert.deepEqual(extra.filter((k) => !NEWER_TLS_CONFIG_KEYS.has(k)), [],
+                'a new tls-config property: check that older flows still work without it, then add it to NEWER_TLS_CONFIG_KEYS');
         });
 
         it('clamps to the ranges the runtime uses', function () {
