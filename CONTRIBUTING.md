@@ -35,8 +35,8 @@ newer (`node-red.version` in `package.json`): 3.0 gives nodes inside subflows a 
 default queue directory and consumer group depend on.
 
 ```sh
-git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
-cd node-red-kafkajs-no-crash
+git clone https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git
+cd node-red-contrib-kafkajs-no-crash
 npm install
 npm test
 ```
@@ -45,7 +45,7 @@ To try your working copy in a real Node-RED, install it into your Node-RED user 
 
 ```sh
 cd ~/.node-red
-npm install /path/to/node-red-kafkajs-no-crash
+npm install /path/to/node-red-contrib-kafkajs-no-crash
 ```
 
 After changing a `.js` file, restart Node-RED; after changing a `.html` file, restart Node-RED and reload the editor.
@@ -260,7 +260,7 @@ For maintainers: [docs/RELEASING.md](docs/RELEASING.md) has the complete steps. 
 ## Reporting bugs
 
 Open an issue with the bug report template at
-<https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues>. Please include the versions of this palette,
+<https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/issues>. Please include the versions of this palette,
 Node-RED and Node.js, the platform, the broker setup (Kafka version or cloud service, listener, SASL mechanism, TLS),
 a flow export with **all secrets removed**, and the log around the problem. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#enabling-debug-logging)
 explains how to turn on debug logging.

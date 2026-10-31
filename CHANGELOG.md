@@ -132,5 +132,5 @@ version that do not exist in this palette:
 - The crash safety net only swallows rejections of kafkajs and of this palette, so bugs of other nodes are not
   hidden; a Node-RED installed under a folder named `kafkajs` does not change that.
 
-[Unreleased]: https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/releases/tag/v1.0.0
+[Unreleased]: https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/releases/tag/v1.0.0

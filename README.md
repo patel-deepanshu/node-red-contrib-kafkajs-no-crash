@@ -1,6 +1,6 @@
 # node-red-contrib-kafkajs-no-crash
 
-[![CI](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/actions/workflows/ci.yml/badge.svg)](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/actions/workflows/ci.yml)
+[![CI](https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/actions/workflows/ci.yml/badge.svg)](https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/node-red-contrib-kafkajs-no-crash.svg)](https://www.npmjs.com/package/node-red-contrib-kafkajs-no-crash)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -145,13 +145,13 @@ the host is reachable as `host.docker.internal`.
 ### From source (contributors)
 
 ```sh
-git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
-cd node-red-kafkajs-no-crash
+git clone https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git
+cd node-red-contrib-kafkajs-no-crash
 npm install
 
 # link the working copy into your Node-RED user directory, then restart Node-RED
 cd ~/.node-red
-npm install /path/to/node-red-kafkajs-no-crash
+npm install /path/to/node-red-contrib-kafkajs-no-crash
 ```
 
 See [Development](#development) for the tests and [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow.
@@ -1011,7 +1011,7 @@ that use it.
 | `config error`, `no broker config`, `unknown action` (red, from the start) | Fix the configuration and deploy. `unknown action`: the node's *Action* setting names no action of this node. |
 
 A node showing `internal error` (red) hit an unexpected bug. Please
-[open an issue](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues) with the log.
+[open an issue](https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/issues) with the log.
 
 ## Error handling & monitoring
 

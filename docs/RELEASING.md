@@ -19,24 +19,26 @@ the package was built from this repository by that workflow).
 
 1. **npm account.** Create one at <https://www.npmjs.com/signup> and verify your e-mail address. Turn on two-factor
    authentication (*Account → Two-Factor Authentication*); npm requires it for publishing.
-2. **Package name.** `package.json` uses `node-red-contrib-kafkajs-no-crash`. The Node-RED flow library refuses new
-   unscoped names that start with `node-red-` without `contrib-`, so the repository name cannot be used as is. A scoped
-   name such as `@your-npm-user/node-red-kafkajs-no-crash` is the alternative the Node-RED docs recommend; to use it,
-   change `name` in `package.json` (and the install commands and badges in the README). `publishConfig.access` is
-   already `public`, which scoped packages need. Check that the name is still free:
+2. **Package name.** `package.json` uses `node-red-contrib-kafkajs-no-crash`, the same name as the GitHub repository.
+   (The Node-RED flow library refuses new unscoped names that start with `node-red-` without `contrib-`. A scoped
+   name such as `@your-npm-user/node-red-kafkajs-no-crash` would also be accepted; to use it, change `name` in
+   `package.json` and the install commands and badges in the README. `publishConfig.access` is already `public`,
+   which scoped packages need.) Check that the name is still free:
 
    ```sh
    npm view node-red-contrib-kafkajs-no-crash   # "404 Not Found" means it is free
    ```
 
-3. **GitHub.** Merge the work into `main` (the README badges, CI and the release workflow use `main`). Keep the
+3. **GitHub.** Merge the work into `main` (the README badges, CI and the release workflow use `main`). The
+   `repository`, `bugs` and `homepage` URLs in `package.json` must name the repository exactly as it is on GitHub
+   now: npm compares them with the provenance of each release and refuses a mismatch (rename both together). Keep the
    repository **public**: npm provenance is only available for packages built from public repositories.
 
 ## First release (by hand)
 
 ```sh
-git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
-cd node-red-kafkajs-no-crash
+git clone https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git
+cd node-red-contrib-kafkajs-no-crash
 git checkout main
 npm ci
 
@@ -73,7 +75,7 @@ Once the package exists on npm:
 
 1. On npmjs.com open the package → *Settings* → *Trusted publishing* → *GitHub Actions*, and enter:
    - organization or user: `patel-deepanshu`
-   - repository: `node-red-kafkajs-no-crash`
+   - repository: `node-red-contrib-kafkajs-no-crash`
    - workflow filename: `release.yml`
    - environment: leave empty (or create a GitHub environment, add it to the `publish` job with `environment:`, and
      enter the same name here; a GitHub environment lets you require an approval before every publish).

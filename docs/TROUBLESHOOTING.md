@@ -402,7 +402,7 @@ the request:
 
 ## Reporting a bug
 
-Open an issue at <https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues> with:
+Open an issue at <https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/issues> with:
 
 - what happened and what you expected;
 - the versions of this palette, Node-RED and Node.js, and the platform (Raspberry Pi, Docker, Windows, ...);
