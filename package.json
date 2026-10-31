@@ -74,12 +74,12 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git"
+        "url": "git+https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git"
     },
     "bugs": {
-        "url": "https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues"
+        "url": "https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/issues"
     },
-    "homepage": "https://github.com/patel-deepanshu/node-red-kafkajs-no-crash#readme",
+    "homepage": "https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash#readme",
     "author": "Deepanshu Patel",
     "license": "MIT"
 }

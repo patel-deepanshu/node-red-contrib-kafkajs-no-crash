@@ -16,7 +16,7 @@ Node.js 18.5 or newer and Node-RED 3.1 or newer; please reproduce problems on a 
 
 Use GitHub's private vulnerability reporting instead:
 **Security → Report a vulnerability** on
-<https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/security/advisories/new>.
+<https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/security/advisories/new>.
 
 Please include:
 

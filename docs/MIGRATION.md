@@ -92,14 +92,14 @@ installation that runs this palette already has.
 - **From a git checkout** of the repository:
 
   ```sh
-  git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
-  node node-red-kafkajs-no-crash/scripts/migrate-flows.js ~/.node-red/flows.json
+  git clone https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git
+  node node-red-contrib-kafkajs-no-crash/scripts/migrate-flows.js ~/.node-red/flows.json
   ```
 
 - **As a single file**: the script has no dependencies, so a copy works on its own (`node migrate-flows.js ...`):
 
   ```sh
-  curl -fsSLO https://raw.githubusercontent.com/patel-deepanshu/node-red-kafkajs-no-crash/main/scripts/migrate-flows.js
+  curl -fsSLO https://raw.githubusercontent.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/main/scripts/migrate-flows.js
   node migrate-flows.js ~/.node-red/flows.json
   ```
 
