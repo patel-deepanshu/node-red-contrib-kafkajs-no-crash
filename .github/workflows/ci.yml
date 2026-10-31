@@ -44,8 +44,8 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      # always the version in the job's name, whatever devDependencies pins for local development
       - name: Use Node-RED ${{ matrix.node-red }}
-        if: matrix.node-red != 4
         run: npm install --no-save node-red@${{ matrix.node-red }}
       - run: npm test
 
