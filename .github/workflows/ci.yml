@@ -19,6 +19,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - name: No known vulnerability in the runtime dependencies (what users install)
+        run: npm run audit:runtime
+      - name: Registry signatures of the installed packages
+        run: npm audit signatures
 
   test:
     name: test (Node ${{ matrix.node }}, Node-RED ${{ matrix.node-red }})
