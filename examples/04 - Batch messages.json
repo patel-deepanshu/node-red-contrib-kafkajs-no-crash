@@ -1,0 +1,266 @@
+[
+    {
+        "id": "4a6b6028a52db271",
+        "type": "tab",
+        "label": "Kafka 04: batch messages",
+        "disabled": false,
+        "info": "Send many Kafka messages with one Node-RED message by setting `msg.messages` to an array.",
+        "env": []
+    },
+    {
+        "id": "ff6f20da8a1e9e67",
+        "type": "comment",
+        "z": "4a6b6028a52db271",
+        "name": "Example 04: batch messages with msg.messages - select me and open the Info sidebar",
+        "info": "## Batch messages\n\nSet `msg.messages` to an array to send several Kafka messages at once. Each element is `{ value, key, headers, partition, timestamp, topic }` (`payload` is accepted instead of `value`); `msg.payload` is then ignored.\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 04)*) and change **Brokers**. Then click **Deploy**.\n\n### Rules\n\n- An element without `topic` goes to the producer's *Topic* or, when that is empty (as here), to `msg.topic`. Settings made in the producer node (Topic, Key, Partition, static headers) always win.\n- `msg.key`, `msg.headers`, `msg.partition` and `msg.timestamp` are **not** applied to the elements: give each element its own.\n- The whole input message succeeds or fails as one: one delivery report (with `kafka.count`, the number of Kafka messages) and one `done`. If one element is invalid, nothing is sent and a *catch* node gets the reason, for example `msg.messages[2].value is undefined`.\n- Messages are sent in requests of up to *Batch size* messages (Delivery tab, default 100), one topic per request.\n\n**Topics:** the producer creates `example-batch` and `example-batch-audit` with its first message if the broker allows automatic topic creation (Apache Kafka does by default, many managed services do not). Until a topic exists, the consumer shows `unknown topic/partition · retry …` (yellow) and keeps retrying, waiting a little longer each time; it starts at the first retry after the topic was created. To create topics yourself, use the admin node (example 06) or your Kafka tools.",
+        "x": 380,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "96573d255924ecf6",
+        "type": "comment",
+        "z": "4a6b6028a52db271",
+        "name": "A small batch, written in the inject node",
+        "info": "The inject node sets `msg.topic` and `msg.messages` (JSON). The third element goes to another topic.",
+        "x": 220,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "b87e5255a9c9e53e",
+        "type": "inject",
+        "z": "4a6b6028a52db271",
+        "name": "batch of 3 messages",
+        "props": [
+            {
+                "p": "topic",
+                "vt": "str"
+            },
+            {
+                "p": "messages",
+                "v": "[{\"key\":\"a\",\"value\":{\"n\":1}},{\"key\":\"b\",\"value\":{\"n\":2},\"headers\":{\"source\":\"line-3\"}},{\"topic\":\"example-batch-audit\",\"value\":{\"event\":\"batch sent\",\"count\":2}}]",
+                "vt": "json"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "example-batch",
+        "payload": "",
+        "payloadType": "date",
+        "x": 160,
+        "y": 140,
+        "wires": [
+            [
+                "bb124ec5748a87d3"
+            ]
+        ]
+    },
+    {
+        "id": "23061fc1396dbe67",
+        "type": "comment",
+        "z": "4a6b6028a52db271",
+        "name": "A large batch, built in a function",
+        "info": "1000 readings from 10 sensors in one message. The key keeps the readings of one sensor in one partition.",
+        "x": 190,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "52f2ddfe0ec70392",
+        "type": "inject",
+        "z": "4a6b6028a52db271",
+        "name": "1000 readings",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 140,
+        "y": 240,
+        "wires": [
+            [
+                "e25db25f98df9582"
+            ]
+        ]
+    },
+    {
+        "id": "e25db25f98df9582",
+        "type": "function",
+        "z": "4a6b6028a52db271",
+        "name": "build msg.messages",
+        "func": "// msg.messages: an array of Kafka messages, sent in one go.\n// Element: { value, key, headers, partition, timestamp, topic }\nconst messages = [];\nfor (let i = 1; i <= 1000; i++) {\n    messages.push({\n        key: 'sensor-' + (i % 10),\n        value: { reading: i, value: Math.round(Math.random() * 1000) / 10 }\n    });\n}\nmsg.topic = 'example-batch';\nmsg.messages = messages;\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 420,
+        "y": 240,
+        "wires": [
+            [
+                "bb124ec5748a87d3"
+            ]
+        ]
+    },
+    {
+        "id": "bb124ec5748a87d3",
+        "type": "kafkajs-nc-producer",
+        "z": "4a6b6028a52db271",
+        "name": "producer (topic from msg)",
+        "broker": "c842f46f95176f17",
+        "topic": "",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 700,
+        "y": 190,
+        "wires": [
+            [
+                "688d1751f14d7232"
+            ]
+        ]
+    },
+    {
+        "id": "688d1751f14d7232",
+        "type": "debug",
+        "z": "4a6b6028a52db271",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 960,
+        "y": 190,
+        "wires": []
+    },
+    {
+        "id": "7cb5310c08a2245f",
+        "type": "comment",
+        "z": "4a6b6028a52db271",
+        "name": "Read both topics",
+        "info": "One consumer can subscribe to several topics (comma separated). The function counts the messages per topic in its status. The debug node is switched off so that 1000 messages do not flood the sidebar: click its button to switch it on.",
+        "x": 150,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "a6492f2268bba873",
+        "type": "kafkajs-nc-consumer",
+        "z": "4a6b6028a52db271",
+        "name": "consumer (2 topics)",
+        "broker": "c842f46f95176f17",
+        "topics": "example-batch, example-batch-audit",
+        "topicIsRegex": false,
+        "groupId": "example-batch-reader",
+        "fromBeginning": true,
+        "autoStart": true,
+        "payloadFormat": "json",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 160,
+        "y": 360,
+        "wires": [
+            [
+                "25e6892b9218d118",
+                "d6dbb42a1256ffff"
+            ]
+        ]
+    },
+    {
+        "id": "25e6892b9218d118",
+        "type": "debug",
+        "z": "4a6b6028a52db271",
+        "name": "received",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 380,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "d6dbb42a1256ffff",
+        "type": "function",
+        "z": "4a6b6028a52db271",
+        "name": "count per topic",
+        "func": "// Shows how many messages arrived per topic in the node status.\nconst counts = context.get('counts') || {};\ncounts[msg.topic] = (counts[msg.topic] || 0) + 1;\ncontext.set('counts', counts);\nnode.status({\n    fill: 'green', shape: 'dot',\n    text: Object.keys(counts).map((t) => `${t}: ${counts[t]}`).join(', ')\n});\nreturn null;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 400,
+        "y": 380,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "c842f46f95176f17",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 04)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]

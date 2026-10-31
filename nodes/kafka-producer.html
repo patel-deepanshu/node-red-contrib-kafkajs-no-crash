@@ -1,0 +1,703 @@
+<style>
+    .kafkajs-nc-producer-form .form-row > label { width: 150px; }
+    .kafkajs-nc-producer-form .form-row > label.kafkajs-nc-check { width: auto; margin-left: 154px; }
+    .kafkajs-nc-producer-form .form-row > label.kafkajs-nc-check input { width: auto; margin: 0 6px 3px 0; vertical-align: middle; }
+    .kafkajs-nc-producer-form .kafkajs-nc-unit { margin-left: 6px; color: var(--red-ui-secondary-text-color, #777); }
+    .kafkajs-nc-producer-form .kafkajs-nc-section {
+        margin: 16px 0 10px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--red-ui-secondary-border-color, #ddd);
+        font-weight: bold;
+        color: var(--red-ui-primary-text-color, #555);
+    }
+    .kafkajs-nc-producer-form .kafkajs-nc-section:first-child { margin-top: 4px; }
+    .kafkajs-nc-producer-form .form-tips { margin-bottom: 12px; }
+    .kafkajs-nc-producer-form .kafkajs-nc-help { margin-left: 4px; color: var(--red-ui-secondary-text-color, #999); cursor: help; }
+    .kafkajs-nc-producer-form .kafkajs-nc-header-row { display: flex; gap: 6px; align-items: center; }
+    .kafkajs-nc-producer-form .kafkajs-nc-header-row input { margin: 0; }
+    .kafkajs-nc-producer-form .kafkajs-nc-header-name { flex: 2; min-width: 80px; }
+    .kafkajs-nc-producer-form .kafkajs-nc-header-value { flex: 3; min-width: 80px; }
+</style>
+
+<script type="text/html" data-template-name="kafkajs-nc-producer">
+    <div class="kafkajs-nc-producer-form">
+        <div class="form-row">
+            <label for="node-input-broker"><i class="fa fa-server"></i> Broker</label>
+            <input type="text" id="node-input-broker" style="width: calc(100% - 160px);">
+        </div>
+        <div class="form-row">
+            <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+            <input type="text" id="node-input-name" placeholder="Name" style="width: calc(100% - 160px);">
+        </div>
+        <div class="form-row">
+            <ul style="min-width: 500px; margin-bottom: 20px;" id="node-input-kafkajs-nc-producer-tabs"></ul>
+        </div>
+        <div id="node-input-kafkajs-nc-producer-tabs-content" style="min-height: 250px;">
+
+            <!-- Message -->
+            <div id="kafkajs-nc-producer-tab-message" style="display: none;">
+                <div class="form-row">
+                    <label for="node-input-topic"><i class="fa fa-tasks"></i> Topic</label>
+                    <input type="text" id="node-input-topic" placeholder="empty = use msg.topic" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-row">
+                    <label for="node-input-key"><i class="fa fa-key"></i> Key</label>
+                    <input type="text" id="node-input-key" placeholder="empty = use msg.key" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-row">
+                    <label for="node-input-partition"><i class="fa fa-th-large"></i> Partition</label>
+                    <input type="text" id="node-input-partition" placeholder="empty = msg.partition or partitioner" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-tips">
+                    A value set here is used for every message; leave a field empty to take it from the message
+                    (<code>msg.topic</code>, <code>msg.key</code>, <code>msg.partition</code>).
+                </div>
+                <div class="form-row" style="margin-bottom: 0;">
+                    <label><i class="fa fa-list"></i> Static headers</label>
+                </div>
+                <div class="form-row node-input-headers-container-row">
+                    <ol id="node-input-headers-container"></ol>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-useMsgHeaders" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-input-useMsgHeaders">Also send <code>msg.headers</code> (static headers win)
+                    </label>
+                </div>
+                <div class="form-tips">
+                    Note: <i>http in</i> and <i>http request</i> nodes put the HTTP headers in <code>msg.headers</code>.
+                    Untick the box (or delete <code>msg.headers</code>) if they should not become Kafka headers.
+                </div>
+            </div>
+
+            <!-- Delivery -->
+            <div id="kafkajs-nc-producer-tab-delivery" style="display: none;">
+                <div class="form-row">
+                    <label for="node-input-acks"><i class="fa fa-check-square-o"></i> Acknowledgement</label>
+                    <select id="node-input-acks" style="width: calc(100% - 160px);">
+                        <option value="all">All in-sync replicas (acks=-1, safest)</option>
+                        <option value="leader">Leader only (acks=1)</option>
+                        <option value="none">None (acks=0, fire and forget)</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-ackTimeout"><i class="fa fa-clock-o"></i> Ack timeout</label>
+                    <input type="text" id="node-input-ackTimeout" placeholder="30000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="How long the broker may wait for the replicas to acknowledge a write (100 - 600000)."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-compression"><i class="fa fa-compress"></i> Compression</label>
+                    <select id="node-input-compression" style="width: calc(100% - 160px);">
+                        <option value="none">None</option>
+                        <option value="gzip">GZIP</option>
+                        <option value="snappy">Snappy</option>
+                        <option value="lz4">LZ4</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-partitioner"><i class="fa fa-random"></i> Partitioner</label>
+                    <select id="node-input-partitioner" style="width: calc(100% - 160px);">
+                        <option value="default">Default (Java client compatible)</option>
+                        <option value="legacy">Legacy (kafkajs 1.x)</option>
+                    </select>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Which partition a message with a key goes to. Default matches the Java client; use Legacy only to keep the key-to-partition mapping of flows that used kafkajs 1.x."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-batchSize"><i class="fa fa-database"></i> Batch size</label>
+                    <input type="text" id="node-input-batchSize" placeholder="100" style="width: 110px;"><span class="kafkajs-nc-unit">messages per request</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Messages that arrive while a request is in flight, and queued messages, are sent together in requests of up to this many messages (1 - 10000)."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-allowAutoTopicCreation" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-input-allowAutoTopicCreation">Let the broker create missing topics (if the broker allows it)
+                    </label>
+                </div>
+            </div>
+
+            <!-- Offline queue -->
+            <div id="kafkajs-nc-producer-tab-queue" style="display: none;">
+                <div class="form-row">
+                    <label for="node-input-queueMode"><i class="fa fa-inbox"></i> Offline queue</label>
+                    <select id="node-input-queueMode" style="width: calc(100% - 160px);">
+                        <option value="disk">On disk (survives restarts)</option>
+                        <option value="memory">In memory (lost on restart)</option>
+                        <option value="off">Off (fail messages while Kafka is unreachable)</option>
+                    </select>
+                </div>
+                <div class="form-tips kafkajs-nc-queue-off">
+                    With the queue off, messages that arrive while Kafka is not connected fail
+                    (<code>done(err)</code>, catchable with a <i>catch</i> node).
+                </div>
+                <div class="form-tips kafkajs-nc-queue-memory">
+                    Messages are kept in memory while Kafka is unreachable and are lost when Node-RED stops or the
+                    flow is redeployed.
+                </div>
+
+                <div class="kafkajs-nc-queue-disk">
+                    <div class="kafkajs-nc-section"><i class="fa fa-folder-open-o"></i> Location</div>
+                    <div class="form-row">
+                        <label for="node-input-queueDir">Directory</label>
+                        <input type="text" id="node-input-queueDir" placeholder="&lt;Node-RED user directory&gt;/kafkajs-nc-queue" style="width: calc(100% - 160px);">
+                    </div>
+                    <div class="form-row">
+                        <label for="node-input-queueName">Queue name</label>
+                        <input type="text" id="node-input-queueName" placeholder="empty = this node's id" style="width: calc(100% - 160px);">
+                    </div>
+                    <div class="form-tips">
+                        Messages are stored in <code>&lt;directory&gt;/&lt;queue name&gt;</code>. A relative directory is
+                        relative to the Node-RED user directory. Each producer needs its own queue: set a name if the
+                        queue should survive re-importing the node (that gives it a new id). A copy of the node keeps
+                        the name, so give the copy a name of its own (otherwise it runs without a queue).
+                    </div>
+                </div>
+
+                <div class="kafkajs-nc-queue-on">
+                    <div class="kafkajs-nc-section"><i class="fa fa-tachometer"></i> Limits</div>
+                    <div class="form-row">
+                        <label for="node-input-queueMaxMB">Maximum size</label>
+                        <input type="text" id="node-input-queueMaxMB" placeholder="100" style="width: 110px;"><span class="kafkajs-nc-unit">MB (0 = unlimited)</span>
+                    </div>
+                    <div class="form-row">
+                        <label for="node-input-queueMaxMessages">Maximum messages</label>
+                        <input type="text" id="node-input-queueMaxMessages" placeholder="0" style="width: 110px;"><span class="kafkajs-nc-unit">(0 = unlimited)</span>
+                    </div>
+                    <div class="form-row">
+                        <label for="node-input-queueOverflow">When full</label>
+                        <select id="node-input-queueOverflow" style="width: calc(100% - 160px);">
+                            <option value="drop-oldest">Drop the oldest queued messages</option>
+                            <option value="drop-newest">Reject new messages (done(err))</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label for="node-input-queueMaxAgeHours">Expire after</label>
+                        <input type="text" id="node-input-queueMaxAgeHours" placeholder="0" style="width: 110px;"><span class="kafkajs-nc-unit">hours (0 = never)</span>
+                        <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Queued messages older than this are not sent: they are moved to the dead-letter file instead."></i>
+                    </div>
+                </div>
+
+                <div class="kafkajs-nc-queue-disk">
+                    <div class="form-row">
+                        <label for="node-input-queueFsync" class="kafkajs-nc-check">
+                            <input type="checkbox" id="node-input-queueFsync">Sync every write to disk (safe on power loss; slower)
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</script>
+
+<script type="text/javascript">
+(function () {
+    'use strict';
+
+    // Node-RED replaces ${NAME} / $(NAME) only when it is the WHOLE value, without spaces
+    // (@node-red/runtime lib/flows/util.js); anything else stays literal at runtime.
+    var ENV_REF = /^(\$\{\S+\}|\$\(\S+\))$/;
+    var ANY_REF = /\$\{|\$\(/;
+    var TOPIC_RE = /^[A-Za-z0-9._-]{1,249}$/;
+    var NOT_WHOLE = 'a ${NAME} reference is only replaced when it is the whole value, without spaces';
+
+    function isBlank(v) {
+        return v === undefined || v === null || String(v).trim() === '';
+    }
+
+    /**
+     * Number validator: blank means "use the default" and ${ENV} references are
+     * resolved at runtime, so both are valid. Returns a reason string on
+     * Node-RED >= 3.1 (which passes `opt`), else a boolean.
+     */
+    function numberRange(min, max, integer) {
+        return function (v, opt) {
+            if (isBlank(v) || ENV_REF.test(String(v))) {
+                return true;
+            }
+            var n = Number(v);
+            if (isFinite(n) && n >= min && n <= max && (!integer || Math.floor(n) === n)) {
+                return true;
+            }
+            if (ANY_REF.test(String(v))) {
+                return opt ? NOT_WHOLE : false;
+            }
+            return opt ? 'must be ' + (integer ? 'a whole number' : 'a number') + ' from ' + min + ' to ' + max : false;
+        };
+    }
+
+    /** Same rule as the runtime: Kafka topic names use letters, digits, '.', '_' and '-'. */
+    function validTopic(v, opt) {
+        if (isBlank(v) || ENV_REF.test(String(v))) {
+            return true;
+        }
+        var s = String(v).trim();
+        if (TOPIC_RE.test(s) && s !== '.' && s !== '..') {
+            return true;
+        }
+        if (ANY_REF.test(s)) {
+            return opt ? NOT_WHOLE : false; // e.g. "orders-${REGION}": stays literal at runtime
+        }
+        return opt ? 'invalid topic name (letters, digits, ".", "_" and "-", at most 249)' : false;
+    }
+
+    function validPartition(v, opt) {
+        if (isBlank(v) || ENV_REF.test(String(v))) {
+            return true;
+        }
+        if (/^\s*\d+\s*$/.test(String(v)) && Number(v) <= 2147483647) {
+            return true;
+        }
+        if (ANY_REF.test(String(v))) {
+            return opt ? NOT_WHOLE : false;
+        }
+        return opt ? 'must be empty or a whole number >= 0' : false;
+    }
+
+    /**
+     * The offline queue mode: the dialog's current choice while it is open,
+     * else the saved value (blank and unknown values mean "disk", as at runtime).
+     */
+    function queueModeOf(node) {
+        var mode;
+        try {
+            var field = $('#node-input-queueMode');
+            if (field && field.length) {
+                mode = field.val();
+            }
+        } catch (e) {
+            mode = undefined;
+        }
+        if (mode === undefined || mode === null) {
+            mode = node ? node.queueMode : '';
+        }
+        return String(mode || '').trim().toLowerCase();
+    }
+
+    /**
+     * Queue directory and Queue name: the runtime's checks (pathProblem in
+     * kafka-producer.js). A ${NAME} inside a longer value ('${HOME}/queues') is
+     * never replaced by Node-RED and "~user" is not expanded: the queue would be
+     * unavailable. Only matters for the disk queue.
+     */
+    function validQueuePath(v, opt) {
+        var mode = queueModeOf(this);
+        if (mode === 'memory' || mode === 'off' || isBlank(v) || ENV_REF.test(String(v))) {
+            return true;
+        }
+        var s = String(v);
+        if (/\$\{[^}]*\}/.test(s)) {
+            return opt ? NOT_WHOLE : false;
+        }
+        if (/^~[^/\\]/.test(s.trim())) {
+            return opt ? '"~user" is not expanded: use an absolute path' : false;
+        }
+        return true;
+    }
+
+    /**
+     * Saved headers → editable list rows. Reads everything the runtime reads,
+     * so opening and saving the dialog never changes what is sent: an object
+     * { name: value | [values] } (what this editor saves), an array of
+     * { key|name, value } pairs or a JSON string of either (hand-written
+     * flows). null values are left out, as at runtime.
+     */
+    function headerRows(headers) {
+        var rows = [];
+        function add(name, value) {
+            if (Array.isArray(value)) {
+                value.forEach(function (v) {
+                    add(name, v);
+                });
+            } else if (value !== null && value !== undefined) {
+                rows.push({ name: name, value: value });
+            }
+        }
+        if (typeof headers === 'string') {
+            try {
+                headers = JSON.parse(headers);
+            } catch (e) {
+                return rows;
+            }
+        }
+        if (!headers || typeof headers !== 'object') {
+            return rows;
+        }
+        if (Array.isArray(headers)) {
+            headers.forEach(function (h) {
+                if (h && typeof h === 'object') {
+                    add(h.key !== undefined ? h.key : h.name, h.value);
+                }
+            });
+            return rows;
+        }
+        Object.keys(headers).forEach(function (name) {
+            add(name, headers[name]);
+        });
+        return rows;
+    }
+
+    /** A header value as the runtime sends it: objects as JSON (never '[object Object]'). */
+    function headerText(value) {
+        if (value === undefined || value === null) {
+            return '';
+        }
+        return typeof value === 'object' ? JSON.stringify(value) : String(value);
+    }
+
+    RED.nodes.registerType('kafkajs-nc-producer', {
+        category: 'kafka',
+        color: '#c7d8e6',
+        icon: 'kafka.svg',
+        paletteLabel: 'kafka producer',
+        align: 'right',
+        inputs: 1,
+        outputs: 1,
+        outputLabels: ['delivery report'],
+        defaults: {
+            name: { value: '' },
+            broker: { value: '', type: 'kafkajs-nc-broker', required: true, label: 'Broker' },
+            topic: { value: '', label: 'Topic', validate: validTopic },
+            key: { value: '' },
+            partition: { value: '', label: 'Partition', validate: validPartition },
+            headers: { value: {} },
+            useMsgHeaders: { value: true },
+            acks: { value: 'all' },
+            ackTimeout: { value: 30000, label: 'Ack timeout', validate: numberRange(100, 600000, true) },
+            compression: { value: 'none' },
+            partitioner: { value: 'default' },
+            allowAutoTopicCreation: { value: true },
+            batchSize: { value: 100, label: 'Batch size', validate: numberRange(1, 10000, true) },
+            queueMode: { value: 'disk' },
+            queueDir: { value: '', label: 'Queue directory', validate: validQueuePath },
+            queueName: { value: '', label: 'Queue name', validate: validQueuePath },
+            queueMaxMB: { value: 100, label: 'Queue maximum size', validate: numberRange(0, 1048576, false) },
+            queueMaxMessages: { value: 0, label: 'Queue maximum messages', validate: numberRange(0, 9007199254740991, true) },
+            queueOverflow: { value: 'drop-oldest' },
+            queueMaxAgeHours: { value: 0, label: 'Queue expiry', validate: numberRange(0, 876000, false) },
+            queueFsync: { value: true }
+        },
+        label: function () {
+            return this.name || (this.topic ? 'kafka → ' + this.topic : 'kafka producer');
+        },
+        labelStyle: function () {
+            return this.name ? 'node_label_italic' : '';
+        },
+        oneditprepare: function () {
+            var node = this;
+            var tabs = RED.tabs.create({
+                id: 'node-input-kafkajs-nc-producer-tabs',
+                onchange: function (tab) {
+                    $('#node-input-kafkajs-nc-producer-tabs-content').children().hide();
+                    $('#' + tab.id).show();
+                }
+            });
+            tabs.addTab({ id: 'kafkajs-nc-producer-tab-message', label: 'Message' });
+            tabs.addTab({ id: 'kafkajs-nc-producer-tab-delivery', label: 'Delivery' });
+            tabs.addTab({ id: 'kafkajs-nc-producer-tab-queue', label: 'Offline queue' });
+            setTimeout(function () {
+                tabs.resize();
+            }, 0);
+
+            // Older or hand-written flows may lack these properties: show the runtime defaults.
+            var fallbacks = {
+                acks: 'all', compression: 'none', partitioner: 'default', queueMode: 'disk', queueOverflow: 'drop-oldest'
+            };
+            Object.keys(fallbacks).forEach(function (prop) {
+                if (isBlank(node[prop])) {
+                    $('#node-input-' + prop).val(fallbacks[prop]);
+                }
+            });
+            ['useMsgHeaders', 'allowAutoTopicCreation', 'queueFsync'].forEach(function (prop) {
+                if (node[prop] === undefined) {
+                    $('#node-input-' + prop).prop('checked', true);
+                }
+            });
+
+            var list = $('#node-input-headers-container').css({ 'min-height': '120px', 'min-width': '420px' }).editableList({
+                addItem: function (container, i, header) {
+                    var h = header || {};
+                    var row = $('<div/>', { class: 'kafkajs-nc-header-row' }).appendTo(container);
+                    $('<input/>', { type: 'text', class: 'kafkajs-nc-header-name', placeholder: 'header name' })
+                        .val(h.name === undefined || h.name === null ? '' : String(h.name))
+                        .appendTo(row);
+                    $('<input/>', { type: 'text', class: 'kafkajs-nc-header-value', placeholder: 'value' })
+                        .val(headerText(h.value))
+                        .appendTo(row);
+                },
+                sortable: true,
+                removable: true,
+                addButton: 'header',
+                height: 'auto'
+            });
+            // editableList measured the 120px min-height and fixed the list's
+            // height to it: rows from the 3rd on would overflow onto the controls
+            // below. Without that height the list grows with its rows (the
+            // min-height stays) and the dialog scrolls.
+            list.parent().css('height', '');
+            headerRows(node.headers).forEach(function (row) {
+                list.editableList('addItem', row);
+            });
+
+            function updateQueueSections() {
+                var mode = $('#node-input-queueMode').val() || 'disk';
+                $('.kafkajs-nc-queue-disk').toggle(mode === 'disk');
+                $('.kafkajs-nc-queue-on').toggle(mode !== 'off');
+                $('.kafkajs-nc-queue-off').toggle(mode === 'off');
+                $('.kafkajs-nc-queue-memory').toggle(mode === 'memory');
+            }
+            $('#node-input-queueMode').on('change', updateQueueSections);
+            updateQueueSections();
+
+            if (RED.popover && typeof RED.popover.tooltip === 'function') {
+                $('.kafkajs-nc-producer-form .kafkajs-nc-help').each(function () {
+                    RED.popover.tooltip($(this), $(this).attr('data-tip'));
+                });
+            } else {
+                $('.kafkajs-nc-producer-form .kafkajs-nc-help').each(function () {
+                    $(this).attr('title', $(this).attr('data-tip'));
+                });
+            }
+        },
+        oneditsave: function () {
+            // Rows with an empty name are ignored; a repeated name becomes a
+            // multi-value header (Kafka allows the same header more than once).
+            var headers = {};
+            $('#node-input-headers-container').editableList('items').each(function () {
+                var name = $(this).find('.kafkajs-nc-header-name').val();
+                var value = $(this).find('.kafkajs-nc-header-value').val();
+                name = name === undefined || name === null ? '' : String(name).trim();
+                if (name === '') {
+                    return;
+                }
+                if (Object.prototype.hasOwnProperty.call(headers, name)) {
+                    headers[name] = [].concat(headers[name], value);
+                } else {
+                    headers[name] = value;
+                }
+            });
+            this.headers = headers;
+        }
+    });
+})();
+</script>
+
+<script type="text/markdown" data-help-name="kafkajs-nc-producer">
+Sends messages to Kafka. While Kafka cannot be reached, messages are stored in an offline queue (on disk by default) and sent in their original order as soon as the connection is back. Never crashes Node-RED.
+
+### Inputs
+
+: payload (string | buffer | object | array | number | boolean | null) : the message value. Strings and buffers are sent as they are; objects and arrays as JSON; numbers, booleans and dates as text; `null` is a *tombstone* (deletes the key on compacted topics). An `undefined` payload is an error.
+: *topic* (string) : the Kafka topic, used when the node's **Topic** is empty.
+: *key* (string | buffer | number | object) : the message key, used when the node's **Key** is empty. Messages with the same key go to the same partition, which keeps their order.
+: *partition* (number) : send to this partition (0, 1, ...), used when the node's **Partition** is empty. Without it, the partitioner picks one from the key.
+: *headers* (object) : Kafka headers, an object of header names and values (a value may be an array for repeated headers). Values are converted to text; `null` values are left out. Only used when *Also send msg.headers* is ticked.
+: *timestamp* (number | Date | string) : the Kafka message timestamp, in epoch milliseconds (a number, a Date or a string of digits; other strings such as ISO dates are an error). Defaults to the time the message reached this node, so messages delivered later from the offline queue keep their original time.
+: *messages* (array) : send several Kafka messages at once. Each element is `{ value, key, headers, partition, timestamp, topic }` (`payload` is accepted instead of `value`); `msg.payload` is then ignored. An element without `topic` uses the node's Topic or `msg.topic`; the other `msg` properties (key, headers, partition, timestamp) are not applied to the elements. Node settings still win. The whole input succeeds or fails as one message (one report, one `done`).
+: *action* (string) : `flush`, `reconnect`, `queue-status` or `queue-clear` make the message a control command (see *Control messages*); upper/lower case and surrounding spaces do not matter. Any other `msg.action` is ordinary data and the message is sent normally.
+
+### Outputs
+
+The input message is passed on as a *delivery report* once it has been handled:
+
+: kafka.status (string) : `sent` (Kafka acknowledged the message) or `queued` (stored in the offline queue; it will be sent later and no second report follows).
+: kafka.topic (string) : the topic.
+: kafka.partition (number) : the partition, when it is known.
+: kafka.offset (string) : the offset, when it is known exactly.
+: kafka.results (array) : only with `sent`, what Kafka returned for the request that carried the message (`[{ topicName, partition, baseOffset, ... }]`). Empty when *Acknowledgement* is *None*.
+: kafka.count (number) : how many Kafka messages the input carried (only for `msg.messages`).
+: kafka.queueSize (number) : only with `queued`, the messages in the queue after this one was added.
+
+For `queue-status` and `queue-clear` the message is sent with the queue statistics in `msg.payload`.
+
+Messages that cannot be sent end the message with an error (`done(err)`), so a *catch* node receives the original
+message with `msg.error`. Examples: no topic, an invalid topic name, an undefined payload, a partition that does not
+exist, a message too large for the broker, a full queue with *Reject new messages*, or Kafka unreachable with the
+offline queue off.
+
+### Details
+
+#### Settings and message properties
+
+A value set in the node (Topic, Key, Partition) is used for every message, and the matching `msg` property is
+ignored. Leave the field empty to take the value from the message. Static headers are combined with `msg.headers`;
+a static header wins when both have the same name.
+
+Topic names may use letters, digits, `.`, `_` and `-` (at most 249 characters). An MQTT-style topic such as
+`sensors/temp` is rejected: set the node's Topic or change `msg.topic` first.
+
+A setting can be `${NAME}` to read an environment variable; Node-RED only replaces it when it is the whole field.
+What happens when the variable is not set depends on the setting:
+
+- Topic, Key, Partition and Static headers: every message fails with a clear error instead of being sent somewhere
+  unexpected.
+- Queue directory and Queue name: the offline queue is unavailable (an error is logged); messages are still sent
+  while Kafka is connected. A `${NAME}` inside a longer path (`${HOME}/queues`) is never replaced: the editor marks
+  the field as invalid and the runtime reports it the same way.
+- Acknowledgement, Compression and Offline queue mode: a warning is logged and the default is used.
+- Other settings (numbers and check boxes): the default is used.
+
+#### Offline queue (store-and-forward)
+
+When the queue is on (the default is *On disk*):
+
+- While Kafka is not connected, every incoming message is appended to the queue, the report `kafka.status` `queued`
+  is sent and the message is done. Nothing is lost while Node-RED keeps running, and with the disk queue also not
+  when Node-RED is restarted, redeployed or the machine reboots.
+- When the connection is back, the queue is sent oldest-first, in batches of *Batch size*. Messages that arrive
+  meanwhile are queued behind it. When the queue is empty, messages are sent directly again.
+- If a send fails because of the connection (broker down, timeout, network), the failed messages and every message
+  waiting behind them go to the queue, in order, and the node reconnects.
+- If Kafka is slow (a request takes more than 3 s), new messages also go to the queue so they are safe on disk
+  rather than waiting in memory.
+- A message whose content is invalid is never queued: it fails at once with `done(err)`.
+
+**Where:** `<directory>/<queue name>`. The directory defaults to `kafkajs-nc-queue` in the Node-RED user directory
+(usually `~/.node-red/kafkajs-nc-queue`); an administrator can change the default with
+`kafkajsNcProducerQueueDir` in `settings.js`. The queue name defaults to the node's id, so each producer has its own
+queue (inside a subflow the id is that of the node in the subflow instance, which stays the same across restarts).
+The files are `seg-*.jsonl` (the messages, one JSON object per line), `cursor.json` (how far the queue has been
+sent) and `dead-letter.jsonl`. When the queue is empty the message files are deleted.
+
+**Limits:** *Maximum size* (default 100 MB) and *Maximum messages* (default unlimited). When a limit is reached,
+*Drop the oldest* removes the oldest queued messages (a warning is logged); *Reject new messages* fails the new
+message with `done(err)`. *Expire after* moves queued messages older than this many hours to the dead-letter file
+instead of sending them.
+
+**Sync every write to disk** (default on): a message is only reported as queued once it is safely on disk, even if
+the power fails. Turn it off for more speed on slow storage, accepting that the last messages may be lost on a power
+cut.
+
+*In memory* mode works the same way but keeps the queue in memory only: it is lost when Node-RED stops or the node is
+redeployed. *Off* fails messages (`done(err)`) while Kafka is not connected.
+
+**Moving or renaming a queue.** Messages are only sent by a producer that uses their queue directory. Re-importing
+a node gives it a new id and therefore a new, empty queue (set a *Queue name* to keep the same queue). Changing
+*Directory* or *Queue name* leaves the queued messages in the old directory: a warning names it, and setting the old
+values again sends them. When a node with queued messages is deleted, a warning names its directory too, and a
+producer that starts warns about queue directories next to its own that hold messages no producer in the deployed
+flows uses. Producers that are disabled, or in a disabled flow, still count: their queues are sent when they run
+again. A listed directory may also belong to a flow you will import again or to another Node-RED instance using the
+same directory, so only delete it when you are sure no producer needs those messages.
+
+Two producers must never use the same queue. A copy of a node keeps its *Queue name*: while the original exists the
+copy cannot lock that queue, reports an error and runs without a queue, so give the copy its own name. After a
+redeploy, the new instance waits until the old one has finished writing the queue; on a very slow disk it runs
+without the queue for a moment and opens it as soon as the old instance is done.
+
+#### Order
+
+Messages are sent one request at a time, in the order they arrived, including when they go through the offline
+queue. Kafka keeps the order per partition: use a key (or a fixed partition) for messages whose order matters. The
+order of messages for different topics is kept as well, because a request only ever contains one topic.
+
+#### Delivery guarantee: at least once
+
+A message is reported `sent` only when Kafka has acknowledged it, and `queued` only when it is stored. If the
+connection breaks after Kafka wrote a message but before its answer arrived, the message is sent again later: in
+rare cases a consumer sees a **duplicate**. Messages are never silently dropped, except by the limits and expiry you
+configure. Consumers that must not process a message twice should de-duplicate, for example with a unique id in a
+header.
+
+Kafka errors that usually clear within a second or two (a partition leader moving during a broker restart, not
+enough in-sync replicas yet, a request timeout) are retried by sending the whole request again, up to 3 times after
+pauses of about 0.2, 0.6 and 1.6 s, before the messages go to the offline queue. kafkajs' own retry is not used,
+because it can lose messages when partition leaders move. Retries are logged at debug level only.
+
+**New topics.** With *Let the broker create missing topics* on (the default) and a broker that creates topics
+(Kafka's default), the first message to a new topic creates it. The broker needs a moment for that (typically 0.1 to
+1 s) and answers *unknown topic* meanwhile, so the node sends the request again after 0.05, 0.1, 0.2, 0.4, 0.8 and
+0.8 s (at most about 2.5 s): the first messages are reported `sent`, without an error. If the topic still does not
+exist then, the broker does not create topics: the message fails (topic from `msg.topic`) or is queued (the node's
+Topic) as with the option off, and for the next minute further messages for that topic do not wait again.
+
+A message for an explicit partition that Kafka did not write because the producer's information about the topic may
+be out of date (partitions were added) is sent again after a quick reconnect that fetches the current list of
+partitions (logged at debug level; newer messages wait in memory behind it). It fails as *partition does not exist*
+when that is confirmed. After that, further messages for the same missing partition fail at once for one minute, so a
+flow that keeps using a wrong partition does not make the node reconnect again and again. Other partitions of the
+topic are not affected: a partition that was really added is always used.
+
+#### Dead-letter file
+
+A queued message that Kafka refuses for good (for example *message too large*, a partition that does not exist, an
+invalid or unauthorised topic taken from the message or from a Topic setting the node no longer has, a damaged queue
+file, or expired) cannot be sent at all. So that it does not block the messages behind it, it is appended to
+`dead-letter.jsonl` in the queue directory, a warning is logged, and sending continues. Each line is `{ "ts": "...",
+"error": { "name", "message", "kind", ... }, "record": { "t": topic, "ts": queued-at, "m": { "k": key, "v": value,
+"h": headers, "p": partition, "ts": timestamp } } }`, where values are `{ "s": "text" }` or `{ "b": "base64" }`. A
+batch that keeps failing with an unrecognised error 5 times in a row is checked message by message the same way. The
+file is rotated to `dead-letter.1.jsonl` at 50 MB. In memory mode the last 100 dead letters are kept in memory only:
+`queue-status` returns them in `msg.payload.deadLetters`, and they are lost when Node-RED stops.
+
+#### Connection
+
+The node connects when it starts and reconnects on its own after any failure, waiting longer after each failed
+attempt (settings of the broker node). Authentication, authorisation and configuration errors are retried slowly
+(*After auth/config errors* in the broker node). The first failure of an outage is logged as an error; repeats are
+logged at debug level, with a warning every 10th attempt. When Kafka works again the log says
+`Connected to Kafka after N attempts`.
+
+#### Status
+
+- `starting` / `12 queued` (grey): the offline queue is being opened (after a redeploy this can include waiting for
+  the previous instance to finish writing it).
+- `connecting…` (yellow): connecting to Kafka.
+- `connected` (green): messages are sent directly.
+- `connected · 12 queued` / `flushing · 1234 queued` (green): sending the offline queue.
+- `offline · 57 queued · retry 8s` (yellow): Kafka cannot be reached; the next attempt is in 8 s.
+- `ECONNREFUSED broker:9092 · retry 8s` (yellow): the same with an empty queue, showing the reason.
+- `auth failed · retry 60s` (red): wrong user name or password. Other problems that need a human show their
+  reason instead, for example `TLS: untrusted cert (CA?) · retry 60s` or `not authorized (topic) · 1 queued · retry 60s`.
+- `config error · 3 queued` (red): the broker configuration is invalid, or kafkajs refused an option (see the log);
+  messages are queued.
+- `no broker config` (red): no broker configuration is selected; messages are queued.
+- `connected · queue unavailable` (yellow): connected, but the offline queue could not be opened (see the log).
+
+A status shows at most 48 characters; a longer reason is shortened with `…` (the log has the full text).
+
+#### Control messages
+
+Send a message with `msg.action` set to one of these (case and surrounding spaces do not matter):
+
+- `flush` or `reconnect`: retry the connection now instead of waiting, or start sending the queue now.
+- `queue-status`: outputs `msg.payload = { size, bytes, segments, droppedTotal, deadLettered, oldestTs, state, mode,
+  queueMode, queueDir, pending, queueError, lastError, deadLetters }`. `size` is the number of queued messages,
+  `deadLettered` how many were moved to the dead-letter file, `oldestTs` (when known) the arrival time of the oldest
+  queued message, `state` the connection state (`idle` before the queue is open, `connecting`, `connected`,
+  `waiting` for the next attempt, `stopped` without a usable broker configuration, `closing`), `mode` is `live`
+  (sending directly) or `backlog` (going through the queue), `pending` the messages waiting in memory. `queueError`
+  and `lastError` are only present after a problem, `deadLetters` only in memory mode.
+- `queue-clear`: deletes every queued message without sending it (logged as a warning), then outputs the statistics.
+
+These four values are reserved: a message whose `msg.action` is one of them is never sent to Kafka.
+
+#### Examples
+
+Send JSON to a fixed topic: set Topic to `telemetry` and pass `msg.payload = { "temp": 21.5 }`.
+
+Choose the topic and key per message (node Topic and Key empty):
+
+```
+msg.topic = "orders";
+msg.key = msg.payload.orderId;   // same order → same partition → kept in order
+return msg;
+```
+
+Several messages in one go:
+
+```
+msg.messages = [
+    { key: "a", value: { n: 1 } },
+    { key: "b", value: { n: 2 }, headers: { source: "line-3" } },
+    { topic: "audit", value: "batch sent" }
+];
+return msg;
+```
+
+Watch the queue: an *inject* node every minute with `msg.action = "queue-status"` → this node → a *debug* node that
+shows `msg.payload.size`. Use a *status* node to react to connection changes and a *catch* node for messages that
+failed.
+
+### References
+
+- [kafkajs producer documentation](https://kafka.js.org/docs/producing)
+- [Kafka topic name rules and producer acks](https://kafka.apache.org/documentation/#producerconfigs)
+- [Project README and issue tracker](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash)
+</script>

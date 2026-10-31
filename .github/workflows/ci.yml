@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    name: test (Node ${{ matrix.node }}, Node-RED ${{ matrix.node-red }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { node: 18.x, node-red: '3.1' }  # the oldest supported Node-RED
+          - { node: 18.x, node-red: 4 }
+          - { node: 20.x, node-red: 4 }
+          - { node: 22.x, node-red: 4 }
+          - { node: 22.x, node-red: 5 }
+          - { node: 24.x, node-red: 5 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Use Node-RED ${{ matrix.node-red }}
+        if: matrix.node-red != 4
+        run: npm install --no-save node-red@${{ matrix.node-red }}
+      - run: npm test
+
+  e2e:
+    name: e2e (real Kafka broker, SASL, outages)
+    runs-on: ubuntu-latest
+    env:
+      KAFKA_VERSION: 3.9.1
+      KAFKA_CACHE_DIR: ${{ github.workspace }}/.kafka-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci
+      - name: Cache Kafka distribution
+        uses: actions/cache@v4
+        with:
+          path: .kafka-cache
+          key: kafka-${{ env.KAFKA_VERSION }}
+      - name: Download and start Kafka (KRaft, PLAINTEXT + SASL listeners)
+        run: |
+          echo "KAFKA_HOME=$(bash scripts/kafka/kafka-download.sh | tail -n1)" >> "$GITHUB_ENV"
+      - run: npm run kafka:start
+      - run: npm run test:e2e
+        env:
+          KAFKA_E2E_BROKERS: 127.0.0.1:19092
+          KAFKA_E2E_SASL_BROKERS: 127.0.0.1:19093
+          KAFKA_E2E_CONTROL: '1'
+      - name: Kafka broker log (on failure)
+        if: failure()
+        run: tail -n 200 .kafka-local/logs/server.out || true
+      - name: Stop Kafka
+        if: always()
+        run: npm run kafka:stop || true

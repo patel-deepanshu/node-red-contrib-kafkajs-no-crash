@@ -1,0 +1,437 @@
+[
+    {
+        "id": "8d24f276d123a072",
+        "type": "tab",
+        "label": "Kafka 07: error handling",
+        "disabled": false,
+        "info": "Catch messages that could not be sent, and raise an alert when a Kafka node loses or regains its connection.",
+        "env": []
+    },
+    {
+        "id": "6620e24d9a80daee",
+        "type": "comment",
+        "z": "8d24f276d123a072",
+        "name": "Example 07: error handling with catch and status nodes - select me and open the Info sidebar",
+        "info": "## Error handling with *catch* and *status*\n\nThe Kafka nodes never crash Node-RED. Problems are reported in three places:\n\n1. **The node status** (and *status* nodes): the connection state, e.g. `connected` (green), `ECONNREFUSED localhost:9092 · retry 8s` (yellow, Kafka unreachable, retrying), `auth failed · retry 60s` (red, needs a human).\n2. **Catch nodes**: a message that could not be handled ends with an error; a *catch* node receives the original message with `msg.error`.\n3. **The Node-RED log**: the first failure of an outage is logged as an error, then only a warning every 10th attempt, so the log does not fill up.\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 07)*) and change **Brokers**. Then click **Deploy**.\n\n**Topics:** the producer creates `example-errors` with its first message if the broker allows automatic topic creation (Apache Kafka does by default, many managed services do not). Until a topic exists, the consumer shows `unknown topic/partition · retry …` (yellow) and keeps retrying, waiting a little longer each time; it starts at the first retry after the topic was created. To create topics yourself, use the admin node (example 06) or your Kafka tools.\n\n### Try it\n\n- Click **valid message**: it is sent (delivery report).\n- Click **topic sensors/temp**: Kafka topic names may only contain letters, digits, `.`, `_` and `-`, so the producer rejects the message and the catch node gets it.\n- Click **no topic**: neither the node nor `msg.topic` names a topic.\n- Stop Kafka. After a short while (kafkajs retries first) the consumer status turns yellow and the *connecting / retrying* debug node shows it once. The producer only notices when it sends: click **valid message**. Its offline queue is **Off**, so the message fails and goes to the catch node. Start Kafka again: the statuses turn green and *connected again* shows it. (Instead of stopping Kafka you can also set the broker address to a port nothing listens on and deploy.)\n\nReplace the debug nodes by an e-mail, Telegram, MQTT or dashboard node to get real alerts.",
+        "x": 400,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "50a9650b01019b9c",
+        "type": "comment",
+        "z": "8d24f276d123a072",
+        "name": "Messages that fail go to the catch node",
+        "info": "The producer has no Topic, so it uses `msg.topic`. Its offline queue is *Off*: while Kafka is unreachable, messages fail instead of being queued.",
+        "x": 220,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "eddbf3138b04e043",
+        "type": "inject",
+        "z": "8d24f276d123a072",
+        "name": "valid message",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "example-errors",
+        "payload": "hello",
+        "payloadType": "str",
+        "x": 140,
+        "y": 140,
+        "wires": [
+            [
+                "9451f23bf49bb164"
+            ]
+        ]
+    },
+    {
+        "id": "8bdf3d179eeaafc4",
+        "type": "inject",
+        "z": "8d24f276d123a072",
+        "name": "topic sensors/temp",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "sensors/temp",
+        "payload": "21.5",
+        "payloadType": "num",
+        "x": 150,
+        "y": 180,
+        "wires": [
+            [
+                "9451f23bf49bb164"
+            ]
+        ]
+    },
+    {
+        "id": "a79c6d88ad260feb",
+        "type": "inject",
+        "z": "8d24f276d123a072",
+        "name": "no topic",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "where to?",
+        "payloadType": "str",
+        "x": 120,
+        "y": 220,
+        "wires": [
+            [
+                "9451f23bf49bb164"
+            ]
+        ]
+    },
+    {
+        "id": "9451f23bf49bb164",
+        "type": "kafkajs-nc-producer",
+        "z": "8d24f276d123a072",
+        "name": "producer (queue off)",
+        "broker": "7bf0d195d83866c6",
+        "topic": "",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "off",
+        "queueDir": "",
+        "queueName": "",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 400,
+        "y": 180,
+        "wires": [
+            [
+                "35424a1f35deccc6"
+            ]
+        ]
+    },
+    {
+        "id": "35424a1f35deccc6",
+        "type": "debug",
+        "z": "8d24f276d123a072",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 640,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "27f5c4a20f80a1df",
+        "type": "catch",
+        "z": "8d24f276d123a072",
+        "name": "producer errors",
+        "scope": [
+            "9451f23bf49bb164"
+        ],
+        "uncaught": false,
+        "x": 140,
+        "y": 280,
+        "wires": [
+            [
+                "bd709d047185c552"
+            ]
+        ]
+    },
+    {
+        "id": "bd709d047185c552",
+        "type": "debug",
+        "z": "8d24f276d123a072",
+        "name": "failed message",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "error",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 380,
+        "y": 280,
+        "wires": []
+    },
+    {
+        "id": "0f8d9b330ad89f92",
+        "type": "comment",
+        "z": "8d24f276d123a072",
+        "name": "Alert when the connection state changes",
+        "info": "The *status* node receives every status change of the producer and the consumer: `msg.status = { fill, shape, text, source: { id, type, name } }`. The *filter* node (rbe) only lets a message through when the colour of a node changes, so a retry countdown does not raise a new alert every time. The *switch* routes by colour:\n\n- **red**: a problem that does not fix itself (wrong password, not authorised, TLS or configuration error). The node keeps retrying slowly.\n- **yellow**: connecting, or Kafka unreachable and the node is retrying (messages are queued if the producer has an offline queue).\n- **green**: connected again.",
+        "x": 230,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "c93d67d5b23497cd",
+        "type": "status",
+        "z": "8d24f276d123a072",
+        "name": "Kafka node status",
+        "scope": [
+            "9451f23bf49bb164",
+            "da8fb74c260ffb62"
+        ],
+        "x": 150,
+        "y": 400,
+        "wires": [
+            [
+                "feb0a942122843ab"
+            ]
+        ]
+    },
+    {
+        "id": "feb0a942122843ab",
+        "type": "rbe",
+        "z": "8d24f276d123a072",
+        "name": "colour changed?",
+        "func": "rbe",
+        "gap": "",
+        "start": "",
+        "inout": "out",
+        "septopics": true,
+        "property": "status.fill",
+        "topi": "status.source.id",
+        "x": 390,
+        "y": 400,
+        "wires": [
+            [
+                "908131839a3cb194"
+            ]
+        ]
+    },
+    {
+        "id": "908131839a3cb194",
+        "type": "switch",
+        "z": "8d24f276d123a072",
+        "name": "colour",
+        "property": "status.fill",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "eq",
+                "v": "red",
+                "vt": "str"
+            },
+            {
+                "t": "eq",
+                "v": "yellow",
+                "vt": "str"
+            },
+            {
+                "t": "eq",
+                "v": "green",
+                "vt": "str"
+            }
+        ],
+        "checkall": "true",
+        "repair": false,
+        "outputs": 3,
+        "x": 610,
+        "y": 400,
+        "wires": [
+            [
+                "fef1abb1f0b9c932"
+            ],
+            [
+                "70b94d6650379ffb"
+            ],
+            [
+                "cc6997610d3c71d5"
+            ]
+        ]
+    },
+    {
+        "id": "fef1abb1f0b9c932",
+        "type": "function",
+        "z": "8d24f276d123a072",
+        "name": "alert text",
+        "func": "// msg.status.source tells which node changed.\nconst s = msg.status;\nmsg.payload = `Kafka problem on \"${s.source.name || s.source.type}\": ${s.text}`;\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 840,
+        "y": 360,
+        "wires": [
+            [
+                "8679f4975c4e0d3b"
+            ]
+        ]
+    },
+    {
+        "id": "8679f4975c4e0d3b",
+        "type": "debug",
+        "z": "8d24f276d123a072",
+        "name": "needs attention",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1100,
+        "y": 360,
+        "wires": []
+    },
+    {
+        "id": "70b94d6650379ffb",
+        "type": "debug",
+        "z": "8d24f276d123a072",
+        "name": "connecting / retrying",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "status.text",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 860,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "cc6997610d3c71d5",
+        "type": "debug",
+        "z": "8d24f276d123a072",
+        "name": "connected again",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "status.text",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 870,
+        "y": 440,
+        "wires": []
+    },
+    {
+        "id": "1583a9ea6a69f277",
+        "type": "comment",
+        "z": "8d24f276d123a072",
+        "name": "A consumer, so that the status node watches two nodes",
+        "info": "",
+        "x": 280,
+        "y": 500,
+        "wires": []
+    },
+    {
+        "id": "da8fb74c260ffb62",
+        "type": "kafkajs-nc-consumer",
+        "z": "8d24f276d123a072",
+        "name": "consumer",
+        "broker": "7bf0d195d83866c6",
+        "topics": "example-errors",
+        "topicIsRegex": false,
+        "groupId": "example-errors-reader",
+        "fromBeginning": false,
+        "autoStart": true,
+        "payloadFormat": "string",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 130,
+        "y": 540,
+        "wires": [
+            [
+                "7959e676d1f45f23"
+            ]
+        ]
+    },
+    {
+        "id": "7959e676d1f45f23",
+        "type": "debug",
+        "z": "8d24f276d123a072",
+        "name": "received",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 360,
+        "y": 540,
+        "wires": []
+    },
+    {
+        "id": "7bf0d195d83866c6",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 07)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]
