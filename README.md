@@ -91,7 +91,7 @@ The design notes behind these decisions are in [docs/ARCHITECTURE.md](docs/ARCHI
   accepts `${ENV_VAR}`.
 - **No ghost clients.** Every connection attempt uses a fresh kafkajs client. A late connect after a redeploy is shut
   down instead of living on as a hidden consumer group member.
-- **Pure JavaScript dependencies** (kafkajs, kafkajs-snappy, lz4js), so nothing has to be compiled on a Raspberry Pi or
+- **Pure JavaScript dependencies** (kafkajs, snappyjs, lz4js), so nothing has to be compiled on a Raspberry Pi or
   in Alpine containers.
 
 ## Requirements & compatibility
@@ -488,9 +488,12 @@ why).
   exactly the retry that can lose messages, so this palette does not offer it. Earlier development versions had an
   *Idempotent producer* option; a flow that still sets it loads normally, the option is ignored, and a warning says
   so. De-duplicate on the consuming side instead (see below).
-- **Compression.** gzip is built into kafkajs. Snappy (through kafkajs-snappy) and LZ4 (compressed through lz4js,
-  decompressed by this palette's own bounded decoder) are registered automatically, and both are pure JavaScript. The end-to-end tests check that Kafka's own Java
-  consumer can read all three. zstd is not available.
+- **Compression.** gzip is built into kafkajs. Snappy (through snappyjs) and LZ4 (compressed through lz4js) are
+  registered automatically, and both are pure JavaScript. Both are decompressed with size checks: a batch that claims
+  more than its compressed size can hold, or more than 256 MiB, is refused before any memory is allocated, so a
+  crafted batch cannot exhaust the memory of Node-RED. The end-to-end tests check that Kafka's own Java client can
+  read what this palette writes and that this palette reads what the Java client writes, for all three. zstd is not
+  available.
 
 ### Ordering and delivery guarantees
 
@@ -1220,10 +1223,11 @@ Without `KAFKA_E2E_BROKERS`, the e2e tests are skipped. `KAFKA_E2E_CONTROL=1` al
 | [`lib/`](lib) | Shared modules: configuration parsing, error classification, disk and memory queues, serialisation, logging, safety net |
 | [`test/unit/`](test/unit), [`test/nodes/`](test/nodes), [`test/e2e/`](test/e2e) | Unit, node (fake kafkajs) and end-to-end (real broker) tests. A root hook fails any test that causes an unhandled rejection. |
 | [`examples/`](examples) | Importable example flows |
-| [`docs/`](docs) | Architecture, offline queue, migration and troubleshooting guides |
+| [`docs/`](docs) | Architecture, offline queue, migration, troubleshooting and release guides |
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-for how the nodes are built and why. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+for how the nodes are built and why. Changes are listed in [CHANGELOG.md](CHANGELOG.md); maintainers publish new
+versions as described in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Security
 
@@ -1241,8 +1245,9 @@ Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.
 [MIT](LICENSE) © Deepanshu Patel
 
 - Built on [KafkaJS](https://github.com/tulios/kafkajs) (MIT), pinned at 2.2.4.
-- Snappy compression through [kafkajs-snappy](https://github.com/tulios/kafkajs-snappy) (MIT). LZ4 compression
-  through [lz4js](https://github.com/Benzinga/lz4js) (ISC).
+- Snappy compression through [snappyjs](https://github.com/zhipeng-jia/snappyjs) (MIT); the xerial framing is read
+  the same way as in [kafkajs-snappy](https://github.com/tulios/kafkajs-snappy) (MIT). LZ4 compression through
+  [lz4js](https://github.com/Benzinga/lz4js) (ISC).
 - Inspired by [node-red-contrib-kafkajs](https://github.com/emrebekar/node-red-contrib-kafkajs) by Emre Bekar. This
   project is an independent rewrite and shares no code with it. Thank you for the original palette.
 - Not affiliated with the Apache Software Foundation. Apache Kafka is a trademark of the Apache Software Foundation.

@@ -36,8 +36,9 @@ Things that are in scope include:
   output or the offline-queue files,
 - TLS verification being disabled when the configuration says it is enabled,
 - path traversal through the offline-queue directory/name settings,
-- anything that lets a crafted Kafka message or flow message crash Node-RED (for example a compressed batch: LZ4
-  batches that would decompress to more than 256 MiB are rejected as a safeguard),
+- anything that lets a crafted Kafka message or flow message crash Node-RED (for example a compressed batch: Snappy
+  and LZ4 batches that claim more than their compressed size can hold, or that would decompress to more than
+  256 MiB, are rejected before any memory is allocated),
 - the migration script (`kafkajs-nc-migrate-flows`) leaking the credentials it converts (it writes them to a file
   readable by its owner only).
 

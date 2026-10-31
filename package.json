@@ -13,7 +13,9 @@
         "test:e2e": "mocha --timeout 240000 \"test/e2e/**/*.e2e.js\"",
         "lint": "eslint .",
         "kafka:start": "bash scripts/kafka/kafka-start.sh",
-        "kafka:stop": "bash scripts/kafka/kafka-stop.sh"
+        "kafka:stop": "bash scripts/kafka/kafka-stop.sh",
+        "prepublishOnly": "npm run lint && npm test",
+        "audit:runtime": "npm audit --omit=dev --audit-level=low"
     },
     "keywords": [
         "node-red",
@@ -54,10 +56,13 @@
         "CHANGELOG.md",
         "LICENSE"
     ],
+    "publishConfig": {
+        "access": "public"
+    },
     "dependencies": {
         "kafkajs": "2.2.4",
-        "kafkajs-snappy": "^1.1.0",
-        "lz4js": "^0.2.0"
+        "lz4js": "^0.2.0",
+        "snappyjs": "^0.7.0"
     },
     "devDependencies": {
         "@eslint/js": "^9.39.0",

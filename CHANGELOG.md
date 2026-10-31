@@ -72,8 +72,11 @@ subflows a new id on every start, which would change their default queue directo
 - Reconnects forever with exponential backoff and jitter; clear status texts (`ECONNREFUSED broker:9092 · retry 8s`,
   `auth failed`, `TLS: self-signed cert`, `offline · 57 queued`); one log line per outage instead of hundreds;
   kafkajs log lines in the Node-RED log, labelled with their node and de-duplicated.
-- Snappy (kafkajs-snappy) and LZ4 compression, pure JavaScript. LZ4 is compressed with lz4js in a Kafka-compatible
-  frame format and decompressed by a bounded decoder of this palette that verifies block checksums.
+- Snappy (snappyjs) and LZ4 compression, pure JavaScript. LZ4 is compressed with lz4js in a Kafka-compatible
+  frame format and decompressed by a bounded decoder of this palette that verifies block checksums. Snappy and LZ4
+  batches that claim more than their compressed size can hold, or more than 256 MiB, are refused before anything is
+  allocated (kafkajs-snappy, used during development, let a 49-byte Snappy batch allocate gigabytes; the same class
+  of problem as snappy-java's CVE-2023-43642). Interoperability with Kafka's Java client is tested both ways.
 - Nine example flows (*Import → Examples*), detailed help for every node, and the guides
   [ARCHITECTURE](docs/ARCHITECTURE.md), [OFFLINE-QUEUE](docs/OFFLINE-QUEUE.md), [MIGRATION](docs/MIGRATION.md) and
   [TROUBLESHOOTING](docs/TROUBLESHOOTING.md).
