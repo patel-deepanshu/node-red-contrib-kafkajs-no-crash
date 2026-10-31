@@ -69,7 +69,7 @@
         "eslint": "^10.13.0",
         "globals": "^17.13.0",
         "mocha": "^11.7.0",
-        "node-red": "^4.1.17",
+        "node-red": "^5.0.9",
         "node-red-node-test-helper": "^0.3.6"
     },
     "repository": {
