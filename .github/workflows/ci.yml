@@ -67,7 +67,7 @@ jobs:
           java-version: 21
       - run: npm ci
       - name: Cache Kafka distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .kafka-cache
           key: kafka-${{ env.KAFKA_VERSION }}
