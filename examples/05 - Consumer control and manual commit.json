@@ -1,0 +1,484 @@
+[
+    {
+        "id": "6e6b107ac4a184c5",
+        "type": "tab",
+        "label": "Kafka 05: consumer control",
+        "disabled": false,
+        "info": "Pause, resume, stop, start, restart and seek a consumer with `msg.action`, and commit offsets manually after a message was processed (at-least-once processing).",
+        "env": []
+    },
+    {
+        "id": "bf1e10cab199ff00",
+        "type": "comment",
+        "z": "6e6b107ac4a184c5",
+        "name": "Example 05: consumer control and manual commit - select me and open the Info sidebar",
+        "info": "## Consumer control and manual commit\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 05)*) and change **Brokers**. Then click **Deploy**. After the deploy, click **send 5 jobs** to put some messages on the topic `example-work`.\n\n**Topics:** the producer creates `example-work` with its first message if the broker allows automatic topic creation (Apache Kafka does by default, many managed services do not). Until a topic exists, the consumer shows `unknown topic/partition · retry …` (yellow) and keeps retrying, waiting a little longer each time; it starts at the first retry after the topic was created. To create topics yourself, use the admin node (example 06) or your Kafka tools.\n\n### Manual commit: process at least once\n\nKafka remembers, per consumer group and partition, the position of the next message to read (the *committed offset*). With *Commit: Automatically* (the default) the position is stored regularly (every 5 s and after each fetched batch) once the messages were handed to the flow. After a crash or restart the messages handed over since the last stored position are delivered again (*at least once*, with possible duplicates), but a message that was still being processed when its position was stored is not.\n\nThis consumer uses *Commit: Manually*. Nothing is stored until the processed message comes back to the consumer's input with `msg.action = \"commit\"`: here the *change* node sets it and the *link* nodes carry the message back. The consumer then commits that message's offset + 1, taken from `msg.kafka`, so keep `msg.kafka` on the message. It must be the consumer's own `msg.kafka`: a **kafka producer** node in the processing replaces it with its delivery report, and the commit is then refused. Keep a copy before the producer (`msg.consumed = msg.kafka`) and put it back before the commit. Messages that were not committed are delivered **again** after a restart, a reconnect or a rebalance (*at least once*), so the processing should tolerate duplicates.\n\nCommitting a message also commits every earlier message of the same partition. If processing fails, do not pass the message on (return `null` or throw in the function).\n\nTo see the committed position, use the **group offsets** button of example 06 with the group id `example-work-group` and the topic `example-work`.",
+        "x": 380,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "4ca843ac49a9b868",
+        "type": "comment",
+        "z": "6e6b107ac4a184c5",
+        "name": "Control the consumer (msg.action)",
+        "info": "- **pause** / **resume**: stop / continue fetching. The consumer stays in its group. A pause is kept across reconnects.\n- **stop**: leave the group and disconnect; the consumer stays stopped until **start**.\n- **restart**: disconnect and connect again now.\n- **seek**: continue reading a partition from another offset: `msg.payload = { topic, partition, offset }`. `topic` can be left out when the consumer has a single topic; `offset` is a number, `\"earliest\"` (the oldest message still stored) or `\"latest\"` (only new messages). The consumer looks up the partition's offsets first: a number outside them is refused. Only works while connected, for a partition assigned to this consumer.\n\nControl messages are not sent to the output. A failing one (for example *seek* while stopped) goes to the *catch* node.",
+        "x": 200,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "0a573bddca827cff",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "pause",
+        "props": [
+            {
+                "p": "action",
+                "v": "pause",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 110,
+        "y": 140,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "8cb632ad1840d4c5",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "resume",
+        "props": [
+            {
+                "p": "action",
+                "v": "resume",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 110,
+        "y": 180,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "6e348ef5bf7bb657",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "stop",
+        "props": [
+            {
+                "p": "action",
+                "v": "stop",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 110,
+        "y": 220,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "a2a938f13d1f36a8",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "start",
+        "props": [
+            {
+                "p": "action",
+                "v": "start",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 110,
+        "y": 260,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "c509f4c67132cc83",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "restart",
+        "props": [
+            {
+                "p": "action",
+                "v": "restart",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 110,
+        "y": 300,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "27dcef6eb85c60e1",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "seek to earliest",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "seek",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"partition\":0,\"offset\":\"earliest\"}",
+        "payloadType": "json",
+        "x": 140,
+        "y": 340,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "4cbb5876fc829414",
+        "type": "link in",
+        "z": "6e6b107ac4a184c5",
+        "name": "commit",
+        "links": [
+            "85cf501596561b03"
+        ],
+        "l": true,
+        "x": 110,
+        "y": 400,
+        "wires": [
+            [
+                "bd76a4cd7ecca6af"
+            ]
+        ]
+    },
+    {
+        "id": "bd76a4cd7ecca6af",
+        "type": "kafkajs-nc-consumer",
+        "z": "6e6b107ac4a184c5",
+        "name": "consumer (manual commit)",
+        "broker": "3c5f603523b9de32",
+        "topics": "example-work",
+        "topicIsRegex": false,
+        "groupId": "example-work-group",
+        "fromBeginning": true,
+        "autoStart": true,
+        "payloadFormat": "string",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "manual",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 400,
+        "y": 270,
+        "wires": [
+            [
+                "d02fa52424cf490f"
+            ]
+        ]
+    },
+    {
+        "id": "d02fa52424cf490f",
+        "type": "function",
+        "z": "6e6b107ac4a184c5",
+        "name": "process the message",
+        "func": "// Do the real work here: write to a database, call an API...\n// Pass the message on only when the work succeeded: it is then\n// committed. Return null (or throw) when it failed: the message\n// is not committed and Kafka delivers it again after a restart.\n// Keep msg.kafka: the commit needs its topic, partition and offset.\nnode.status({ fill: 'green', shape: 'dot', text: `processed offset ${msg.offset}` });\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 680,
+        "y": 270,
+        "wires": [
+            [
+                "5a4f46acff22b430",
+                "3ec08c0bb098ed3f"
+            ]
+        ]
+    },
+    {
+        "id": "5a4f46acff22b430",
+        "type": "change",
+        "z": "6e6b107ac4a184c5",
+        "name": "msg.action = commit",
+        "rules": [
+            {
+                "t": "set",
+                "p": "action",
+                "pt": "msg",
+                "to": "commit",
+                "tot": "str"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 960,
+        "y": 240,
+        "wires": [
+            [
+                "85cf501596561b03"
+            ]
+        ]
+    },
+    {
+        "id": "85cf501596561b03",
+        "type": "link out",
+        "z": "6e6b107ac4a184c5",
+        "name": "commit",
+        "mode": "link",
+        "links": [
+            "4cbb5876fc829414"
+        ],
+        "l": true,
+        "x": 1180,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "3ec08c0bb098ed3f",
+        "type": "debug",
+        "z": "6e6b107ac4a184c5",
+        "name": "processed",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 930,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "7dd72fcebdb3d57e",
+        "type": "catch",
+        "z": "6e6b107ac4a184c5",
+        "name": "control errors",
+        "scope": [
+            "bd76a4cd7ecca6af"
+        ],
+        "uncaught": false,
+        "x": 350,
+        "y": 400,
+        "wires": [
+            [
+                "ce7a905b475ef069"
+            ]
+        ]
+    },
+    {
+        "id": "ce7a905b475ef069",
+        "type": "debug",
+        "z": "6e6b107ac4a184c5",
+        "name": "control or commit failed",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "error",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 690,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "34d6453c540fd7b5",
+        "type": "comment",
+        "z": "6e6b107ac4a184c5",
+        "name": "Put some work on the topic",
+        "info": "Sends 5 messages to `example-work`.",
+        "x": 180,
+        "y": 460,
+        "wires": []
+    },
+    {
+        "id": "bf7b8deb33e40c04",
+        "type": "inject",
+        "z": "6e6b107ac4a184c5",
+        "name": "send 5 jobs",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 130,
+        "y": 500,
+        "wires": [
+            [
+                "2544842c852b0be5"
+            ]
+        ]
+    },
+    {
+        "id": "2544842c852b0be5",
+        "type": "function",
+        "z": "6e6b107ac4a184c5",
+        "name": "5 jobs",
+        "func": "for (let i = 1; i <= 5; i++) {\n    node.send({ payload: `job ${i} of ${new Date().toISOString()}` });\n}\nreturn null;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 330,
+        "y": 500,
+        "wires": [
+            [
+                "2d40e7748cbe1ff8"
+            ]
+        ]
+    },
+    {
+        "id": "2d40e7748cbe1ff8",
+        "type": "kafkajs-nc-producer",
+        "z": "6e6b107ac4a184c5",
+        "name": "",
+        "broker": "3c5f603523b9de32",
+        "topic": "example-work",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 690,
+        "y": 500,
+        "wires": [
+            [
+                "560d64f2597379c0"
+            ]
+        ]
+    },
+    {
+        "id": "560d64f2597379c0",
+        "type": "debug",
+        "z": "6e6b107ac4a184c5",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 940,
+        "y": 500,
+        "wires": []
+    },
+    {
+        "id": "3c5f603523b9de32",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 05)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]

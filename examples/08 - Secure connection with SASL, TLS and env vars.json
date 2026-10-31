@@ -1,0 +1,317 @@
+[
+    {
+        "id": "9f249dae98e8a987",
+        "type": "tab",
+        "label": "Kafka 08: SASL, TLS, env vars",
+        "disabled": false,
+        "info": "Connect to a secured Kafka cluster (SASL/SCRAM-SHA-512 over TLS) with the broker address and the credentials taken from environment variables.",
+        "env": []
+    },
+    {
+        "id": "360c2302224cc6a8",
+        "type": "comment",
+        "z": "9f249dae98e8a987",
+        "name": "Example 08: secure connection (SASL/SCRAM, TLS, environment variables) - select me",
+        "info": "## Secure connection with SASL, TLS and environment variables\n\nThe broker configuration node *Secure Kafka (from env vars)* contains no addresses or passwords. It reads them from environment variables when Node-RED starts:\n\n| Field (broker node) | Value | Environment variable |\n|---|---|---|\n| Connection → Brokers | `${KAFKA_BROKERS}` | e.g. `broker1.example.com:9093,broker2.example.com:9093` |\n| Security → Mechanism | SASL/SCRAM-SHA-512 | |\n| Security → Username | `${KAFKA_USER}` | your Kafka user name |\n| Security → Password | `${KAFKA_PASSWORD}` | its password |\n| Security → Use TLS | ticked | |\n\nNode-RED only replaces a field that consists of the whole `${NAME}` reference. Username and password are credentials: Node-RED keeps them in its credentials file, not in the flow. If the two fields are empty after the import, type `${KAFKA_USER}` and `${KAFKA_PASSWORD}` into them.\n\nIf a variable is not set, the Kafka nodes show **config error** and the log says, for example, `environment variable KAFKA_PASSWORD is not set`. They do not try to connect until that is fixed.\n\n### TLS\n\nThe *TLS configuration* node *Kafka TLS (system CAs, verify server)* has no certificates: the CA certificates of the system are trusted and the server certificate is verified. That suits public services. Open it to add a private CA certificate, a client certificate and key (mutual TLS), or, for test systems only, to untick *Verify server certificate* for a self-signed certificate. Without any of that you can also leave *TLS configuration* empty.\n\n### Other common setups\n\n- **Confluent Cloud**: SASL/PLAIN, username = API key, password = API secret, *Use TLS* on, no TLS configuration.\n- **Amazon MSK with SASL/SCRAM**: SCRAM-SHA-512 and *Use TLS* on, as here.\n- **SASL without TLS** (`SASL_PLAINTEXT` listener): untick *Use TLS*. With SASL/PLAIN the password then travels in clear text; a warning is logged.\n\nSelect **How to set the environment variables** for the how-to.",
+        "x": 380,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "312dd506224c52c1",
+        "type": "comment",
+        "z": "9f249dae98e8a987",
+        "name": "How to set the environment variables (select me)",
+        "info": "## Setting the environment variables\n\nSet them **before** Node-RED starts; restart Node-RED after changing them.\n\n**Linux / macOS shell**\n\n```\nexport KAFKA_BROKERS=\"broker1.example.com:9093,broker2.example.com:9093\"\nexport KAFKA_USER=\"my-user\"\nexport KAFKA_PASSWORD=\"my-password\"\nnode-red\n```\n\n**systemd service**: add to the `[Service]` section of the unit (or use `EnvironmentFile=` with a file only root can read):\n\n```\nEnvironment=KAFKA_BROKERS=broker1.example.com:9093\nEnvironment=KAFKA_USER=my-user\nEnvironment=KAFKA_PASSWORD=my-password\n```\n\n**Docker**\n\n```\ndocker run -e KAFKA_BROKERS=broker1.example.com:9093 \\\n  -e KAFKA_USER=my-user -e KAFKA_PASSWORD=my-password \\\n  -p 1880:1880 nodered/node-red\n```\n\n**Windows PowerShell**\n\n```\n$env:KAFKA_BROKERS = \"broker1.example.com:9093\"\n$env:KAFKA_USER = \"my-user\"\n$env:KAFKA_PASSWORD = \"my-password\"\nnode-red\n```\n\nWith environment variables, the flow itself contains no addresses or secrets, so it can be exported, shared and committed to version control as it is, and the same flow works on a test and a production system.",
+        "x": 830,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "ccbe5fa23c34900e",
+        "type": "comment",
+        "z": "9f249dae98e8a987",
+        "name": "Check the connection",
+        "info": "Asks the cluster for its brokers and cluster id.",
+        "x": 160,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "e9544643e5cdd842",
+        "type": "inject",
+        "z": "9f249dae98e8a987",
+        "name": "describe cluster",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 140,
+        "y": 140,
+        "wires": [
+            [
+                "b1d03fb63aa2a081"
+            ]
+        ]
+    },
+    {
+        "id": "b1d03fb63aa2a081",
+        "type": "kafkajs-nc-admin",
+        "z": "9f249dae98e8a987",
+        "name": "describe cluster",
+        "broker": "5f2b09ba537fd57e",
+        "action": "describeCluster",
+        "timeout": 30000,
+        "x": 430,
+        "y": 140,
+        "wires": [
+            [
+                "ac09a82135b5f992"
+            ]
+        ]
+    },
+    {
+        "id": "ac09a82135b5f992",
+        "type": "debug",
+        "z": "9f249dae98e8a987",
+        "name": "cluster",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 700,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "2344b8c1f5d7ed06",
+        "type": "comment",
+        "z": "9f249dae98e8a987",
+        "name": "Produce and consume over the secure connection",
+        "info": "Topic `example-secure`. Create it first if your cluster does not create topics automatically (many managed services do not).",
+        "x": 260,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "45da986a4aee1615",
+        "type": "inject",
+        "z": "9f249dae98e8a987",
+        "name": "send a message",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "hello over TLS",
+        "payloadType": "str",
+        "x": 140,
+        "y": 240,
+        "wires": [
+            [
+                "c51e6b519c80a5a9"
+            ]
+        ]
+    },
+    {
+        "id": "c51e6b519c80a5a9",
+        "type": "kafkajs-nc-producer",
+        "z": "9f249dae98e8a987",
+        "name": "",
+        "broker": "5f2b09ba537fd57e",
+        "topic": "example-secure",
+        "key": "",
+        "partition": "",
+        "headers": {},
+        "useMsgHeaders": true,
+        "acks": "all",
+        "ackTimeout": 30000,
+        "compression": "none",
+        "partitioner": "default",
+        "allowAutoTopicCreation": true,
+        "batchSize": 100,
+        "queueMode": "disk",
+        "queueDir": "",
+        "queueName": "",
+        "queueMaxMB": 100,
+        "queueMaxMessages": 0,
+        "queueOverflow": "drop-oldest",
+        "queueMaxAgeHours": 0,
+        "queueFsync": true,
+        "x": 460,
+        "y": 240,
+        "wires": [
+            [
+                "f0377cb2a008a2fd"
+            ]
+        ]
+    },
+    {
+        "id": "f0377cb2a008a2fd",
+        "type": "debug",
+        "z": "9f249dae98e8a987",
+        "name": "delivery report",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "kafka",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 720,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "070136a2c1bb7014",
+        "type": "kafkajs-nc-consumer",
+        "z": "9f249dae98e8a987",
+        "name": "",
+        "broker": "5f2b09ba537fd57e",
+        "topics": "example-secure",
+        "topicIsRegex": false,
+        "groupId": "example-secure-reader",
+        "fromBeginning": false,
+        "autoStart": true,
+        "payloadFormat": "string",
+        "keyFormat": "string",
+        "headersFormat": "string",
+        "commitMode": "auto",
+        "autoCommitInterval": 5000,
+        "autoCommitThreshold": 0,
+        "sessionTimeout": 30000,
+        "heartbeatInterval": 3000,
+        "rebalanceTimeout": 60000,
+        "maxBytesPerPartition": 1048576,
+        "maxBytes": 10485760,
+        "maxWaitTimeInMs": 1000,
+        "partitionsConsumedConcurrently": 1,
+        "allowAutoTopicCreation": false,
+        "x": 170,
+        "y": 300,
+        "wires": [
+            [
+                "af7ffa30d3494b36"
+            ]
+        ]
+    },
+    {
+        "id": "af7ffa30d3494b36",
+        "type": "debug",
+        "z": "9f249dae98e8a987",
+        "name": "received",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 400,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "fd90f3e7adbc6021",
+        "type": "comment",
+        "z": "9f249dae98e8a987",
+        "name": "Connection problems",
+        "info": "Shows the status changes of the three Kafka nodes, e.g. `auth failed · retry 60s` for a wrong password or `TLS: self-signed cert · retry 60s`.",
+        "x": 160,
+        "y": 360,
+        "wires": []
+    },
+    {
+        "id": "e1aad8b6bfa1790b",
+        "type": "status",
+        "z": "9f249dae98e8a987",
+        "name": "Kafka node status",
+        "scope": [
+            "b1d03fb63aa2a081",
+            "c51e6b519c80a5a9",
+            "070136a2c1bb7014"
+        ],
+        "x": 150,
+        "y": 400,
+        "wires": [
+            [
+                "31d1d463daf030db"
+            ]
+        ]
+    },
+    {
+        "id": "31d1d463daf030db",
+        "type": "debug",
+        "z": "9f249dae98e8a987",
+        "name": "status changes",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "status",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 420,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "2c9c3c143a40093b",
+        "type": "tls-config",
+        "name": "Kafka TLS (system CAs, verify server)",
+        "cert": "",
+        "key": "",
+        "ca": "",
+        "certname": "",
+        "keyname": "",
+        "caname": "",
+        "servername": "",
+        "verifyservercert": true,
+        "alpnprotocol": ""
+    },
+    {
+        "id": "5f2b09ba537fd57e",
+        "type": "kafkajs-nc-broker",
+        "name": "Secure Kafka (from env vars)",
+        "brokers": "${KAFKA_BROKERS}",
+        "clientId": "node-red",
+        "authMechanism": "scram-sha-512",
+        "tls": true,
+        "tlsConfig": "2c9c3c143a40093b",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true,
+        "credentials": {
+            "username": "${KAFKA_USER}",
+            "password": "${KAFKA_PASSWORD}"
+        }
+    }
+]

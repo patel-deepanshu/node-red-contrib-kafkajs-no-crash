@@ -1,0 +1,516 @@
+<style>
+    .kafkajs-nc-consumer-form .form-row > label { width: 150px; }
+    .kafkajs-nc-consumer-form .form-row > label.kafkajs-nc-check { width: auto; margin-left: 154px; }
+    .kafkajs-nc-consumer-form .form-row > label.kafkajs-nc-check input { width: auto; margin: 0 6px 3px 0; vertical-align: middle; }
+    .kafkajs-nc-consumer-form .kafkajs-nc-unit { margin-left: 6px; color: var(--red-ui-secondary-text-color, #777); }
+    .kafkajs-nc-consumer-form .kafkajs-nc-section {
+        margin: 16px 0 10px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--red-ui-secondary-border-color, #ddd);
+        font-weight: bold;
+        color: var(--red-ui-primary-text-color, #555);
+    }
+    .kafkajs-nc-consumer-form .kafkajs-nc-section:first-child { margin-top: 4px; }
+    .kafkajs-nc-consumer-form .form-tips { margin-bottom: 12px; }
+    .kafkajs-nc-consumer-form .kafkajs-nc-help { margin-left: 4px; color: var(--red-ui-secondary-text-color, #999); cursor: help; }
+</style>
+
+<script type="text/html" data-template-name="kafkajs-nc-consumer">
+    <div class="kafkajs-nc-consumer-form">
+        <div class="form-row">
+            <label for="node-input-broker"><i class="fa fa-server"></i> Broker</label>
+            <input type="text" id="node-input-broker" style="width: calc(100% - 160px);">
+        </div>
+        <div class="form-row">
+            <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+            <input type="text" id="node-input-name" placeholder="Name" style="width: calc(100% - 160px);">
+        </div>
+        <div class="form-row">
+            <ul style="min-width: 500px; margin-bottom: 20px;" id="node-input-kafkajs-nc-consumer-tabs"></ul>
+        </div>
+        <div id="node-input-kafkajs-nc-consumer-tabs-content" style="min-height: 250px;">
+
+            <!-- Subscription -->
+            <div id="kafkajs-nc-consumer-tab-subscription" style="display: none;">
+                <div class="form-row">
+                    <label for="node-input-topics"><i class="fa fa-tasks"></i> Topics</label>
+                    <input type="text" id="node-input-topics" placeholder="orders, payments" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-row">
+                    <label for="node-input-topicIsRegex" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-input-topicIsRegex">Topics is a regular expression (e.g. <code>^orders-.*</code>)
+                    </label>
+                </div>
+                <div class="form-tips kafkajs-nc-regex-tip">
+                    The expression is matched against the topics that exist when the consumer starts. Topics created
+                    later are only picked up after a restart (<code>msg.action = "restart"</code> or a redeploy).
+                </div>
+                <div class="form-row">
+                    <label for="node-input-groupId"><i class="fa fa-users"></i> Group ID</label>
+                    <input type="text" id="node-input-groupId" placeholder="node-red-&lt;node id&gt;" style="width: calc(100% - 160px);">
+                </div>
+                <div class="form-tips">
+                    Consumers with the same group ID share the partitions of the topics, and Kafka remembers how far
+                    the group has read. Leave it empty for a group of its own that stays the same across restarts and
+                    deploys (copying or importing the node creates a new one).
+                </div>
+                <div class="form-row">
+                    <label for="node-input-fromBeginning" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-input-fromBeginning">Read from the beginning when the group has no stored position
+                    </label>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-autoStart" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-input-autoStart">Start consuming on deploy (otherwise wait for <code>msg.action = "start"</code>)
+                    </label>
+                </div>
+            </div>
+
+            <!-- Output -->
+            <div id="kafkajs-nc-consumer-tab-output" style="display: none;">
+                <div class="form-row">
+                    <label for="node-input-payloadFormat"><i class="fa fa-file-text-o"></i> Payload</label>
+                    <select id="node-input-payloadFormat" style="width: calc(100% - 160px);">
+                        <option value="string">UTF-8 string</option>
+                        <option value="buffer">Buffer (binary, e.g. Avro or Protobuf)</option>
+                        <option value="json">Parsed JSON</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-keyFormat"><i class="fa fa-key"></i> Key</label>
+                    <select id="node-input-keyFormat" style="width: calc(100% - 160px);">
+                        <option value="string">UTF-8 string</option>
+                        <option value="buffer">Buffer</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-headersFormat"><i class="fa fa-list"></i> Header values</label>
+                    <select id="node-input-headersFormat" style="width: calc(100% - 160px);">
+                        <option value="string">UTF-8 strings</option>
+                        <option value="buffer">Buffers</option>
+                    </select>
+                </div>
+                <div class="form-tips">
+                    With <i>Parsed JSON</i>, a message that is not valid JSON is not sent: a <i>catch</i> node receives
+                    it with the raw text in <code>msg.payload</code>, and the consumer carries on with the next message.
+                </div>
+            </div>
+
+            <!-- Commit -->
+            <div id="kafkajs-nc-consumer-tab-commit" style="display: none;">
+                <div class="form-row">
+                    <label for="node-input-commitMode"><i class="fa fa-check-square-o"></i> Commit</label>
+                    <select id="node-input-commitMode" style="width: calc(100% - 160px);">
+                        <option value="auto">Automatically (after the hand-off to the flow)</option>
+                        <option value="manual">Manually with msg.action "commit" (after processing)</option>
+                    </select>
+                </div>
+                <div class="kafkajs-nc-commit-auto">
+                    <div class="form-row">
+                        <label for="node-input-autoCommitInterval"><i class="fa fa-clock-o"></i> Every</label>
+                        <input type="text" id="node-input-autoCommitInterval" placeholder="5000" style="width: 110px;"><span class="kafkajs-nc-unit">ms (0 = after every batch)</span>
+                    </div>
+                    <div class="form-row">
+                        <label for="node-input-autoCommitThreshold"><i class="fa fa-sort-numeric-asc"></i> Or every</label>
+                        <input type="text" id="node-input-autoCommitThreshold" placeholder="0" style="width: 110px;"><span class="kafkajs-nc-unit">messages (0 = off)</span>
+                    </div>
+                    <div class="form-tips">
+                        The position is stored when either limit is reached, and always at the end of each batch of
+                        messages fetched from Kafka. Messages handed to the flow since the last stored position are
+                        delivered again after a crash or restart; a message the flow was still processing when its
+                        position was stored is not.
+                    </div>
+                </div>
+                <div class="form-tips kafkajs-nc-commit-manual">
+                    Nothing is committed automatically. When a message has been processed, send it back to this node
+                    with <code>msg.action = "commit"</code> and this node's <code>msg.kafka</code> (a producer node
+                    replaces <code>msg.kafka</code>: keep a copy). Messages that were not committed are delivered again
+                    after a restart or a rebalance (at least once).
+                </div>
+            </div>
+
+            <!-- Advanced -->
+            <div id="kafkajs-nc-consumer-tab-advanced" style="display: none;">
+                <div class="kafkajs-nc-section"><i class="fa fa-heartbeat"></i> Group membership</div>
+                <div class="form-row">
+                    <label for="node-input-sessionTimeout">Session timeout</label>
+                    <input type="text" id="node-input-sessionTimeout" placeholder="30000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="A member that sends no heartbeat for this long is removed from the group and its partitions move to other members. The broker limits it (6 s to 30 min by default)."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-heartbeatInterval">Heartbeat interval</label>
+                    <input type="text" id="node-input-heartbeatInterval" placeholder="3000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Must be lower than the session timeout (about a third is usual). A value that is too high is replaced by a third of the session timeout, with a warning."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-rebalanceTimeout">Rebalance timeout</label>
+                    <input type="text" id="node-input-rebalanceTimeout" placeholder="60000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                </div>
+
+                <div class="kafkajs-nc-section"><i class="fa fa-download"></i> Fetching</div>
+                <div class="form-row">
+                    <label for="node-input-maxBytesPerPartition">Max per partition</label>
+                    <input type="text" id="node-input-maxBytesPerPartition" placeholder="1048576" style="width: 110px;"><span class="kafkajs-nc-unit">bytes per fetch</span>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-maxBytes">Max per fetch</label>
+                    <input type="text" id="node-input-maxBytes" placeholder="10485760" style="width: 110px;"><span class="kafkajs-nc-unit">bytes</span>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-maxWaitTimeInMs">Max wait</label>
+                    <input type="text" id="node-input-maxWaitTimeInMs" placeholder="1000" style="width: 110px;"><span class="kafkajs-nc-unit">ms</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="How long the broker may hold a fetch request while there is no new data. Stopping the node (deploy) waits for that request, so keep it short."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-partitionsConsumedConcurrently">Concurrency</label>
+                    <input type="text" id="node-input-partitionsConsumedConcurrently" placeholder="1" style="width: 110px;"><span class="kafkajs-nc-unit">partitions at a time (1 - 100)</span>
+                    <i class="fa fa-question-circle kafkajs-nc-help" data-tip="Messages of one partition always arrive in order. With more than 1, messages of different partitions may be interleaved."></i>
+                </div>
+                <div class="form-row">
+                    <label for="node-input-allowAutoTopicCreation" class="kafkajs-nc-check">
+                        <input type="checkbox" id="node-input-allowAutoTopicCreation">Let the broker create missing topics (if the broker allows it)
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+</script>
+
+<script type="text/javascript">
+(function () {
+    'use strict';
+
+    // Node-RED replaces ${NAME} / $(NAME) only when it is the WHOLE value, without spaces
+    // (@node-red/runtime lib/flows/util.js); anything else stays literal at runtime.
+    var ENV_REF = /^(\$\{\S+\}|\$\(\S+\))$/;
+    var TOPIC_RE = /^[A-Za-z0-9._-]{1,249}$/;
+    var NOT_WHOLE = 'a ${NAME} reference is only replaced when it is the whole value, without spaces';
+
+    function isBlank(v) {
+        return v === undefined || v === null || String(v).trim() === '';
+    }
+
+    /**
+     * Number validator: blank means "use the default" and ${ENV} references are
+     * resolved at runtime, so both are valid. Returns a reason string on
+     * Node-RED >= 3.1 (which passes `opt`), else a boolean.
+     */
+    function numberRange(min, max) {
+        return function (v, opt) {
+            if (isBlank(v) || ENV_REF.test(String(v))) {
+                return true;
+            }
+            var n = Number(v);
+            if (isFinite(n) && n >= min && n <= max && Math.floor(n) === n) {
+                return true;
+            }
+            return opt ? 'must be a whole number from ' + min + ' to ' + max : false;
+        };
+    }
+
+    /** The live checkbox while the dialog is open, else the saved value. */
+    function isRegex(node) {
+        var box = $('#node-input-topicIsRegex');
+        return box.length ? box.is(':checked') : node.topicIsRegex === true || node.topicIsRegex === 'true';
+    }
+
+    /** Required; a list of valid topic names, or one valid regular expression. */
+    function validTopics(v, opt) {
+        if (isBlank(v)) {
+            return opt ? 'at least one topic is required' : false;
+        }
+        if (ENV_REF.test(String(v))) {
+            return true;
+        }
+        var text = String(v).trim();
+        if (ENV_REF.test(text)) {
+            return opt ? NOT_WHOLE : false; // spaces around it
+        }
+        if (isRegex(this)) {
+            try {
+                var literal = /^\/([\s\S]+)\/([a-z]*)$/.exec(text);
+                if (literal) {
+                    new RegExp(literal[1], literal[2].replace(/[gy]/g, ''));
+                } else {
+                    new RegExp(text);
+                }
+                return true;
+            } catch (err) {
+                return opt ? 'invalid regular expression: ' + err.message : false;
+            }
+        }
+        if (text.indexOf('${') !== -1) {
+            return opt ? NOT_WHOLE : false; // e.g. "orders, ${MORE}": stays literal at runtime
+        }
+        var names = text.split(/[\s,]+/);
+        for (var i = 0; i < names.length; i++) {
+            var name = names[i];
+            if (name !== '' && (!TOPIC_RE.test(name) || name === '.' || name === '..')) {
+                return opt ? 'invalid topic name "' + name + '" (letters, digits, ".", "_" and "-", at most 249)' : false;
+            }
+        }
+        return true;
+    }
+
+    RED.nodes.registerType('kafkajs-nc-consumer', {
+        category: 'kafka',
+        color: '#c7d8e6',
+        icon: 'kafka.svg',
+        paletteLabel: 'kafka consumer',
+        inputs: 1,
+        outputs: 1,
+        inputLabels: 'control (msg.action)',
+        outputLabels: ['Kafka messages'],
+        defaults: {
+            name: { value: '' },
+            broker: { value: '', type: 'kafkajs-nc-broker', required: true, label: 'Broker' },
+            topics: { value: '', label: 'Topics', validate: validTopics },
+            topicIsRegex: { value: false },
+            groupId: { value: '' },
+            fromBeginning: { value: false },
+            autoStart: { value: true },
+            payloadFormat: { value: 'string' },
+            keyFormat: { value: 'string' },
+            headersFormat: { value: 'string' },
+            commitMode: { value: 'auto' },
+            autoCommitInterval: { value: 5000, label: 'Commit interval', validate: numberRange(0, 86400000) },
+            autoCommitThreshold: { value: 0, label: 'Commit threshold', validate: numberRange(0, 1000000000) },
+            sessionTimeout: { value: 30000, label: 'Session timeout', validate: numberRange(1000, 3600000) },
+            heartbeatInterval: { value: 3000, label: 'Heartbeat interval', validate: numberRange(100, 3600000) },
+            rebalanceTimeout: { value: 60000, label: 'Rebalance timeout', validate: numberRange(1000, 3600000) },
+            maxBytesPerPartition: { value: 1048576, label: 'Max bytes per partition', validate: numberRange(1, 2147483647) },
+            maxBytes: { value: 10485760, label: 'Max bytes per fetch', validate: numberRange(1, 2147483647) },
+            maxWaitTimeInMs: { value: 1000, label: 'Max wait', validate: numberRange(0, 300000) },
+            partitionsConsumedConcurrently: { value: 1, label: 'Concurrency', validate: numberRange(1, 100) },
+            allowAutoTopicCreation: { value: false }
+        },
+        label: function () {
+            return this.name || (this.topics ? 'kafka: ' + this.topics : 'kafka consumer');
+        },
+        labelStyle: function () {
+            return this.name ? 'node_label_italic' : '';
+        },
+        oneditprepare: function () {
+            var node = this;
+            var tabs = RED.tabs.create({
+                id: 'node-input-kafkajs-nc-consumer-tabs',
+                onchange: function (tab) {
+                    $('#node-input-kafkajs-nc-consumer-tabs-content').children().hide();
+                    $('#' + tab.id).show();
+                }
+            });
+            tabs.addTab({ id: 'kafkajs-nc-consumer-tab-subscription', label: 'Subscription' });
+            tabs.addTab({ id: 'kafkajs-nc-consumer-tab-output', label: 'Output' });
+            tabs.addTab({ id: 'kafkajs-nc-consumer-tab-commit', label: 'Commit' });
+            tabs.addTab({ id: 'kafkajs-nc-consumer-tab-advanced', label: 'Advanced' });
+            setTimeout(function () {
+                tabs.resize();
+            }, 0);
+
+            // Older or hand-written flows may lack these properties: show the runtime defaults.
+            var fallbacks = { payloadFormat: 'string', keyFormat: 'string', headersFormat: 'string', commitMode: 'auto' };
+            Object.keys(fallbacks).forEach(function (prop) {
+                if (isBlank(node[prop])) {
+                    $('#node-input-' + prop).val(fallbacks[prop]);
+                }
+            });
+            if (node.autoStart === undefined) {
+                $('#node-input-autoStart').prop('checked', true);
+            }
+
+            // The runtime default group id is stable: show exactly what will be used. Inside a subflow the
+            // runtime node id is "<subflow instance id>-<node id>", so every instance has its own group.
+            var groupPlaceholder = 'node-red-' + String(node.id).replace(/[^A-Za-z0-9._-]/g, '_');
+            if (node.z && RED.nodes.subflow && RED.nodes.subflow(node.z)) {
+                groupPlaceholder = 'node-red-<subflow instance id>-' + String(node.id).replace(/[^A-Za-z0-9._-]/g, '_') +
+                    ' (one group per subflow instance)';
+            }
+            $('#node-input-groupId').attr('placeholder', groupPlaceholder);
+
+            function updateCommitSections() {
+                var manual = $('#node-input-commitMode').val() === 'manual';
+                $('.kafkajs-nc-commit-auto').toggle(!manual);
+                $('.kafkajs-nc-commit-manual').toggle(manual);
+            }
+            function updateTopicHints() {
+                var regex = $('#node-input-topicIsRegex').is(':checked');
+                $('.kafkajs-nc-regex-tip').toggle(regex);
+                $('#node-input-topics').attr('placeholder', regex ? '^orders-.*' : 'orders, payments');
+                // the topics validator depends on the checkbox
+                $('#node-input-topics').trigger('change');
+            }
+            $('#node-input-commitMode').on('change', updateCommitSections);
+            $('#node-input-topicIsRegex').on('change', updateTopicHints);
+            updateCommitSections();
+            updateTopicHints();
+
+            if (RED.popover && typeof RED.popover.tooltip === 'function') {
+                $('.kafkajs-nc-consumer-form .kafkajs-nc-help').each(function () {
+                    RED.popover.tooltip($(this), $(this).attr('data-tip'));
+                });
+            } else {
+                $('.kafkajs-nc-consumer-form .kafkajs-nc-help').each(function () {
+                    $(this).attr('title', $(this).attr('data-tip'));
+                });
+            }
+        }
+    });
+})();
+</script>
+
+<script type="text/markdown" data-help-name="kafkajs-nc-consumer">
+Reads messages from Kafka topics and sends one message per Kafka record. Reconnects on its own after any failure and never crashes Node-RED.
+
+### Inputs
+
+The input only takes control messages:
+
+: action (string) : `pause`, `resume`, `stop`, `start`, `restart`, `seek` or `commit` (see *Control messages*). Any other value, or none, is an error.
+: *payload* (object) : for `seek`, the object `{ topic, partition, offset }`.
+: *kafka* (object) : for `commit`, the `msg.kafka` this node set on the processed message (its `groupId` must be this node's group). A producer node replaces `msg.kafka` with its delivery report, see *Commit modes*.
+
+### Outputs
+
+: payload (string | buffer | object | null) : the message value, as a UTF-8 string, a Buffer or parsed JSON (see *Output*). `null` for a *tombstone* (a record without value, used to delete a key on compacted topics).
+: topic (string) : the topic.
+: key (string | buffer | null) : the message key, or `null` when it has none.
+: partition (number) : the partition.
+: offset (string) : the offset of the message in its partition. A string, because offsets can exceed JavaScript's safe integers.
+: timestamp (number) : the Kafka timestamp in milliseconds since the epoch.
+: headers (object) : the Kafka headers as an object of name → value. Values are strings (or Buffers when *Header values* is *Buffers*); a header sent several times is an array; a header without value is `null`.
+: kafka (object) : `{ groupId, topic, partition, offset, timestamp, highWatermark }`. `highWatermark` (string) is the offset after the last message in the partition when the batch was fetched, so `highWatermark - offset - 1` is roughly how many messages are still waiting. Keep `msg.kafka` if you commit manually (a producer node replaces it with its delivery report).
+
+### Details
+
+#### Subscription
+
+**Topics** is a list separated by commas or spaces, for example `orders, payments`. With *Topics is a regular
+expression* it is one JavaScript regular expression instead, either plain (`^orders-.*`) or in slashes with flags
+(`/^orders-.*$/i`; the `g` and `y` flags are ignored). **Note:** the expression is matched against the topics that
+exist when the consumer starts. A matching topic created later is only consumed after a restart (send
+`msg.action = "restart"`, redeploy, or wait for the next reconnect).
+
+The **Group ID** decides which consumers share the work and where Kafka stores how far the group has read (its
+*committed offsets*). Every consumer with the same group ID gets a share of the partitions; give two nodes different
+group IDs if both should receive every message. When empty, the group ID is `node-red-<node id>`: it stays the same
+across restarts and deploys, so the node continues where it stopped. Copying or importing the node gives it a new id
+and therefore a new group that starts from scratch; set a Group ID if you need it to survive that. Inside a subflow
+the node id is `<subflow instance id>-<node id>`, so every instance of the subflow has a group of its own.
+
+*Read from the beginning* only applies when the group has no committed position for a partition (a new group):
+it then starts with the oldest message instead of only new ones. It does not rewind an existing group; use `seek`
+or the admin node (`resetOffsets`) for that.
+
+Any setting can be `${NAME}` to read an environment variable, for example a Topics value of `${KAFKA_TOPICS}`.
+Node-RED only replaces it when it is the whole value, without spaces: `orders, ${MORE}` stays as it is, and the node
+reports it.
+
+#### Commit modes and delivery guarantee
+
+Kafka remembers, per group and partition, the offset of the next message to read. When that is stored decides what
+happens if Node-RED stops while messages are being processed:
+
+- **Automatically** (default): the position is stored every *Every* ms (default 5 s), every *Or every* messages,
+  and at the end of each fetched batch, once the messages were handed to the flow. The messages handed to the flow
+  since the last stored position (at most the last fetched batch) are delivered **again** after a
+  crash or restart: *at least once* into the flow, with possible duplicates. The position does not wait for the
+  flow to finish a message, so a message the flow was still processing when its position was stored is not
+  delivered again. Usually fine for telemetry; use manual commits when every message must be fully processed.
+- **Manually**: nothing is stored until you send `msg.action = "commit"` with the message's `msg.kafka`: send the
+  processed message itself back to this node's input. The committed position is that message's offset + 1.
+  Messages that were not committed are delivered **again** after a restart, a reconnect or a rebalance: *at least
+  once*. Downstream processing should tolerate duplicates. Committing a message commits every earlier message of
+  the same partition too.
+
+`msg.kafka` must be the one this node set on its output message: the commit is refused when its `groupId` is not
+this node's group or its topic is not one this node subscribes to. **A producer node replaces `msg.kafka`** with
+its delivery report (the topic, partition and offset it wrote to). In a *consume → produce → commit* flow, keep a
+copy before the producer and put it back before the commit, for example with *change* nodes: set `msg.consumed` to
+`msg.kafka` before the producer, then move `msg.consumed` to `msg.kafka` and set `msg.action` to `commit`.
+
+#### Pause, stop and order
+
+Messages of one partition arrive in order. With *Concurrency* above 1, messages of different partitions may be
+interleaved. The node hands each message to the flow and immediately goes on with the next one; use `pause` and
+`resume` to slow it down (for example from a *queue length* check further down the flow).
+
+`pause` takes effect after the message being delivered: messages already handed to the flow are not taken back. A
+pause sent before the consumer has joined its group is remembered and applied as soon as it joins, and it is
+re-applied after every reconnect and rebalance (kafkajs itself forgets pauses on a restart).
+
+#### Compression
+
+Messages compressed with **gzip**, **snappy** or **lz4** are decoded. **zstd is not supported**: a topic containing
+zstd-compressed messages makes the consumer fail with *compression codec missing*; it then retries slowly and the
+log explains the reason.
+
+#### Errors and connection
+
+The node connects when it is deployed and reconnects on its own after any failure, waiting longer after each failed
+attempt (settings of the broker node). It always creates a fresh Kafka client, so a consumer that was stopped can
+never come back as a hidden extra group member. Authentication, authorisation (also for the topic or the group)
+and configuration errors are retried slowly (*After auth/config errors* in the broker node). *group coordinator
+not found* is retried with the normal waits: Kafka reports a coordinator that is not available yet (brokers
+starting or recovering) and a missing permission for the group the same way. The first failure is logged as an
+error (as a warning for a missing topic, which is usually temporary); repeats are logged at debug level, with a
+warning every 10th attempt. Use a *status* node to react to connection changes.
+
+A message that cannot be turned into an output message (for example invalid JSON with *Parsed JSON*) is reported to
+*catch* nodes with `msg.payload` as text and is skipped; the consumer carries on. Control messages that fail
+(unknown action, `seek` while not connected, an invalid offset...) are also reported to *catch* nodes.
+
+#### Status
+
+- `connecting…` / `joining group…` (yellow): starting.
+- `connected · orders, payments` (green): consuming.
+- `connected · no partitions` (yellow dot): in the group, but no partition is assigned to this node. With a regular
+  expression this usually means it matches no topic (see the warning in the log); with a topic list, other members
+  of the group have all partitions.
+- `paused · orders` (yellow dot): paused with `msg.action = "pause"`.
+- `rebalancing…` (yellow): the group is redistributing the partitions.
+- `ECONNREFUSED broker:9092 · retry 8s` (yellow): Kafka cannot be reached; the next attempt is in 8 s.
+- `unknown topic/partition · retry 2s` (yellow): a subscribed topic does not exist (yet). The node keeps retrying
+  and starts consuming at the next retry once the topic exists (the waits grow up to the broker's *max* reconnect
+  delay).
+- `group coordinator not found · retry 2s` (yellow): the group's coordinator is not available (yet), or the user
+  may not use the group.
+- `auth failed · retry 60s` (red): wrong user name or password. Other problems that need a human show their
+  reason instead, for example `TLS: self-signed cert · retry 60s` or `not authorized (group) · retry 60s`.
+- `stopped` (grey): stopped with `msg.action = "stop"`, or *Start consuming on deploy* is off.
+- `config error`, `no topic`, `invalid topic regex`, `no broker config` (red): fix the configuration (see the log)
+  and deploy again.
+
+#### Control messages
+
+Send a message with `msg.action` set to:
+
+- `pause` / `resume`: stop fetching / continue fetching all subscribed topics. The group membership is kept.
+- `stop`: leave the group and disconnect; no reconnect until `start`. `start` starts a stopped consumer.
+- `restart`: disconnect and connect again now (also picks up new topics matching a regular expression).
+- `seek`: continue reading a partition from another offset: `msg.payload = { topic, partition, offset }`. `topic` may
+  be left out when the node subscribes to a single topic; `offset` is a number, `"earliest"` (the oldest message
+  still stored) or `"latest"` (only new messages). The node looks up the partition's current offsets with a short
+  admin connection first: `"earliest"` and `"latest"` become those offsets, and a number outside them is refused
+  (Kafka would otherwise jump to its default position and store it, even with manual commits). Only works while
+  connected and not rebalancing, for a partition assigned to this consumer (see the error for the assigned ones).
+  With *Automatically* the new position is stored at once; with *Manually* only when you commit.
+- `commit`: store the position after a processed message: `msg.kafka` as this node set it on the output message
+  (see *Commit modes*); `msg.topic`, `msg.partition` and `msg.offset` are used when `msg.kafka` is missing. It fails
+  when the consumer stopped before Kafka stored the position.
+
+Every control message completes with `done()`, so a *complete* node can follow it; a failing one goes to *catch*
+nodes. The control messages are not sent to the output.
+
+#### Example
+
+Process at least once: this node (Commit: *Manually*) → a *function* node that does the work → a *link* back to
+this node's input with `msg.action = "commit"` set by a *change* node. A *catch* node on the function node can log
+failures; the uncommitted message is then delivered again after the next restart. With a producer node in the
+path, keep a copy of `msg.kafka` before it (see *Commit modes*).
+
+### References
+
+- [kafkajs consumer documentation](https://kafka.js.org/docs/consuming)
+- [Kafka consumer groups and offsets](https://kafka.apache.org/documentation/#intro_consumers)
+- [Project README and issue tracker](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash)
+</script>

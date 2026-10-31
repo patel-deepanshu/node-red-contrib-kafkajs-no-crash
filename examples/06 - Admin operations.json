@@ -1,0 +1,439 @@
+[
+    {
+        "id": "b005473b6ffd742d",
+        "type": "tab",
+        "label": "Kafka 06: admin operations",
+        "disabled": false,
+        "info": "Create and delete topics, read topic and consumer group offsets, list and describe consumer groups and look at the cluster with the **kafka admin** node.",
+        "env": []
+    },
+    {
+        "id": "77798cb46f00729a",
+        "type": "comment",
+        "z": "b005473b6ffd742d",
+        "name": "Example 06: admin operations - select me and open the Info sidebar",
+        "info": "## Admin operations\n\nThe **kafka admin** node runs one Kafka admin operation per input message. Here its *Action* is *set by msg.action*, so every button sets `msg.action` and the parameters in `msg.payload`. You can also pick a fixed action in the node (example 01 does that for *Create topics*).\n\n**Before you deploy:** the example connects to a Kafka broker on `localhost:9092`. If yours runs elsewhere, double-click any Kafka node, click the pencil next to **Broker** (the configuration node *Local Kafka (example 06)*) and change **Brokers**. Then click **Deploy**.\n\nThe result is in `msg.payload`, and `msg.kafka = { action, durationMs }`. A failing action (for example creating a topic with more replicas than there are brokers) goes to the *catch* node together with the original message; the next message is processed normally. Messages are handled one after another.\n\n### The buttons\n\n| Button | msg.action | msg.payload |\n|---|---|---|\n| create topic | `createTopics` | `{\"topics\": [{\"topic\": \"example-admin\", \"numPartitions\": 3, \"replicationFactor\": 1, \"configEntries\": {\"retention.ms\": \"86400000\"}}]}` |\n| list topics | `listTopics` | none |\n| topic metadata | `fetchTopicMetadata` | `{\"topics\": [\"example-admin\"]}` |\n| topic offsets | `fetchTopicOffsets` | `\"example-admin\"` |\n| list groups | `listGroups` | none |\n| describe group | `describeGroups` | `{\"groupIds\": [\"example-basics-reader\"]}` |\n| group offsets | `fetchOffsets` | `{\"groupId\": \"example-basics-reader\", \"topics\": [\"example-basics\"]}` |\n| reset group to earliest | `resetOffsets` | `{\"groupId\": \"example-basics-reader\", \"topic\": \"example-basics\", \"earliest\": true}` |\n| describe cluster | `describeCluster` | none |\n| delete topic | `deleteTopics` | `\"example-admin\"` |\n\n`replicationFactor: 1` suits a single-broker test cluster; production clusters usually want 3. The group buttons use the consumer group of example 01 (`example-basics-reader`): run example 01 first or change the group id in the inject node.\n\n**resetOffsets** (and *setOffsets*, *deleteGroups*) only work while the group has **no running consumers**. Stop the consumer of example 01 first (for example: disable it and deploy); otherwise the catch node reports the error. Without `earliest: true` the group moves to the latest offset (skips everything not yet read). The node stores the real offsets, so the consumer starts exactly there, whatever its *Read from the beginning* setting. Changing a group's offsets takes about 5 s.\n\nThe help of the admin node (*Help* sidebar) lists every action and its parameters.",
+        "x": 320,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "f7a94a12abc438ce",
+        "type": "comment",
+        "z": "b005473b6ffd742d",
+        "name": "Topics",
+        "info": "Create, inspect and delete the topic `example-admin`.",
+        "x": 110,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "67edbcdd23b668b6",
+        "type": "comment",
+        "z": "b005473b6ffd742d",
+        "name": "Consumer groups",
+        "info": "Uses the group `example-basics-reader` of example 01.",
+        "x": 150,
+        "y": 380,
+        "wires": []
+    },
+    {
+        "id": "bd58ba082dd79890",
+        "type": "comment",
+        "z": "b005473b6ffd742d",
+        "name": "Cluster",
+        "info": "",
+        "x": 110,
+        "y": 580,
+        "wires": []
+    },
+    {
+        "id": "1ca10eabbb0735aa",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "create topic",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "createTopics",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"topics\":[{\"topic\":\"example-admin\",\"numPartitions\":3,\"replicationFactor\":1,\"configEntries\":{\"retention.ms\":\"86400000\"}}]}",
+        "payloadType": "json",
+        "x": 130,
+        "y": 140,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "37848548a422aaa9",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "list topics",
+        "props": [
+            {
+                "p": "action",
+                "v": "listTopics",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 120,
+        "y": 180,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "d5cb313a7c229453",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "topic metadata",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "fetchTopicMetadata",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"topics\":[\"example-admin\"]}",
+        "payloadType": "json",
+        "x": 140,
+        "y": 220,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "c3f2daaa4e34fa88",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "topic offsets",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "fetchTopicOffsets",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "example-admin",
+        "payloadType": "str",
+        "x": 130,
+        "y": 260,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "1c3f8f2400ff3069",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "list groups",
+        "props": [
+            {
+                "p": "action",
+                "v": "listGroups",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 120,
+        "y": 420,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "0d74ab008ed8c1b8",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "describe group",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "describeGroups",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"groupIds\":[\"example-basics-reader\"]}",
+        "payloadType": "json",
+        "x": 140,
+        "y": 460,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "233f7cf8b14a1420",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "group offsets",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "fetchOffsets",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"groupId\":\"example-basics-reader\",\"topics\":[\"example-basics\"]}",
+        "payloadType": "json",
+        "x": 130,
+        "y": 500,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "b69d7f4d6e454d34",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "reset group to earliest",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "resetOffsets",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "{\"groupId\":\"example-basics-reader\",\"topic\":\"example-basics\",\"earliest\":true}",
+        "payloadType": "json",
+        "x": 160,
+        "y": 540,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "ee2721a3f847db94",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "describe cluster",
+        "props": [
+            {
+                "p": "action",
+                "v": "describeCluster",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 140,
+        "y": 620,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "86d9baaeceb37587",
+        "type": "inject",
+        "z": "b005473b6ffd742d",
+        "name": "delete topic",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "action",
+                "v": "deleteTopics",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "example-admin",
+        "payloadType": "str",
+        "x": 130,
+        "y": 300,
+        "wires": [
+            [
+                "42c34d222351562e"
+            ]
+        ]
+    },
+    {
+        "id": "42c34d222351562e",
+        "type": "kafkajs-nc-admin",
+        "z": "b005473b6ffd742d",
+        "name": "kafka admin (msg.action)",
+        "broker": "171098e7bc865e61",
+        "action": "",
+        "timeout": 30000,
+        "x": 440,
+        "y": 380,
+        "wires": [
+            [
+                "4cfac392c1ff50fd"
+            ]
+        ]
+    },
+    {
+        "id": "4cfac392c1ff50fd",
+        "type": "debug",
+        "z": "b005473b6ffd742d",
+        "name": "result",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 670,
+        "y": 380,
+        "wires": []
+    },
+    {
+        "id": "44d46182e49ed19f",
+        "type": "comment",
+        "z": "b005473b6ffd742d",
+        "name": "Failed actions",
+        "info": "The catch node only listens to the admin node. `msg.error.message` explains what went wrong.",
+        "x": 400,
+        "y": 460,
+        "wires": []
+    },
+    {
+        "id": "d321f554a462ddc2",
+        "type": "catch",
+        "z": "b005473b6ffd742d",
+        "name": "admin errors",
+        "scope": [
+            "42c34d222351562e"
+        ],
+        "uncaught": false,
+        "x": 390,
+        "y": 500,
+        "wires": [
+            [
+                "24e0f560635848af"
+            ]
+        ]
+    },
+    {
+        "id": "24e0f560635848af",
+        "type": "debug",
+        "z": "b005473b6ffd742d",
+        "name": "admin error",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "error",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 690,
+        "y": 500,
+        "wires": []
+    },
+    {
+        "id": "171098e7bc865e61",
+        "type": "kafkajs-nc-broker",
+        "name": "Local Kafka (example 06)",
+        "brokers": "localhost:9092",
+        "clientId": "node-red",
+        "authMechanism": "none",
+        "tls": false,
+        "tlsConfig": "",
+        "connectionTimeout": 10000,
+        "authenticationTimeout": 10000,
+        "requestTimeout": 30000,
+        "retries": 5,
+        "initialRetryTime": 300,
+        "maxRetryTime": 30000,
+        "reconnectMin": 1000,
+        "reconnectMax": 60000,
+        "authRetryMin": 60000,
+        "logLevel": "warn",
+        "safetyNet": true
+    }
+]

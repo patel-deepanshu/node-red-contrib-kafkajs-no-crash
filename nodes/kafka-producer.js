@@ -1,0 +1,2707 @@
+'use strict';
+
+/**
+ * kafkajs-nc-producer: sends messages to Kafka and does not lose them while
+ * Kafka is unreachable ("store-and-forward").
+ *
+ * How a message travels (the user-facing description is the help text in
+ * kafka-producer.html):
+ *
+ *   input ─► build the Kafka message(s) synchronously
+ *       │      invalid content ⇒ done(err); such a message is never queued
+ *       ├─ "live" mode (connected and the offline queue is empty):
+ *       │      in-memory pending list, ONE produce request in flight at a time
+ *       │      ⇒ delivery report + done(). A connection-level failure moves the
+ *       │      failed batch and everything behind it to the offline queue (in
+ *       │      order) and reconnects.
+ *       └─ "backlog" mode (not connected, or older messages still queued):
+ *              append to the offline queue (disk or memory) ⇒ "queued" report +
+ *              done(). Once connected, the flusher sends the queue oldest-first
+ *              and switches back to live mode when it is empty, so the overall
+ *              order of messages is kept.
+ *
+ * Crash safety (docs/ARCHITECTURE.md, Design goals): the input and close handlers are not async, every
+ * promise has a rejection handler, kafkajs listeners go through safeOn(),
+ * every connect attempt carries a generation number (a connect that completes
+ * after a redeploy is disconnected instead of becoming a zombie client), and
+ * the close handler always calls done() within 10 s.
+ *
+ * Retries: kafkajs' own produce retry is off (`retry: { retries: 0 }`). In
+ * kafkajs 2.2.4 a retried send can resolve without having written the
+ * partitions whose leader moved to a broker that had already answered, and
+ * nothing reports it (LOSS-1). The node retries instead, always with the
+ * WHOLE batch (sendWithRetry): at worst a duplicate, never a silent loss.
+ * This includes a topic that the broker is still creating (auto-creation:
+ * UNKNOWN_TOPIC_OR_PARTITION for a moment) and a topic kafkajs has no
+ * metadata for yet, with a shorter backoff (sendRetryReason).
+ */
+
+const crypto = require('crypto');
+const fsp = require('fs').promises;
+const path = require('path');
+
+const { getKafkajs } = require('../lib/kafka-factory');
+const { Backoff } = require('../lib/backoff');
+const { StatusReporter, MAX_TEXT: STATUS_TEXT_MAX } = require('../lib/status');
+const { DiskQueue } = require('../lib/disk-queue');
+const { MemoryQueue } = require('../lib/memory-queue');
+const queueRegistry = require('../lib/queue-registry');
+const {
+    MessageError, ErrorKind, classifyError, describeError, shortMessage, problemText, connectionKind, topicKind, asConfigError
+} = require('../lib/errors');
+const serialize = require('../lib/serialize');
+const {
+    toInt, toNumber, toBool, safeOn, once, withTimeout, noop, sanitizeName, resolveDir, truncate, userDir, envProblem,
+    formatDelay: fmtDelay
+} = require('../lib/util');
+
+/**
+ * Timeouts in ms. Exported as `module.exports.TIMEOUTS` so that tests can
+ * shorten them; production code never changes them.
+ */
+const TIMEOUTS = {
+    /** close: wait this long for an in-flight produce request or flush batch */
+    closeSendWait: 5000,
+    /** bound for producer.disconnect() (kafkajs can take requestTimeout during a hang) */
+    disconnect: 3000,
+    /** close: bound for persisting unsent messages and for closing the queue */
+    closeQueue: 1500,
+    /** close: done() is called after this long whatever happens (Node-RED gives up after 15 s) */
+    closeTotal: 10000,
+    /**
+     * startup: wait this long for an older instance (redeploy) that is still
+     * closing the same queue directory; after that the node runs without the
+     * queue until that instance has finished (it never shares the directory)
+     */
+    previousClose: 12000,
+    /**
+     * live mode: when a produce request has been in flight this long, new
+     * messages go to the offline queue (durable) instead of piling up in memory
+     */
+    liveStall: 3000,
+    /** flusher: pause before peeking again when enqueued records are not written yet */
+    emptyPoll: 25,
+    /**
+     * pauses before sending a batch again after a retriable error
+     * (sendWithRetry): about 0.2 s, 0.6 s, then 1.6 s
+     */
+    sendRetryMin: 200,
+    sendRetryMax: 1600,
+    /**
+     * pauses before sending a batch again while its topic is being created
+     * (automatic topic creation) or kafkajs has no metadata for it yet
+     * (LIMITS.topicRetries): about 0.05, 0.1, 0.2, 0.4, 0.8 and 0.8 s. A broker
+     * typically creates a topic within 0.1 to 1 s.
+     */
+    topicRetryMin: 50,
+    topicRetryMax: 800,
+    /** sendWithRetry waits at most this long in total (all pauses of one batch together) */
+    sendRetryTotal: 5000,
+    /**
+     * kafkajs fetches a topic's metadata when a connection first uses the topic
+     * and then keeps it for metadataMaxAge (5 min). On a connection younger than
+     * this, a partition missing from the metadata really does not exist.
+     */
+    freshMetadata: 10000,
+    /**
+     * After fresh metadata showed that a topic lacks a particular partition, a
+     * message for that same partition fails at once for this long instead of
+     * reconnecting to fetch the metadata again. Other partitions of the topic
+     * are not affected, and a partition added meanwhile is used at the latest
+     * once this has passed.
+     */
+    missingPartition: 60000,
+    /**
+     * A topic that a send kept answering UNKNOWN_TOPIC_OR_PARTITION for although
+     * automatic topic creation is allowed (the cluster does not create topics)
+     * is not waited for again during this long: further messages for it fail
+     * (or are queued) at once instead of each waiting for the topic retries.
+     */
+    topicNotCreated: 60000,
+    /** after the queue opened: look for queue directories no running producer uses (LOSS-4) */
+    orphanScan: 10000
+};
+
+/**
+ * Limits. Exported as `module.exports.LIMITS` so that tests can lower them.
+ * maxPending: most messages kept in memory (live pending list, messages
+ * waiting for the queue to open); beyond it messages go to the offline queue.
+ * sendRetries: extra attempts of a produce request after a retriable error.
+ * topicRetries: extra attempts while the topic is being created or kafkajs has
+ * no metadata for it yet (counted separately from sendRetries).
+ */
+const LIMITS = {
+    maxPending: 10000,
+    sendRetries: 3,
+    topicRetries: 6
+};
+/** Entries kept by partitionMissing() (topic + partition) and sendWithRetry() (topic), per map; oldest forgotten first. */
+const TOPIC_MEMORY_MAX = 1000;
+/** A queued batch that keeps failing with an UNKNOWN error is treated as poison after this many attempts. */
+const UNKNOWN_LIMIT = 5;
+/** Version of the queue record format ({v, t, tf, ts, m}). */
+const RECORD_VERSION = 1;
+
+/** acks setting → Kafka acks. Explicit map: never `acks || x` (0 is a valid value: acks none). */
+const ACKS = new Map([['all', -1], ['leader', 1], ['none', 0], ['-1', -1], ['1', 1], ['0', 0]]);
+/** compression setting → kafkajs CompressionTypes key (and its numeric fallback). */
+const COMPRESSION = new Map([['none', ['None', 0]], ['gzip', ['GZIP', 1]], ['snappy', ['Snappy', 2]], ['lz4', ['LZ4', 3]]]);
+const QUEUE_MODES = new Set(['disk', 'memory', 'off']);
+/**
+ * msg.action values reserved for control messages (matched trimmed and
+ * case-insensitively, like the consumer and admin nodes). Any other
+ * msg.action is user data: the message is produced normally.
+ */
+const CONTROL_ACTIONS = new Set(['flush', 'reconnect', 'queue-status', 'queue-clear']);
+const TOPIC_RE = /^[A-Za-z0-9._-]{1,249}$/;
+const SEGMENT_FILE = /^seg-\d{16}\.jsonl$/;
+/** The orphan scan looks at no more than this many sub-directories (it must stay cheap). */
+const ORPHAN_SCAN_MAX = 1000;
+
+/**
+ * Unique ids for records written by switchToBacklog(), so that ackSentHead()
+ * can recognise exactly those records (two messages with the same content and
+ * timestamp would otherwise look identical).
+ */
+const FLIGHT_TOKEN = crypto.randomBytes(6).toString('hex');
+let flightSeq = 0;
+
+/**
+ * Node id → { dir, left }: a closing instance (not removed) left messages in
+ * its queue. If the next instance of that node uses another queue (Queue
+ * directory or name changed), it says where they are (LOSS-4).
+ */
+const leftBehind = new Map();
+/** Base directories with an orphan scan scheduled: one scan covers every producer started meanwhile. */
+const orphanScans = new Set();
+/** Queue directories already reported as orphaned: each one is reported once per process. */
+const reportedOrphans = new Set();
+
+// ---------------------------------------------------------------------------
+// configuration
+
+/** A config value as a string ('' for anything that is not a string or a finite number). */
+function text(v) {
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+    return '';
+}
+
+/**
+ * Why `topic` cannot be used as a Kafka topic name, or null when it can.
+ * Checking here means an invalid topic fails the message immediately instead
+ * of being queued and dead-lettered later.
+ */
+function topicProblem(topic, what) {
+    const env = envProblem(topic);
+    if (env) return `${what}: ${env}`;
+    if (!TOPIC_RE.test(topic) || topic === '.' || topic === '..') {
+        return `${what}: invalid Kafka topic name "${truncate(topic, 60)}" ` +
+            '(use 1-249 characters: letters, digits, ".", "_" and "-")';
+    }
+    return null;
+}
+
+/**
+ * The static headers of the node configuration. The editor saves an object
+ * { name: value | [values] }; an array of { key|name, value } pairs and a JSON
+ * string are accepted too (hand-written flows).
+ *
+ * @returns {{headers: (object|undefined), error: (string|null)}}
+ */
+function parseStaticHeaders(raw) {
+    try {
+        let h = raw;
+        if (h === undefined || h === null || h === '') return { headers: undefined, error: null };
+        if (typeof h === 'string') h = JSON.parse(h);
+        if (Array.isArray(h)) {
+            const obj = {};
+            for (const pair of h) {
+                if (!pair || typeof pair !== 'object') continue;
+                const name = text(pair.key !== undefined ? pair.key : pair.name);
+                if (name === '') continue;
+                const value = pair.value;
+                if (Object.prototype.hasOwnProperty.call(obj, name)) {
+                    obj[name] = [].concat(obj[name], value);
+                } else {
+                    Object.defineProperty(obj, name, { value, enumerable: true, writable: true, configurable: true });
+                }
+            }
+            h = obj;
+        }
+        const headers = serialize.toKafkaHeaders(h);
+        return { headers: headers && Object.keys(headers).length > 0 ? headers : undefined, error: null };
+    } catch (err) {
+        return { headers: undefined, error: `Invalid static headers setting: ${err && err.message}` };
+    }
+}
+
+/**
+ * Parse the node configuration (the editor saves strings). Never throws;
+ * problems that make every message fail are returned as `*Error` texts,
+ * harmless ones as `warnings`.
+ *
+ * @param {object} config node configuration
+ * @returns {object}
+ */
+function parseConfig(config) {
+    const c = config && typeof config === 'object' ? config : {};
+    const warnings = [];
+    const cfg = { warnings };
+
+    cfg.topic = text(c.topic).trim();
+    cfg.topicError = cfg.topic ? topicProblem(cfg.topic, 'Topic setting') : null;
+
+    // A key may legitimately contain spaces: only '' means "use msg.key".
+    cfg.key = text(c.key);
+    // only a whole-value ${VAR}: a key is free text that may contain '${'
+    const keyEnv = envProblem(cfg.key, { embedded: false });
+    cfg.keyError = keyEnv ? `Key setting: ${keyEnv}` : null;
+
+    const partition = text(c.partition).trim();
+    cfg.partition = undefined;
+    cfg.partitionError = null;
+    if (partition !== '') {
+        const env = envProblem(partition);
+        if (env) {
+            cfg.partitionError = `Partition setting: ${env}`;
+        } else {
+            try {
+                cfg.partition = serialize.toKafkaPartition(partition);
+            } catch (err) {
+                cfg.partitionError = `Partition setting: must be an integer >= 0 (got "${truncate(partition, 30)}")`;
+            }
+        }
+    }
+
+    const headers = parseStaticHeaders(c.headers);
+    cfg.headers = headers.headers;
+    cfg.headersError = headers.error;
+    cfg.useMsgHeaders = toBool(c.useMsgHeaders, true);
+
+    let acksName = text(c.acks).trim().toLowerCase();
+    if (acksName === '') acksName = 'all';
+    if (!ACKS.has(acksName)) {
+        warnings.push(`Unknown acks setting "${truncate(text(c.acks), 20)}": using "all"`);
+        acksName = 'all';
+    }
+    cfg.acks = ACKS.get(acksName);
+    cfg.ackTimeout = toInt(c.ackTimeout, 30000, { min: 100, max: 600000 });
+
+    let compression = text(c.compression).trim().toLowerCase();
+    if (compression === '') compression = 'none';
+    if (!COMPRESSION.has(compression)) {
+        warnings.push(`Unknown compression "${truncate(text(c.compression), 20)}": using none`);
+        compression = 'none';
+    }
+    cfg.compression = compression;
+    cfg.partitioner = text(c.partitioner).trim().toLowerCase() === 'legacy' ? 'legacy' : 'default';
+    // Removed in 1.0: kafkajs' idempotent mode needs its internal produce retry,
+    // which can lose messages (see the file header). Older flows still load.
+    if (toBool(c.idempotent, false)) {
+        warnings.push('The "Idempotent producer" option is no longer supported and is ignored (it needs kafkajs ' +
+            'retries that can lose messages); the node retries failed requests itself');
+    }
+    cfg.allowAutoTopicCreation = toBool(c.allowAutoTopicCreation, true);
+    cfg.batchSize = toInt(c.batchSize, 100, { min: 1, max: 10000 });
+
+    let mode = text(c.queueMode).trim().toLowerCase();
+    if (mode === '') mode = 'disk';
+    if (!QUEUE_MODES.has(mode)) {
+        warnings.push(`Unknown offline queue mode "${truncate(text(c.queueMode), 20)}": using disk`);
+        mode = 'disk';
+    }
+    const maxMB = toNumber(c.queueMaxMB, 100, { min: 0, max: 1024 * 1024 });
+    const maxAgeHours = toNumber(c.queueMaxAgeHours, 0, { min: 0, max: 24 * 365 * 100 });
+    cfg.queue = {
+        mode,
+        dir: text(c.queueDir).trim(),
+        name: text(c.queueName).trim(),
+        maxBytes: Math.round(maxMB * 1024 * 1024),
+        maxMessages: toInt(c.queueMaxMessages, 0, { min: 0 }),
+        overflow: text(c.queueOverflow).trim() === 'drop-newest' ? 'drop-newest' : 'drop-oldest',
+        maxAgeMs: Math.round(maxAgeHours * 3600 * 1000),
+        maxAgeHours,
+        fsync: toBool(c.queueFsync, true)
+    };
+    return cfg;
+}
+
+/**
+ * Why a Queue directory / Queue name value cannot be used, or null. A ${VAR}
+ * that Node-RED did not replace, also inside a longer path ('${HOME}/q'),
+ * would otherwise silently become a literal directory name under the user
+ * directory (PATH-2), and so would '~user/q'.
+ */
+function pathProblem(value, what) {
+    const env = envProblem(value);
+    if (env) return `${what}: ${env}`;
+    if (typeof value === 'string' && /^~[^/\\]/.test(value)) {
+        return `${what}: "${truncate(value, 30)}" is not expanded; use an absolute path`;
+    }
+    return null;
+}
+
+/**
+ * The offline queue directory: <root>/<queueName>, where root is the node's
+ * queueDir, else settings.kafkajsNcProducerQueueDir, else
+ * <userDir>/kafkajs-nc-queue (relative paths resolve against userDir) and
+ * queueName defaults to the node id.
+ *
+ * @returns {{dir: (string|null), error: (string|null)}}
+ */
+function queueDirFor(cfg, RED, nodeId) {
+    try {
+        let root = cfg.queue.dir;
+        let source = 'Queue directory setting';
+        if (root === '') {
+            let fromSettings = '';
+            try {
+                const s = RED && RED.settings && RED.settings.kafkajsNcProducerQueueDir;
+                fromSettings = typeof s === 'string' ? s.trim() : '';
+            } catch (_) {
+                fromSettings = '';
+            }
+            root = fromSettings || 'kafkajs-nc-queue';
+            source = 'settings.kafkajsNcProducerQueueDir';
+        }
+        const rootProblem = pathProblem(root, source);
+        if (rootProblem) return { dir: null, error: rootProblem };
+        const nameProblem = pathProblem(cfg.queue.name, 'Queue name setting');
+        if (nameProblem) return { dir: null, error: nameProblem };
+        const name = sanitizeName(cfg.queue.name !== '' ? cfg.queue.name : nodeId);
+        return { dir: path.join(resolveDir(root, userDir(RED)), name), error: null };
+    } catch (err) {
+        return { dir: null, error: `Cannot determine the queue directory: ${err && err.message}` };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// messages
+
+/** Rename 'msg.payload' etc. in a serializer error to the msg.messages element it is about. */
+function relabel(message, label) {
+    return String(message).replace(/^msg\.(payload|key|headers|partition|timestamp)/,
+        (all, field) => `${label}.${field === 'payload' ? 'value' : field}`);
+}
+
+function present(v) {
+    return v !== undefined && v !== null && v !== '';
+}
+
+/**
+ * Build one Kafka message from `src` (the msg itself, or an element of
+ * msg.messages when index >= 0). Node settings win over message values.
+ *
+ * @returns {{topic: string, tf: number, message: object}} tf = 1 when the topic came from the message
+ */
+function buildEntry(msg, src, index, cfg, receivedAt) {
+    const label = index < 0 ? 'msg' : `msg.messages[${index}]`;
+    if (index >= 0 && (src === null || typeof src !== 'object' || Array.isArray(src))) {
+        throw new MessageError(`${label} must be an object like { value, key, headers, partition, timestamp, topic }`);
+    }
+    try {
+        let topic;
+        let tf;
+        if (cfg.topic) {
+            topic = cfg.topic;
+            tf = 0;
+        } else {
+            const own = index >= 0 ? src.topic : undefined;
+            const raw = present(own) ? own : msg.topic;
+            const where = present(own) ? `${label}.topic` : 'msg.topic';
+            if (!present(raw)) {
+                throw new MessageError(index < 0
+                    ? 'No topic: set the node Topic or msg.topic'
+                    : `No topic for ${label}: set the node Topic, ${label}.topic or msg.topic`);
+            }
+            if (typeof raw !== 'string') throw new MessageError(`${where} must be a string`);
+            const problem = topicProblem(raw, where);
+            if (problem) throw new MessageError(problem);
+            topic = raw;
+            tf = 1;
+        }
+
+        // elements may use `payload` instead of `value` (a common slip)
+        const rawValue = index < 0 ? src.payload : (src.value !== undefined ? src.value : src.payload);
+        if (index >= 0 && rawValue === undefined) throw new MessageError(`${label}.value is undefined`);
+        const value = serialize.toKafkaValue(rawValue);
+        const key = cfg.key !== '' ? cfg.key : serialize.toKafkaKey(src.key);
+        const partition = cfg.partition !== undefined ? cfg.partition : serialize.toKafkaPartition(src.partition);
+        const msgHeaders = cfg.useMsgHeaders ? serialize.toKafkaHeaders(src.headers) : undefined;
+        const headers = msgHeaders || cfg.headers ? { ...(msgHeaders || {}), ...(cfg.headers || {}) } : undefined;
+        // Without a timestamp kafkajs would use the SEND time; a message delivered
+        // from the offline queue hours later must keep the time it was produced.
+        let timestamp = serialize.toKafkaTimestamp(src.timestamp);
+        if (timestamp === undefined) timestamp = String(receivedAt);
+
+        const message = { value };
+        if (key !== null && key !== undefined) message.key = key;
+        if (headers && Object.keys(headers).length > 0) message.headers = headers;
+        if (partition !== undefined) message.partition = partition;
+        message.timestamp = timestamp;
+        return { topic, tf, message };
+    } catch (err) {
+        if (index >= 0 && err instanceof MessageError) throw new MessageError(relabel(err.message, label));
+        throw err;
+    }
+}
+
+/**
+ * Build the Kafka messages of an input msg: msg.messages (array) or the single
+ * message described by msg.payload/key/headers/partition/timestamp/topic.
+ * Throws MessageError for invalid content.
+ *
+ * @returns {Array<{topic: string, tf: number, message: object}>}
+ */
+function buildEntries(msg, cfg, receivedAt) {
+    if (cfg.topicError) throw new MessageError(cfg.topicError);
+    if (cfg.keyError) throw new MessageError(cfg.keyError);
+    if (cfg.partitionError) throw new MessageError(cfg.partitionError);
+    if (cfg.headersError) throw new MessageError(cfg.headersError);
+    if (Array.isArray(msg.messages)) {
+        if (msg.messages.length === 0) throw new MessageError('msg.messages is an empty array: nothing to send');
+        return msg.messages.map((el, i) => buildEntry(msg, el, i, cfg, receivedAt));
+    }
+    return [buildEntry(msg, msg, -1, cfg, receivedAt)];
+}
+
+/**
+ * The JSON-safe queue record of one Kafka message:
+ * { v: 1, t: topic, tf: 1 when the topic came from the message, ts: arrival
+ * time (ms), m: lib/serialize encodeMessage() of the Kafka message, id?: only
+ * on records of an in-flight request queued by switchToBacklog() }.
+ */
+function toRecord(entry, receivedAt) {
+    return { v: RECORD_VERSION, t: entry.topic, tf: entry.tf, ts: receivedAt, m: serialize.encodeMessage(entry.message) };
+}
+
+/**
+ * One input message on its way to Kafka. Its Kafka messages are split into
+ * chunks: consecutive messages for the same topic, at most batchSize each
+ * (one produce request only ever carries one topic, which avoids partial
+ * multi-topic writes).
+ *
+ * chunk.state: 'pending' (waiting in memory) → 'inflight' (in a produce
+ * request) → 'sent'; or → 'queuing' (being written to the queue) → 'queued'.
+ * The item is settled (report + done) once every chunk is sent or queued, or
+ * as soon as one of them fails for good.
+ */
+function makeItem(msg, send, done, entries, receivedAt, batchSize) {
+    const item = {
+        msg,
+        send,
+        done: once(done),
+        receivedAt,
+        count: entries.length,
+        chunks: [],
+        settled: false,
+        failed: false,              // settled with done(err)
+        results: [],
+        location: null
+    };
+    let chunk = null;
+    for (const entry of entries) {
+        if (!chunk || chunk.topic !== entry.topic || chunk.entries.length >= batchSize) {
+            chunk = { item, topic: entry.topic, tf: entry.tf, entries: [], state: 'pending', isolate: false };
+            item.chunks.push(chunk);
+        }
+        chunk.entries.push(entry);
+    }
+    return item;
+}
+
+/** Queue records of a list of chunks, in order. */
+function recordsOf(chunks) {
+    const records = [];
+    for (const chunk of chunks) {
+        for (const entry of chunk.entries) records.push(toRecord(entry, chunk.item.receivedAt));
+    }
+    return records;
+}
+
+/** The distinct items of a list of chunks, in order. */
+function itemsOf(chunks) {
+    const seen = new Set();
+    const items = [];
+    for (const chunk of chunks) {
+        if (!seen.has(chunk.item)) {
+            seen.add(chunk.item);
+            items.push(chunk.item);
+        }
+    }
+    return items;
+}
+
+function addOffset(base, n) {
+    try {
+        const b = BigInt(base);
+        return b < 0n ? undefined : (b + BigInt(n)).toString();
+    } catch (_) {
+        return undefined;
+    }
+}
+
+function sameTopic(r, topic) {
+    return r && (r.topicName === undefined || r.topicName === topic);
+}
+
+/**
+ * Where each message of one produce request ended up, from the kafkajs
+ * RecordMetadata[] (one entry per partition written, baseOffset = offset of
+ * the first message written to that partition). Only exact answers are
+ * given: when the partitioner spread messages over several partitions, the
+ * position of an individual message is unknown (null).
+ *
+ * @param {object[]} messages kafkajs messages in request order
+ * @param {object[]} results RecordMetadata[]
+ * @param {string} topic
+ * @returns {Array<{partition: number, offset: (string|undefined)}|null>}
+ */
+function locateMessages(messages, results, topic) {
+    const out = messages.map(() => null);
+    const list = (Array.isArray(results) ? results : []).filter((r) => sameTopic(r, topic));
+    if (list.length === 0) return out;
+    const explicit = messages.every((m) => m.partition !== undefined);
+    if (explicit) {
+        const bases = new Map(list.map((r) => [Number(r.partition), r.baseOffset]));
+        const counts = new Map();
+        messages.forEach((m, j) => {
+            if (!bases.has(m.partition)) return;
+            const k = counts.get(m.partition) || 0;
+            counts.set(m.partition, k + 1);
+            out[j] = { partition: m.partition, offset: addOffset(bases.get(m.partition), k) };
+        });
+        return out;
+    }
+    if (list.length === 1) {
+        const p = Number(list[0].partition);
+        if (messages.every((m) => m.partition === undefined || m.partition === p)) {
+            messages.forEach((m, j) => {
+                out[j] = { partition: p, offset: addOffset(list[0].baseOffset, j) };
+            });
+        }
+    }
+    return out;
+}
+
+/** Explicit partitions of `messages` that kafkajs did not write (it skips unknown partitions silently). */
+function missingPartitions(messages, results, topic) {
+    const written = new Set((Array.isArray(results) ? results : [])
+        .filter((r) => sameTopic(r, topic)).map((r) => Number(r.partition)));
+    const missing = [];
+    for (const m of messages) {
+        if (m.partition !== undefined && !written.has(m.partition) && !missing.includes(m.partition)) {
+            missing.push(m.partition);
+        }
+    }
+    return missing;
+}
+
+/**
+ * Whether a failed produce request is worth sending again at once: a Kafka
+ * error that usually clears within a second or two (leader moved or being
+ * elected, not enough in-sync replicas yet, broker-side timeout, ...) or a
+ * request timeout. Connection failures are not: the node reconnects and
+ * queues instead.
+ */
+function sendRetriable(err) {
+    const c = classifyError(err, { op: 'send' });
+    return c.kind === ErrorKind.TRANSIENT && (c.type !== undefined || c.reason === 'KafkaJSRequestTimeoutError');
+}
+
+/**
+ * Why a failed produce request is sent again at once (sendWithRetry), or null:
+ *  - 'topic': the topic is being created, or kafkajs has no metadata for it
+ *    yet. With automatic topic creation the broker answers
+ *    UNKNOWN_TOPIC_OR_PARTITION until the new topic is ready (about 0.1 to 1 s);
+ *    kafkajs then refreshes its metadata, so the next attempt usually works.
+ *    Without automatic topic creation that error is final for this request
+ *    (msg.topic: the message fails; configured topic: queue and reconnect).
+ *    KafkaJSMetadataNotLoaded / KafkaJSTopicMetadataNotLoaded are thrown before
+ *    anything is sent, so they are always retried.
+ *  - 'transient': sendRetriable().
+ *
+ * @param {*} err
+ * @param {boolean} autoCreate the node's "allow automatic topic creation" setting
+ * @returns {('topic'|'transient'|null)}
+ */
+function sendRetryReason(err, autoCreate) {
+    const c = classifyError(err, { op: 'send' });
+    if (c.reason === 'KafkaJSMetadataNotLoaded' || c.reason === 'KafkaJSTopicMetadataNotLoaded') return 'topic';
+    if (c.type === 'UNKNOWN_TOPIC_OR_PARTITION') return autoCreate ? 'topic' : null;
+    return sendRetriable(err) ? 'transient' : null;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Close `queue` (if any), then call `release` (if any) — never before the
+ * close has really finished: every append requested before close() is then
+ * on disk, so a new holder of the directory cannot overwrite it (LOSS-2).
+ * Never rejects.
+ */
+function closeThenRelease(queue, release) {
+    let closing;
+    try {
+        closing = Promise.resolve(queue ? queue.close() : undefined);
+    } catch (_) {
+        closing = Promise.resolve(); // close() never throws; defensive only
+    }
+    return closing.catch(noop).then(() => {
+        try {
+            if (release) release();
+        } catch (_) {
+            // release never throws; defensive only
+        }
+    });
+}
+
+/** '512 B', '12 KB', '3.4 MB' */
+function fmtBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+    return `${Math.round(n / 104857.6) / 10} MB`;
+}
+
+/**
+ * The queue directory name each producer in the deployed flows would open
+ * (Queue name, else the node id; the same choice as queueDirFor), also for
+ * producers that do not run: a disabled node or flow keeps its configuration,
+ * and its queue is sent once it is enabled again. Only producers with a disk
+ * queue count: the old directory of a producer that was renamed or switched
+ * to the memory/off mode must still be reported as left behind.
+ * Never throws (an empty set when Node-RED cannot list its nodes).
+ */
+function configuredQueueNames(RED) {
+    const names = new Set();
+    try {
+        RED.nodes.eachNode((n) => {
+            try {
+                if (!n || n.type !== 'kafkajs-nc-producer') return;
+                const mode = text(n.queueMode).trim().toLowerCase();
+                // blank or unknown modes fall back to disk (parseConfig)
+                if (mode !== '' && QUEUE_MODES.has(mode) && mode !== 'disk') return;
+                let name = text(n.queueName).trim();
+                // a whole ${VAR} is only replaced in running nodes: look it up the same way
+                const ref = /^\$\{(\S+)\}$/.exec(name);
+                if (ref) {
+                    name = typeof process.env[ref[1]] === 'string' ? process.env[ref[1]].trim() : '';
+                    // not resolvable here (e.g. a flow or group variable): the warning's caveat covers it
+                    if (name === '') return;
+                }
+                if (name !== '' && envProblem(name)) return; // such a producer opens no queue at all
+                if (name === '') name = typeof n.id === 'string' ? n.id : '';
+                if (name !== '') names.add(sanitizeName(name));
+            } catch (_) {
+                // one odd node configuration must not stop the scan
+            }
+        });
+    } catch (_) {
+        // the exclusion is best effort
+    }
+    return names;
+}
+
+/**
+ * Sub-directories of `base` that hold queue segment files (unsent messages)
+ * but are not used by any running producer: [{ name, dir, bytes }]. Cheap
+ * (readdir and stat only, at most ORPHAN_SCAN_MAX directories). Directories
+ * already reported, and those named like the queue of a producer in the
+ * flows (`known`, e.g. one in a disabled flow) are skipped. Never rejects.
+ *
+ * @param {string} base
+ * @param {Set<string>} [known] directory names to leave out
+ */
+async function findOrphanQueues(base, known) {
+    const out = [];
+    try {
+        const entries = await fsp.readdir(base, { withFileTypes: true });
+        for (const entry of entries.slice(0, ORPHAN_SCAN_MAX)) {
+            if (!entry.isDirectory()) continue;
+            const dir = path.join(base, entry.name);
+            if (queueRegistry.isOwned(dir) || reportedOrphans.has(dir)) continue;
+            if (known && known.has(entry.name)) continue;
+            let bytes = 0;
+            try {
+                for (const file of await fsp.readdir(dir)) {
+                    if (SEGMENT_FILE.test(file)) bytes += (await fsp.stat(path.join(dir, file))).size;
+                }
+            } catch (_) {
+                continue; // unreadable or gone: nothing to report
+            }
+            if (bytes > 0) out.push({ name: entry.name, dir, bytes });
+        }
+    } catch (_) {
+        // the scan is advisory only
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// runtime
+
+/**
+ * Everything one producer node does at runtime. Kept out of the Node-RED node
+ * object so method names can never collide with Node's own (send, close, ...).
+ */
+class ProducerRuntime {
+    /**
+     * Never throws: problems are recorded and reported from start().
+     *
+     * @param {object} RED
+     * @param {object} node the Node-RED node
+     * @param {object} config node configuration
+     */
+    constructor(RED, node, config) {
+        this.RED = RED;
+        this.node = node;
+        this.status = new StatusReporter(node, { throttleMs: 1000 });
+
+        this.closing = false;
+        this.closePromise = null;
+        /** connection generation; bumped on every connect attempt, disconnect and close */
+        this.gen = 0;
+        /** 'idle' | 'connecting' | 'connected' | 'waiting' | 'stopped' | 'closing' */
+        this.state = 'idle';
+        /** 'live' | 'backlog' (see the file header) */
+        this.mode = 'backlog';
+        this.producer = null;
+        /** when the current connection was established (ms), see metadataMayBeStale() */
+        this.connectedAt = 0;
+        /**
+         * 'topic\u0000partition' → when fresh metadata last showed that this
+         * partition of the topic does not exist (see partitionMissing)
+         */
+        this.partitionChecks = new Map();
+        /** the metadata refresh last requested: { topic, partitions: Set, at } (see partitionMissing) */
+        this.refreshRequest = null;
+        /** a reconnect that only fetches fresh metadata is running (refreshMetadata) */
+        this.refreshing = false;
+        /** topic → when waiting for its automatic creation last gave up (see TIMEOUTS.topicNotCreated) */
+        this.topicsNotCreated = new Map();
+        this.retryTimer = null;
+        this.flushRetryTimer = null;
+
+        // live pipeline
+        this.pending = [];          // chunks waiting to be sent, in order
+        /**
+         * The request being sent: { chunks, since, persisted, queued }. `queued` is
+         * { json, stored } once switchToBacklog() appended the batch to the queue
+         * meanwhile (workLoop then acks or keeps that copy), else null.
+         */
+        this.inFlight = null;
+        this.working = false;
+        this.workerPromise = null;
+
+        // offline queue
+        this.queue = null;
+        /** 'off' | 'pending' (not open yet) | 'open' | 'failed' */
+        this.queueState = 'off';
+        this.queueError = null;
+        this.queueDir = null;
+        this.queueDirError = null;
+        this.queueOpening = null;
+        /** registry claim of queueDir (see lib/queue-registry); released only by closeThenRelease() */
+        this.releaseQueueDir = null;
+        this.queueClosed = null;    // closeQueue() promise
+        this.orphanScan = null;     // { base, timer } while an orphan scan is scheduled
+        this.early = [];            // items that arrived before the queue was open
+        this.flushing = false;
+        this.flushPromise = null;
+        this.unknownHead = null;
+        this.unknownCount = 0;
+
+        // failure bookkeeping (log de-duplication, status)
+        this.failures = 0;
+        this.lastFailKey = null;
+        this.lastFailContext = null;
+        this.lastError = null;
+        this.lastKind = null;
+        this.retryInMs = 0;
+
+        this.cfg = parseConfig(config);
+        this.compressionType = 0;
+
+        this.broker = null;
+        this.brokerError = null;
+        let r = {};
+        try {
+            const id = config && config.broker;
+            this.broker = id ? RED.nodes.getNode(id) || null : null;
+            if (this.broker && this.broker.configError) this.brokerError = this.broker.configError;
+            r = (this.broker && this.broker.reconnect) || {};
+        } catch (_) {
+            this.broker = null;
+        }
+        this.reconnect = {
+            min: toInt(r.min, 1000, { min: 10, max: 3600000 }),
+            max: toInt(r.max, 60000, { min: 10, max: 3600000 }),
+            authMin: toInt(r.authMin, 60000, { min: 10, max: 3600000 })
+        };
+        this.backoff = new Backoff({ min: this.reconnect.min, max: this.reconnect.max });
+        this.flushBackoff = new Backoff({ min: this.reconnect.min, max: this.reconnect.max });
+
+        if (this.cfg.queue.mode !== 'off') {
+            this.queueState = 'pending';
+            if (this.cfg.queue.mode === 'disk') {
+                const where = queueDirFor(this.cfg, RED, node.id);
+                this.queueDir = where.dir;
+                this.queueDirError = where.error;
+            }
+        }
+
+        // Statuses and errors emitted synchronously in a constructor never reach
+        // Status/Catch nodes, so the real work starts after construction.
+        setImmediate(() => {
+            this.startPromise = this.start().catch((err) => this.bug('start', err));
+        });
+    }
+
+    // ------------------------------------------------------------ logging
+
+    log(text) {
+        try {
+            this.node.log(text);
+        } catch (_) {
+            // logging must never break the producer
+        }
+    }
+
+    warn(text) {
+        try {
+            this.node.warn(text);
+        } catch (_) {
+            // ignore
+        }
+    }
+
+    error(text) {
+        try {
+            this.node.error(text);
+        } catch (_) {
+            // ignore
+        }
+    }
+
+    debug(text) {
+        try {
+            this.node.debug(text);
+        } catch (_) {
+            // ignore
+        }
+    }
+
+    /** An unexpected internal error: report it, never rethrow. Silent while closing, like the consumer. */
+    bug(where, err) {
+        if (this.closing) return;
+        this.error(`Internal error (${where}): ${describeError(err)}`);
+    }
+
+    // ------------------------------------------------------------ status
+
+    /** Number of messages waiting in the offline queue (or for it to open). */
+    queuedCount() {
+        let n = this.early.length;
+        try {
+            if (this.queue) n += this.queue.size;
+        } catch (_) {
+            // a queue getter never throws; defensive only
+        }
+        return n;
+    }
+
+    /**
+     * Show the status derived from the current state. `throttled` is used for
+     * frequent updates (queue depth), state changes are immediate.
+     */
+    render(throttled) {
+        if (this.closing) return;
+        try {
+            const n = this.queuedCount();
+            const queued = n > 0 ? ` · ${n} queued` : '';
+            let fill;
+            let shape = 'ring';
+            let label;
+            if (!this.broker) {
+                fill = 'red';
+                label = `no broker config${queued}`;
+            } else if (this.brokerError) {
+                fill = 'red';
+                label = `config error${queued}`;
+            } else if (this.state === 'connected') {
+                fill = 'green';
+                if (this.flushing) {
+                    label = `flushing · ${n} queued`;
+                } else if (n > 0) {
+                    shape = 'dot';
+                    label = `connected${queued}`;
+                } else if (this.queueState === 'failed') {
+                    fill = 'yellow';
+                    shape = 'dot';
+                    label = 'connected · queue unavailable';
+                } else {
+                    shape = 'dot';
+                    label = 'connected';
+                }
+            } else if (this.state === 'waiting') {
+                const retry = ` · retry ${fmtDelay(this.retryInMs)}`;
+                // the reason gets whatever the status budget leaves after the suffixes
+                const room = Math.max(16, STATUS_TEXT_MAX - queued.length - retry.length);
+                if (this.lastKind === ErrorKind.AUTH || this.lastKind === ErrorKind.CONFIG) {
+                    // needs a human: 'auth failed', 'config error', 'TLS: self-signed cert', ...
+                    fill = 'red';
+                    label = problemText(this.lastError, room) + queued + retry;
+                } else {
+                    fill = 'yellow';
+                    label = (n > 0 ? `offline${queued}` : shortMessage(this.lastError, room)) + retry;
+                }
+            } else if (this.state === 'connecting') {
+                fill = 'yellow';
+                label = `connecting…${queued}`;
+            } else {
+                fill = 'grey';
+                label = n > 0 ? `${n} queued` : 'starting';
+            }
+            if (throttled) this.status.activity(fill, shape, label);
+            else this.status.set(fill, shape, label);
+        } catch (_) {
+            // status is cosmetic
+        }
+    }
+
+    // ------------------------------------------------------------ startup
+
+    /** Report configuration problems, open the queue, then start connecting. */
+    async start() {
+        if (this.closing) return;
+        this.reportConfig();
+        this.render();
+        if (this.queueState === 'pending') {
+            this.queueOpening = this.openQueue();
+            await this.queueOpening;
+        }
+        if (this.closing) return;
+        this.drainEarly();
+        this.queueOpened();
+        this.warnLeftBehind();
+        if (this.broker && !this.brokerError) {
+            this.connect();
+        } else {
+            this.state = 'stopped';
+            this.render();
+        }
+    }
+
+    reportConfig() {
+        for (const w of this.cfg.warnings) this.warn(w);
+        for (const e of [this.cfg.topicError, this.cfg.keyError, this.cfg.partitionError, this.cfg.headersError]) {
+            if (e) this.error(`${e} — every message will be rejected until this is fixed`);
+        }
+        if (!this.broker) {
+            this.error('No Kafka broker configuration selected');
+        } else if (this.brokerError) {
+            const details = Array.isArray(this.brokerError.details) && this.brokerError.details.length
+                ? this.brokerError.details.join('; ')
+                : this.brokerError.message;
+            this.error(`Invalid Kafka broker configuration: ${details}`);
+        }
+    }
+
+    /** Open the offline queue. On failure the node works without one (queue mode effectively 'off'). */
+    async openQueue() {
+        const q = this.cfg.queue;
+        const logger = {
+            warn: (m) => this.warn(m),
+            error: (m) => this.error(m),
+            debug: (m) => this.debug(m)
+        };
+        try {
+            if (q.mode === 'memory') {
+                this.queue = new MemoryQueue({
+                    maxBytes: q.maxBytes, maxMessages: q.maxMessages, overflow: q.overflow, logger
+                });
+            } else {
+                if (!this.queueDir) throw new Error(this.queueDirError || 'no queue directory');
+                // After a redeploy the previous instance may still be writing this
+                // directory (a slow disk): wait until it has really closed its queue.
+                // acquire() throws if it is still closing: never share the directory.
+                await queueRegistry.whenReleased(this.queueDir, TIMEOUTS.previousClose);
+                if (this.closing) return;
+                this.releaseQueueDir = queueRegistry.acquire(this.queueDir, this.node.id);
+                this.queue = new DiskQueue({
+                    dir: this.queueDir,
+                    maxBytes: q.maxBytes,
+                    maxMessages: q.maxMessages,
+                    overflow: q.overflow,
+                    fsync: q.fsync,
+                    logger
+                });
+            }
+            await this.queue.open();
+            this.queueState = 'open';
+        } catch (err) {
+            this.queueState = 'failed';
+            this.queueError = err;
+            if (this.closing) return; // closeQueue() closes it and releases the directory
+            const busy = !!(err && err.code === 'QUEUE_DIR_CLOSING');
+            const where = this.queueDir ? ` (${this.queueDir})` : '';
+            this.error(`Offline queue unavailable${where}: ${err && err.message} — messages cannot be stored ` +
+                'while Kafka is unreachable' + (busy ? '; the queue is opened as soon as that node has closed it' : ''));
+            const queue = this.queue;
+            const release = this.releaseQueueDir;
+            this.queue = null;
+            this.releaseQueueDir = null;
+            closeThenRelease(queue, release);
+            if (busy) this.reopenWhenReleased();
+        }
+    }
+
+    /**
+     * The previous holder of the queue directory was still closing it after
+     * TIMEOUTS.previousClose: open the queue once it has finished, so its
+     * messages (and the next outage's) are not left without a queue until the
+     * next deploy.
+     */
+    reopenWhenReleased() {
+        queueRegistry.whenReleased(this.queueDir).then((free) => {
+            if (!free || this.closing || this.queueState !== 'failed') return undefined;
+            this.queueState = 'pending';
+            this.queueError = null;
+            this.queueOpening = this.openQueue();
+            return this.queueOpening.then(() => {
+                if (this.closing) return;
+                this.drainEarly();
+                if (this.queueState === 'open') this.log(`Offline queue ${this.queueDir} is open now`);
+                this.queueOpened();
+                this.maybeStartFlusher();
+                this.render();
+            });
+        }).catch((err) => this.bug('queue', err));
+    }
+
+    /** The queue is open: report a backlog from earlier and look for orphaned queues (disk mode). */
+    queueOpened() {
+        if (this.queueState !== 'open') return;
+        const n = this.queue.size;
+        if (n > 0) {
+            this.log(`The offline queue holds ${n} message(s) from earlier; they are sent first once Kafka is reachable`);
+        }
+        if (this.queue.dir) this.scheduleOrphanScan();
+    }
+
+    /**
+     * LOSS-4: the previous instance of this node left messages in a queue that
+     * this instance does not use (Queue directory or name changed, or the
+     * queue was turned off). Nothing sends them any more: say where they are.
+     */
+    warnLeftBehind() {
+        const previous = leftBehind.get(this.node.id);
+        leftBehind.delete(this.node.id);
+        if (!previous || (this.queueDir && path.resolve(this.queueDir) === previous.dir)) return;
+        reportedOrphans.add(previous.dir); // the orphan scan need not report it again
+        this.warn(`${previous.left} unsent message(s) are left in the offline queue ${previous.dir}, which this ` +
+            'node no longer uses (Queue directory or Queue name changed, or the queue was turned off). Only a ' +
+            'producer using that queue sends them: set the old values again to send them.');
+    }
+
+    /**
+     * LOSS-4: after a while (every producer of this deploy has opened its
+     * queue by then), warn once about queue directories next to ours that
+     * hold messages but are used by no running producer: a queue that was
+     * renamed or moved, a deleted node. Queues of producers that are in the
+     * flows but do not run (disabled node or flow) are not reported; they are
+     * sent when that producer runs again. The warning never advises deleting
+     * a directory without saying what else may own it.
+     */
+    scheduleOrphanScan() {
+        const base = path.dirname(this.queue.dir);
+        if (orphanScans.has(base)) return;
+        orphanScans.add(base);
+        const timer = setTimeout(() => {
+            if (this.orphanScan) this.orphanScan.timer = null;
+            findOrphanQueues(base, configuredQueueNames(this.RED)).then((list) => {
+                orphanScans.delete(base);
+                this.orphanScan = null;
+                if (this.closing || list.length === 0) return;
+                for (const o of list) reportedOrphans.add(o.dir);
+                const names = list.slice(0, 10).map((o) => `${o.name} (${fmtBytes(o.bytes)})`).join(', ') +
+                    (list.length > 10 ? ` and ${list.length - 10} more` : '');
+                this.warn(`Found ${list.length} offline queue(s) under ${base} with unsent messages that no producer ` +
+                    `in the deployed flows uses: ${names}. If you renamed a producer's queue or changed its Queue ` +
+                    'directory, set the old value again to send them. A queue may also belong to a producer that is ' +
+                    'not deployed right now (a flow you will import again, a disabled flow whose Queue name comes ' +
+                    'from an environment variable) or to another Node-RED instance using the same directory. Only ' +
+                    'delete a directory when you are sure no producer will send its messages: they are lost then.');
+            }).catch((err) => this.bug('orphan scan', err));
+        }, TIMEOUTS.orphanScan);
+        if (timer && typeof timer.unref === 'function') timer.unref();
+        this.orphanScan = { base, timer };
+    }
+
+    /** Cancel a scheduled orphan scan (close); the next instance schedules its own. */
+    cancelOrphanScan() {
+        const scan = this.orphanScan;
+        if (!scan || !scan.timer) return; // none, or already running (it reports nothing once closing)
+        clearTimeout(scan.timer);
+        orphanScans.delete(scan.base);
+        this.orphanScan = null;
+    }
+
+    /** Dispatch the messages that arrived while the queue was opening, in order. */
+    drainEarly() {
+        const early = this.early;
+        this.early = [];
+        for (const item of early) this.dispatch(item);
+        if (early.length) this.render();
+    }
+
+    // ------------------------------------------------------------ input
+
+    /**
+     * The input handler (synchronous; failures go to done(err)).
+     *
+     * @param {object} msg
+     * @param {Function} send
+     * @param {Function} done
+     */
+    input(msg, send, done) {
+        const finish = once((err) => this.safeDone(done, err));
+        try {
+            // ' Flush' or 'QUEUE-STATUS' must not be written to Kafka as data (MAINT-3)
+            const action = typeof msg.action === 'string' ? msg.action.trim().toLowerCase() : '';
+            if (CONTROL_ACTIONS.has(action)) {
+                this.control(action, msg, send, finish);
+                return;
+            }
+            const receivedAt = Date.now();
+            let entries;
+            try {
+                entries = buildEntries(msg, this.cfg, receivedAt);
+            } catch (err) {
+                finish(err);
+                return;
+            }
+            this.dispatch(makeItem(msg, send, finish, entries, receivedAt, this.cfg.batchSize));
+        } catch (err) {
+            finish(err);
+        }
+    }
+
+    /** Send an item live, queue it, or reject it (see the file header). */
+    dispatch(item) {
+        if (this.closing) {
+            this.settleFailed(item, new Error('The Kafka producer node is closing — message not sent'));
+            return;
+        }
+        if (this.state === 'connected' && this.mode === 'live') {
+            const stalled = this.inFlight !== null && Date.now() - this.inFlight.since > TIMEOUTS.liveStall;
+            if (this.pending.length < LIMITS.maxPending && !stalled) {
+                this.pushLive(item);
+                return;
+            }
+            if (this.queueState === 'open') {
+                // Kafka is slow (at the start of an outage kafkajs retries a
+                // request for ~20 s) or too much is waiting in memory: switch to
+                // the durable queue, keeping the order (see switchToBacklog).
+                this.switchToBacklog();
+                this.enqueueItem(item);
+                this.render();
+                return;
+            }
+            if (this.pending.length < LIMITS.maxPending) {
+                this.pushLive(item);
+                return;
+            }
+            this.settleFailed(item, new Error(`Too many messages (${LIMITS.maxPending}) are waiting for Kafka and the ` +
+                'offline queue is off — message not sent'));
+            return;
+        }
+        if (this.refreshing && this.pending.length > 0 && this.pending.length < LIMITS.maxPending &&
+            (this.queueState !== 'open' || this.queue.size === 0)) {
+            // The node reconnects only to fetch fresh metadata (refreshMetadata) and
+            // older messages wait in memory for it: wait behind them, so that nothing
+            // overtakes them, also not when the node closes meanwhile.
+            for (const chunk of item.chunks) this.pending.push(chunk);
+            return;
+        }
+        if (this.queueState === 'pending') {
+            if (this.early.length < LIMITS.maxPending) {
+                this.early.push(item);
+                this.render(true);
+                return;
+            }
+            this.settleFailed(item, new Error('The offline queue is still opening and too many messages are ' +
+                'waiting for it — message not sent'));
+            return;
+        }
+        if (this.queueState === 'open') {
+            // Older messages still in memory (or in flight) must stay in front of this
+            // one: with nothing queued yet, store them first (switchToBacklog keeps the
+            // order). Otherwise close would append them after it.
+            if (this.queue.size === 0 && (this.pending.length > 0 || this.inFlight)) this.switchToBacklog();
+            this.enqueueItem(item);
+            return;
+        }
+        this.settleFailed(item, this.notConnectedError());
+    }
+
+    notConnectedError() {
+        let reason = 'Kafka is not connected';
+        if (!this.broker) reason = 'No Kafka broker configuration is selected';
+        else if (this.brokerError) reason = 'The Kafka broker configuration is invalid';
+        const queue = this.queueState === 'failed'
+            ? `the offline queue is unavailable (${this.queueError && this.queueError.message})`
+            : 'the offline queue is off';
+        return new Error(`${reason} and ${queue} — message not sent`);
+    }
+
+    /** Append the pending chunks of an item to the offline queue. */
+    enqueueItem(item) {
+        return this.enqueueChunks(item.chunks.filter((c) => c.state === 'pending'));
+    }
+
+    /**
+     * Append chunks to the offline queue, in order. Each item's chunks go in one
+     * all-or-nothing append (the queue writes concurrent appends in call order),
+     * so a full queue rejects whole messages. Never rejects.
+     */
+    enqueueChunks(chunks) {
+        const groups = new Map();
+        for (const chunk of chunks) {
+            if (chunk.item.settled) continue;
+            if (!groups.has(chunk.item)) groups.set(chunk.item, []);
+            groups.get(chunk.item).push(chunk);
+        }
+        const writes = [];
+        for (const [item, list] of groups) writes.push(this.enqueueGroup(item, list));
+        this.render(true);
+        return Promise.all(writes);
+    }
+
+    enqueueGroup(item, list) {
+        let p;
+        try {
+            const records = recordsOf(list);
+            for (const chunk of list) chunk.state = 'queuing';
+            p = this.queue.enqueueMany(records);
+        } catch (err) {
+            p = Promise.reject(err);
+        }
+        return Promise.resolve(p).then(() => {
+            for (const chunk of list) chunk.state = 'queued';
+            this.checkItem(item);
+        }, (err) => this.settleFailed(item, this.queueFailure(err))).catch((err) => this.bug('enqueue', err));
+    }
+
+    /**
+     * Leave live mode while a request is in flight (Kafka slow or too much
+     * waiting in memory). The queue is empty in live mode, so the in-flight
+     * batch is appended first, then the pending messages: everything stays in
+     * order whatever the in-flight request's outcome. If it succeeds, its
+     * records are removed again from the head of the queue (ackSentHead).
+     */
+    switchToBacklog() {
+        this.mode = 'backlog';
+        const flight = this.inFlight;
+        if (flight && !flight.queued) {
+            try {
+                const records = recordsOf(flight.chunks).map((r) => ({ ...r, id: `${FLIGHT_TOKEN}.${++flightSeq}` }));
+                const json = records.map((r) => JSON.stringify(r));
+                let p;
+                try {
+                    p = this.queue.enqueueMany(records);
+                } catch (err) {
+                    p = Promise.reject(err);
+                }
+                const stored = Promise.resolve(p).then(() => true, (err) => {
+                    this.debug(`Could not store the in-flight messages in the offline queue: ${err && err.message}`);
+                    return false;
+                });
+                flight.queued = { json, stored };
+            } catch (err) {
+                this.bug('switch', err);
+            }
+        }
+        const pending = this.pending.splice(0);
+        if (pending.length > 0) this.enqueueChunks(pending);
+    }
+
+    /**
+     * The in-flight batch was also appended to the queue (switchToBacklog) and
+     * Kafka has now acknowledged it: remove those records from the head of the
+     * queue so they are not sent twice. Only records that are exactly ours are
+     * removed (drop-oldest may have dropped them meanwhile). Never rejects; on
+     * failure the worst case is a duplicate (at-least-once).
+     */
+    async ackSentHead(json) {
+        try {
+            let rest = json;
+            while (rest.length > 0) {
+                const entries = await this.queue.peek(rest.length);
+                let n = 0;
+                while (n < entries.length && !entries[n].corrupt && JSON.stringify(entries[n].record) === rest[n]) n++;
+                if (n === 0) break;
+                await this.queue.ack(entries.slice(0, n));
+                rest = rest.slice(n);
+                if (n < entries.length) break;
+            }
+            if (rest.length > 0) {
+                this.debug(`${rest.length} sent message(s) were not found at the head of the offline queue ` +
+                    '(dropped by the size limit?); any left will be sent again');
+            }
+        } catch (err) {
+            this.debug(`Could not remove sent messages from the offline queue: ${err && err.message} ` +
+                '(they will be sent again)');
+        }
+    }
+
+    /** A QueueFullError explains itself; anything else is a storage problem. */
+    queueFailure(err) {
+        if (err && err.name === 'KafkaNcQueueFullError') return err;
+        const wrapped = new Error(`Could not store the message in the offline queue: ${err && err.message}`);
+        wrapped.cause = err;
+        if (err && err.code) wrapped.code = err.code;
+        return wrapped;
+    }
+
+    // ------------------------------------------------------------ settling items
+
+    /** Settle the item once every chunk is sent or queued ("queued" if any part is). */
+    checkItem(item) {
+        if (item.settled) return;
+        let queued = false;
+        for (const chunk of item.chunks) {
+            if (chunk.state === 'queued') queued = true;
+            else if (chunk.state !== 'sent') return;
+        }
+        if (queued) this.settleQueued(item);
+        else this.settleSent(item);
+    }
+
+    settleSent(item) {
+        if (item.settled) return;
+        item.settled = true;
+        try {
+            const first = item.chunks[0];
+            const report = { status: 'sent', topic: first.topic };
+            if (item.count === 1) {
+                const explicit = first.entries[0].message.partition;
+                const partition = item.location ? item.location.partition : explicit;
+                if (partition !== undefined) report.partition = partition;
+                if (item.location && item.location.offset !== undefined) report.offset = item.location.offset;
+            } else {
+                report.count = item.count;
+            }
+            report.results = item.results;
+            item.msg.kafka = report;
+            if (!this.closing) item.send(item.msg);
+        } catch (err) {
+            this.bug('report', err);
+        }
+        this.callDone(item);
+    }
+
+    settleQueued(item) {
+        if (item.settled) return;
+        item.settled = true;
+        try {
+            const report = { status: 'queued', topic: item.chunks[0].topic, queueSize: this.queuedCount() };
+            if (item.count > 1) report.count = item.count;
+            item.msg.kafka = report;
+            if (!this.closing) item.send(item.msg);
+        } catch (err) {
+            this.bug('report', err);
+        }
+        this.callDone(item);
+        this.render(true);
+    }
+
+    settleFailed(item, err) {
+        if (item.settled) return;
+        item.settled = true;
+        item.failed = true;
+        this.callDone(item, err);
+    }
+
+    /**
+     * Call Node-RED's done() without letting it throw: with a Catch node,
+     * done(err) clones the message, which throws for messages that cannot be
+     * cloned (e.g. a throwing getter). The problem is then at least logged.
+     */
+    safeDone(done, err) {
+        try {
+            if (err) done(err);
+            else done();
+        } catch (e) {
+            this.error(`Could not complete the message: ${(err && err.message) || 'ok'} (${e && e.message})`);
+        }
+    }
+
+    /** done() must never throw into the send/flush loops. */
+    callDone(item, err) {
+        try {
+            if (err) item.done(err);
+            else item.done();
+        } catch (e) {
+            this.bug('done', e);
+        }
+    }
+
+    // ------------------------------------------------------------ connection supervisor
+
+    /** True when the work started under generation `gen` must stop. */
+    stale(gen) {
+        return this.closing || gen !== this.gen;
+    }
+
+    /** Start a connect attempt now. */
+    connect() {
+        if (this.closing) return;
+        this.clearRetryTimer();
+        const gen = ++this.gen;
+        this.state = 'connecting';
+        this.render();
+        this.connectAttempt(gen).catch((err) => this.bug('connect', err));
+    }
+
+    async connectAttempt(gen) {
+        let producer = null;
+        try {
+            const kafka = this.broker.createKafka(this.node);
+            const kafkajs = getKafkajs();
+            const partitioners = kafkajs.Partitioners || {};
+            const types = kafkajs.CompressionTypes || {};
+            const [typeName, fallback] = COMPRESSION.get(this.cfg.compression);
+            this.compressionType = typeof types[typeName] === 'number' ? types[typeName] : fallback;
+            const options = {
+                // always explicit, so kafkajs logs no "default partitioner changed" warning
+                createPartitioner: this.cfg.partitioner === 'legacy'
+                    ? partitioners.LegacyPartitioner
+                    : partitioners.DefaultPartitioner,
+                allowAutoTopicCreation: this.cfg.allowAutoTopicCreation,
+                // No kafkajs produce retry (LOSS-1, see the file header): sendWithRetry
+                // resends whole batches instead. This only affects send(); connecting
+                // still uses the broker node's retry settings.
+                retry: { retries: 0 }
+            };
+            producer = kafka.producer(options);
+        } catch (err) {
+            // createKafka() throws a ConfigError; kafka.producer() only throws
+            // synchronously for invalid options. Either way: a config problem.
+            this.connectFailed(gen, asConfigError(err, 'Could not create the Kafka producer'), producer, ErrorKind.CONFIG);
+            return;
+        }
+        if (this.stale(gen)) {
+            this.disconnectQuietly(producer);
+            return;
+        }
+        this.producer = producer;
+        this.watch(producer, gen);
+        try {
+            await producer.connect();
+        } catch (err) {
+            this.connectFailed(gen, err, producer);
+            return;
+        }
+        if (this.stale(gen)) {
+            // closed or superseded while connecting: kafkajs cannot cancel a
+            // connect, so this client must be shut down now or it lives on
+            this.disconnectQuietly(producer);
+            return;
+        }
+        this.state = 'connected';
+        this.connectedAt = Date.now();
+        this.refreshing = false;
+        if (this.failures > 0 && this.lastFailContext === 'connection') {
+            this.log(`Connected to Kafka after ${this.failures + 1} attempts`);
+        }
+        // older messages kept in memory are sent before the queue
+        if (this.pending.length > 0) this.kickWorker();
+        else this.maybeStartFlusher();
+        // The connection only counts as healthy once a request got through when
+        // the last failure was a send (or there is a backlog to send): a broker
+        // that accepts connections but rejects every produce request must not
+        // make us reconnect at full speed forever.
+        if (this.mode === 'live' && this.lastFailContext !== 'send') this.healthy();
+        this.render();
+    }
+
+    /** A request succeeded: reset the backoff and the failure log state. */
+    healthy() {
+        if (this.failures === 0 && this.lastError === null) return;
+        // After a failed send or flush the reconnect itself is not logged
+        // (connectAttempt only logs recoveries from connection failures), so
+        // the first request that gets through says so.
+        if (this.failures > 0 && this.lastFailContext !== 'connection') {
+            this.log(`Connected to Kafka after ${this.failures + 1} attempts`);
+        }
+        this.backoff.reset();
+        this.failures = 0;
+        this.lastFailKey = null;
+        this.lastFailContext = null;
+        this.lastError = null;
+        this.lastKind = null;
+    }
+
+    /** kafkajs instrumentation listeners (always through safeOn: a sync throw would crash Node-RED). */
+    watch(producer, gen) {
+        try {
+            const event = producer.events && producer.events.REQUEST_TIMEOUT;
+            if (typeof event !== 'string') return;
+            safeOn(producer, event, (e) => {
+                if (this.stale(gen)) return;
+                const p = (e && e.payload) || {};
+                this.debug(`Kafka request ${p.apiName || ''} to ${p.broker || 'broker'} timed out`);
+            }, (err) => this.debug(`request-timeout listener failed: ${err && err.message}`));
+        } catch (_) {
+            // instrumentation is optional
+        }
+    }
+
+    connectFailed(gen, err, producer, forcedKind) {
+        if (producer) {
+            this.disconnectQuietly(producer);
+            if (this.producer === producer) this.producer = null;
+        }
+        if (this.stale(gen)) return;
+        // same mapping as the consumer, see connectionKind(): a missing topic is
+        // TRANSIENT, an unauthorised one AUTH (topicKind()), MESSAGE ⇒ UNKNOWN
+        const kind = forcedKind || connectionKind(err, 'connect');
+        this.state = 'waiting';
+        if (this.refreshing) this.refreshFailed(err);
+        this.scheduleReconnect(err, kind, 'connection');
+    }
+
+    /**
+     * The reconnect of a metadata refresh failed (Kafka became unreachable
+     * meanwhile): the messages waiting in memory for it are handled like those
+     * of a failed live request. With nothing queued yet they go to the offline
+     * queue now, in order (durable while the outage lasts); with the queue off
+     * they fail. Messages behind newer queued ones (rare, see liveFailed) stay
+     * in memory and are sent first after the reconnect.
+     */
+    refreshFailed(err) {
+        this.refreshing = false;
+        if (this.queueState === 'open') {
+            this.mode = 'backlog';
+            if (this.queue.size === 0 && this.pending.length > 0) this.switchToBacklog();
+            return;
+        }
+        const chunks = this.pending.splice(0);
+        for (const item of itemsOf(chunks)) this.settleFailed(item, err);
+    }
+
+    /**
+     * The connection is unusable (a send failed at connection level): drop the
+     * producer and reconnect after the backoff.
+     */
+    markDisconnected(err, kind, context, topic) {
+        if (this.closing || this.state !== 'connected') return;
+        this.gen++;
+        const old = this.producer;
+        this.producer = null;
+        this.disconnectQuietly(old);
+        this.state = 'waiting';
+        if (this.queueState === 'open') this.mode = 'backlog';
+        this.scheduleReconnect(err, kind, context, topic);
+    }
+
+    scheduleReconnect(err, kind, context, topic) {
+        this.clearRetryTimer();
+        let delay = this.backoff.next();
+        // auth/config problems need a human: retry slowly (avoids account lockouts and log floods)
+        if (kind === ErrorKind.AUTH || kind === ErrorKind.CONFIG) delay = Math.max(delay, this.reconnect.authMin);
+        this.lastError = err;
+        this.lastKind = kind;
+        this.retryInMs = delay;
+        this.noteFailure(err, kind, delay, context, topic);
+        this.render();
+        this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            try {
+                this.connect();
+            } catch (e) {
+                this.bug('reconnect', e);
+            }
+        }, delay);
+    }
+
+    clearRetryTimer() {
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = null;
+    }
+
+    /**
+     * Log a failure without flooding the log: the first failure of an outage
+     * (or a different kind of failure) is an error, repeats are debug, with a
+     * warning every 10th attempt. Kafka's topic errors do not name the topic
+     * ('This server does not host this topic-partition'), so the line does.
+     */
+    noteFailure(err, kind, delay, context, topic) {
+        try {
+            const c = classifyError(err);
+            const key = `${kind}|${c.reason}`;
+            this.failures++;
+            const about = topic && c.kind === ErrorKind.TOPIC ? ` (topic ${topic})` : '';
+            const what = (context === 'send'
+                ? 'Kafka send failed'
+                : (context === 'flush' ? 'Sending queued messages to Kafka failed' : 'Kafka connection failed')) + about;
+            let kept = '';
+            if (this.queueState === 'open' && context !== 'connection') {
+                // rare: older messages behind newer queued ones stay in memory (liveFailed)
+                kept = this.pending.length > 0
+                    ? ' (the messages are kept and sent first after the reconnect)'
+                    : ' (the messages are kept in the offline queue)';
+            }
+            const line = `${what}: ${describeError(err)} — retrying in ${fmtDelay(delay)}${kept}`;
+            if (this.failures === 1 || key !== this.lastFailKey) {
+                this.error(line);
+            } else if (this.failures % 10 === 0) {
+                this.warn(`Kafka still failing after ${this.failures} attempts: ${describeError(err)} — ` +
+                    `retrying in ${fmtDelay(delay)}`);
+            } else {
+                this.debug(line);
+            }
+            this.lastFailKey = key;
+            this.lastFailContext = context;
+        } catch (_) {
+            // logging is best effort
+        }
+    }
+
+    /** producer.disconnect(), bounded and never rejecting. */
+    disconnectQuietly(producer) {
+        if (!producer) return Promise.resolve();
+        let p;
+        try {
+            p = producer.disconnect();
+        } catch (_) {
+            return Promise.resolve();
+        }
+        return withTimeout(p, TIMEOUTS.disconnect);
+    }
+
+    /** The send() options shared by the live pipeline and the flusher. */
+    sendArgs(topic, messages) {
+        return {
+            topic,
+            messages,
+            acks: this.cfg.acks,
+            timeout: this.cfg.ackTimeout,
+            compression: this.compressionType || 0
+        };
+    }
+
+    /**
+     * producer.send() with the node's own retry (kafkajs' is off, see the file
+     * header): the WHOLE batch is sent again after an error that usually
+     * clears within a second or two (sendRetryReason 'transient': up to
+     * LIMITS.sendRetries times, about 0.2, 0.6, 1.6 s apart) or while the topic
+     * is being created / has no metadata yet ('topic': up to
+     * LIMITS.topicRetries times, 0.05 s growing to 0.8 s apart). The pauses
+     * together never exceed TIMEOUTS.sendRetryTotal. Retries are logged at
+     * debug level only. Gives up early when the node closes or the connection
+     * was replaced. A remaining error is thrown for the normal failure handling
+     * (queue + reconnect, or done(err) for a message error).
+     *
+     * @returns {Promise<object[]>} kafkajs RecordMetadata[]
+     */
+    async sendWithRetry(gen, producer, topic, messages) {
+        const plans = {
+            transient: {
+                backoff: new Backoff({ min: TIMEOUTS.sendRetryMin, max: TIMEOUTS.sendRetryMax, factor: 3 }),
+                limit: LIMITS.sendRetries,
+                used: 0,
+                why: ''
+            },
+            topic: {
+                backoff: new Backoff({ min: TIMEOUTS.topicRetryMin, max: TIMEOUTS.topicRetryMax, factor: 2 }),
+                limit: LIMITS.topicRetries,
+                used: 0,
+                why: ' while the topic is being created or its metadata is loaded'
+            }
+        };
+        let waited = 0;
+        for (;;) {
+            let results;
+            try {
+                results = await producer.send(this.sendArgs(topic, messages));
+            } catch (err) {
+                const reason = this.stale(gen) ? null : sendRetryReason(err, this.cfg.allowAutoTopicCreation);
+                const plan = reason ? plans[reason] : null;
+                const notCreated = reason === 'topic' && classifyError(err).type === 'UNKNOWN_TOPIC_OR_PARTITION';
+                if (notCreated && this.recentlyNotCreated(topic)) throw err;
+                const delay = plan && plan.used < plan.limit ? plan.backoff.next() : Infinity;
+                if (waited + delay > TIMEOUTS.sendRetryTotal) {
+                    // the cluster does not create it (auto.create.topics.enable=false): do
+                    // not keep every following message waiting for it as well
+                    if (notCreated) this.rememberTopic(this.topicsNotCreated, topic);
+                    throw err;
+                }
+                plan.used++;
+                waited += delay;
+                this.debug(`Kafka send to topic ${topic} failed (${shortMessage(err, 60)})${plan.why}: sending its ` +
+                    `${messages.length} message(s) again in ${fmtDelay(delay)} (retry ${plan.used} of ${plan.limit})`);
+                await sleep(delay);
+                if (this.stale(gen)) throw err;
+                continue;
+            }
+            this.topicsNotCreated.delete(topic);
+            return results;
+        }
+    }
+
+    /** Whether waiting for `topic` to be created gave up less than TIMEOUTS.topicNotCreated ago. */
+    recentlyNotCreated(topic) {
+        const at = this.topicsNotCreated.get(topic);
+        return at !== undefined && Date.now() - at < TIMEOUTS.topicNotCreated;
+    }
+
+    /** Remember `topic` (or another key) in `map` (key → time), at most TOPIC_MEMORY_MAX entries. */
+    rememberTopic(map, topic, at = Date.now()) {
+        map.delete(topic); // re-insert: Map order is oldest first
+        map.set(topic, at);
+        if (map.size > TOPIC_MEMORY_MAX) map.delete(map.keys().next().value);
+    }
+
+    /**
+     * Whether the metadata of the current connection may be older than a
+     * change of the topic's partitions (see TIMEOUTS.freshMetadata, PART-1).
+     */
+    metadataMayBeStale() {
+        return Date.now() - this.connectedAt >= TIMEOUTS.freshMetadata;
+    }
+
+    /**
+     * kafkajs skipped messages of `topic` for explicit `partitions` that are not
+     * in its metadata. Are they really missing (the messages fail)?
+     *  - yes when each of these partitions was confirmed missing less than
+     *    TIMEOUTS.missingPartition ago;
+     *  - yes, and confirmed, when the metadata is known to be fresh: the
+     *    connection is younger than TIMEOUTS.freshMetadata, or it was made by
+     *    the refresh requested for exactly these partitions (refreshMetadata;
+     *    used once, so a slow reconnect cannot cause a refresh loop);
+     *  - otherwise the metadata may predate partitions added to the topic
+     *    (PART-1): no, refresh it first.
+     * So a flow that keeps sending to a partition that does not exist causes at
+     * most one refresh per partition per TIMEOUTS.missingPartition, and a
+     * partition that was really added is never refused because another
+     * partition of the topic was checked before.
+     */
+    partitionMissing(topic, partitions) {
+        const now = Date.now();
+        const key = (p) => `${topic}\u0000${p}`;
+        const confirmed = partitions.every((p) => {
+            const checked = this.partitionChecks.get(key(p));
+            return checked !== undefined && now - checked < TIMEOUTS.missingPartition;
+        });
+        if (confirmed) return true;
+        const req = this.refreshRequest;
+        const afterRefresh = req !== null && req.topic === topic && this.connectedAt >= req.at &&
+            partitions.every((p) => req.partitions.has(p));
+        if (!afterRefresh && this.metadataMayBeStale()) return false;
+        if (afterRefresh) this.refreshRequest = null;
+        for (const p of partitions) this.rememberTopic(this.partitionChecks, key(p), now);
+        return true;
+    }
+
+    /**
+     * kafkajs skipped messages for partitions that may only be missing from its
+     * cached metadata (partitions added recently, PART-1): reconnect at once,
+     * which fetches fresh metadata. This is not a failure: no backoff, no error
+     * or "Connected after N attempts" log line. The messages waiting for it stay
+     * where they are (in memory in front of the pending list, or at the head of
+     * the queue); while the new connection is made, newer messages wait in
+     * memory behind them (dispatch), so nothing overtakes them, also not when
+     * the node closes meanwhile.
+     */
+    refreshMetadata(topic, partitions) {
+        if (this.closing || this.state !== 'connected') return;
+        this.healthy(); // the request itself got through
+        // nothing is confirmed here: the new connection decides (partitionMissing),
+        // the refresh may well find the partition
+        this.refreshRequest = { topic, partitions: new Set(partitions), at: Date.now() };
+        this.debug(`Partition ${partitions.join(', ')} of topic ${topic} is not in the producer's metadata ` +
+            '(partitions added recently?): reconnecting to fetch the current list');
+        this.gen++;
+        const old = this.producer;
+        this.producer = null;
+        this.disconnectQuietly(old);
+        this.refreshing = true;
+        this.connect();
+    }
+
+    // ------------------------------------------------------------ live pipeline
+
+    pushLive(item) {
+        for (const chunk of item.chunks) this.pending.push(chunk);
+        this.kickWorker();
+    }
+
+    kickWorker() {
+        if (this.working || this.closing || this.state !== 'connected' || this.pending.length === 0) return;
+        this.working = true;
+        this.workerPromise = this.workLoop()
+            .catch((err) => this.bug('send', err))
+            .then(() => {
+                this.working = false;
+                this.workerPromise = null;
+                this.afterWork();
+            })
+            .catch((err) => this.bug('send', err));
+    }
+
+    afterWork() {
+        if (this.closing || this.state !== 'connected') return;
+        if (this.pending.length > 0) this.kickWorker();
+        else this.maybeStartFlusher();
+    }
+
+    /** Next produce request: whole chunks of one topic, up to batchSize messages. */
+    takeBatch() {
+        const pending = this.pending;
+        let i = 0;
+        while (i < pending.length && pending[i].item.settled) i++;
+        if (i >= pending.length) {
+            pending.length = 0;
+            return [];
+        }
+        const first = pending[i];
+        let end = i + 1;
+        let count = first.entries.length;
+        if (!first.isolate) {
+            while (end < pending.length) {
+                const next = pending[end];
+                if (next.item.settled) {
+                    end++;
+                    continue;
+                }
+                if (next.isolate || next.topic !== first.topic ||
+                    count + next.entries.length > this.cfg.batchSize) break;
+                count += next.entries.length;
+                end++;
+            }
+        }
+        return pending.splice(0, end).filter((c) => !c.item.settled);
+    }
+
+    async workLoop() {
+        while (!this.closing && this.state === 'connected' && this.pending.length > 0) {
+            const gen = this.gen;
+            const producer = this.producer;
+            const batch = this.takeBatch();
+            if (batch.length === 0) continue;
+            for (const chunk of batch) chunk.state = 'inflight';
+            const flight = { chunks: batch, since: Date.now(), persisted: false, queued: null };
+            this.inFlight = flight;
+            const messages = [];
+            for (const chunk of batch) for (const e of chunk.entries) messages.push(e.message);
+            let results;
+            let error = null;
+            let forcedKind;
+            if (!producer) {
+                error = new Error('The Kafka producer is not connected');
+                forcedKind = ErrorKind.TRANSIENT;
+            } else {
+                try {
+                    results = await this.sendWithRetry(gen, producer, batch[0].topic, messages);
+                } catch (err) {
+                    error = err || new Error('Kafka send failed');
+                }
+            }
+            this.inFlight = null;
+            if (flight.persisted) return; // close stopped waiting and took care of these
+            if (flight.queued && await flight.queued.stored) {
+                // We switched to backlog mode meanwhile and this batch is at the
+                // head of the queue already.
+                if (!error && this.needsRefresh(batch[0].topic, messages, results)) {
+                    // Some messages were skipped on metadata that may be stale: the
+                    // whole batch stays at the head of the queue and is sent again
+                    // after the refresh (the written ones twice: at-least-once).
+                    // Keeping them in memory instead would put them behind the newer
+                    // queued messages if the node closed meanwhile.
+                    for (const chunk of batch) {
+                        if (chunk.state === 'inflight') chunk.state = 'queued';
+                    }
+                    for (const item of itemsOf(batch)) this.checkItem(item);
+                    if (gen === this.gen) {
+                        this.refreshMetadata(batch[0].topic, missingPartitions(messages, results, batch[0].topic));
+                    }
+                } else if (!error) {
+                    await this.ackSentHead(flight.queued.json);
+                    this.liveSent(batch, messages, results, gen);
+                } else {
+                    for (const chunk of batch) {
+                        if (chunk.state === 'inflight') chunk.state = 'queued';
+                    }
+                    for (const item of itemsOf(batch)) this.checkItem(item);
+                    // a bad message is dead-lettered by the flusher like any queued one
+                    const kind = this.sendKind(error, batch, forcedKind);
+                    if (kind !== ErrorKind.MESSAGE && gen === this.gen) {
+                        this.markDisconnected(error, kind, 'send', batch[0].topic);
+                    }
+                }
+                continue;
+            }
+            if (error) {
+                if (this.closing) {
+                    for (const chunk of batch) chunk.state = 'pending';
+                    this.pending.unshift(...batch); // close persists them
+                    return;
+                }
+                this.liveFailed(batch, error, forcedKind, gen);
+            } else {
+                this.liveSent(batch, messages, results, gen);
+            }
+        }
+    }
+
+    /** Classify a failed produce request; TOPIC depends on where the topic came from. */
+    sendKind(err, batch, forcedKind) {
+        const kind = forcedKind || classifyError(err, { op: 'send' }).kind;
+        if (kind === ErrorKind.TOPIC) return topicKind(err, !!batch[0].tf);
+        return kind;
+    }
+
+    /**
+     * Whether a successful request skipped messages for partitions that may
+     * only be missing from stale metadata (see partitionMissing).
+     */
+    needsRefresh(topic, messages, results) {
+        if (this.cfg.acks === 0) return false;
+        const missing = missingPartitions(messages, results, topic);
+        return missing.length > 0 && !this.partitionMissing(topic, missing);
+    }
+
+    /**
+     * A produce request succeeded. kafkajs silently skips messages for an
+     * explicit partition that is not in its metadata: when the partition is
+     * really missing (partitionMissing) the message fails; when the metadata
+     * may be stale (partitions added since, PART-1) only the skipped messages
+     * are kept, in front of everything else, and sent again after a reconnect
+     * that fetches fresh metadata (refreshMetadata).
+     */
+    liveSent(batch, messages, results, gen) {
+        this.healthy();
+        const list = Array.isArray(results) ? results : [];
+        const located = locateMessages(messages, list, batch[0].topic);
+        const touched = new Set();
+        const again = [];
+        const skipped = new Set();
+        let idx = 0;
+        for (const chunk of batch) {
+            const item = chunk.item;
+            chunk.state = 'sent';
+            if (!touched.has(item)) {
+                touched.add(item);
+                item.results.push(...list);
+            }
+            if (item.count === 1) item.location = located[idx];
+            idx += chunk.entries.length;
+            if (this.cfg.acks === 0 || item.settled) continue;
+            const missing = missingPartitions(chunk.entries.map((e) => e.message), list, chunk.topic);
+            if (missing.length === 0) continue;
+            if (!this.partitionMissing(chunk.topic, missing)) {
+                chunk.entries = chunk.entries.filter((e) => missing.includes(e.message.partition));
+                chunk.state = 'pending';
+                again.push(chunk);
+                for (const p of missing) skipped.add(p);
+            } else {
+                this.settleFailed(item, new MessageError(`Partition ${missing.join(', ')} does not exist for ` +
+                    `topic ${chunk.topic} (kafkajs wrote nothing for it)`));
+            }
+        }
+        for (const item of touched) this.checkItem(item);
+        if (again.length > 0) {
+            this.pending.unshift(...again);
+            if (gen === this.gen) this.refreshMetadata(again[0].topic, [...skipped]);
+        }
+    }
+
+    liveFailed(batch, err, forcedKind, gen) {
+        const kind = this.sendKind(err, batch, forcedKind);
+        if (kind === ErrorKind.MESSAGE) {
+            const items = itemsOf(batch);
+            if (items.length > 1) {
+                // one of them is bad: send them one at a time to find it
+                for (const chunk of batch) {
+                    chunk.state = 'pending';
+                    chunk.isolate = true;
+                }
+                this.pending.unshift(...batch);
+                return;
+            }
+            this.settleFailed(items[0], err);
+            return;
+        }
+        // Connection-level problem: everything not sent yet keeps its order.
+        for (const chunk of batch) chunk.state = 'pending';
+        const chunks = batch.concat(this.pending.splice(0));
+        if (this.queueState === 'open' && this.queue.size === 0) {
+            this.mode = 'backlog';
+            this.enqueueChunks(chunks);
+        } else if (this.queueState === 'open') {
+            // Newer messages are queued already (rare: only after a failed
+            // switchToBacklog): appending these would break the order, so they
+            // stay in memory and are sent first after reconnecting.
+            this.pending = chunks;
+        } else {
+            for (const item of itemsOf(chunks)) this.settleFailed(item, err);
+        }
+        if (gen === this.gen) this.markDisconnected(err, kind, 'send', batch[0].topic);
+    }
+
+    // ------------------------------------------------------------ offline queue flusher
+
+    /** Start sending the offline queue if connected and nothing else is sending. */
+    maybeStartFlusher() {
+        if (this.closing || this.state !== 'connected' || this.flushing || this.working || this.pending.length) return;
+        if (this.queueState !== 'open' || this.queue.size === 0) {
+            if (this.mode !== 'live') {
+                this.mode = 'live';
+                this.render();
+            }
+            return;
+        }
+        if (this.flushRetryTimer) {
+            clearTimeout(this.flushRetryTimer);
+            this.flushRetryTimer = null;
+        }
+        this.mode = 'backlog';
+        this.flushing = true;
+        const gen = this.gen;
+        this.render();
+        this.flushPromise = this.flushLoop(gen)
+            .catch((err) => this.flushCrashed(gen, err))
+            .then(() => {
+                this.flushing = false;
+                this.flushPromise = null;
+                if (!this.closing && this.state === 'connected') {
+                    if (this.mode === 'live') {
+                        this.kickWorker();
+                    } else if (gen !== this.gen && !this.flushRetryTimer) {
+                        // A new connection (e.g. a metadata refresh) came up while this
+                        // flush was still finishing and could not start its own.
+                        if (this.pending.length > 0) this.kickWorker();
+                        else this.maybeStartFlusher();
+                    }
+                }
+                this.render();
+            })
+            .catch((err) => this.bug('flush', err));
+    }
+
+    /** The queue itself failed (e.g. a disk error): retry later, keep the messages. */
+    flushCrashed(gen, err) {
+        if (this.stale(gen) || this.state !== 'connected') return;
+        const delay = this.flushBackoff.next();
+        this.error(`Offline queue error while sending queued messages: ${describeError(err)} — retrying in ` +
+            `${fmtDelay(delay)}`);
+        this.flushRetryTimer = setTimeout(() => {
+            this.flushRetryTimer = null;
+            try {
+                this.maybeStartFlusher();
+            } catch (e) {
+                this.bug('flush', e);
+            }
+        }, delay);
+    }
+
+    flushStale(gen) {
+        return this.stale(gen) || this.state !== 'connected' || !this.producer;
+    }
+
+    async flushLoop(gen) {
+        const queue = this.queue;
+        let flushed = 0;
+        let lastHead = null;
+        for (;;) {
+            if (this.flushStale(gen)) return;
+            // Checked synchronously after the previous ack: enqueues are counted
+            // at call time, so 0 means nothing is waiting and live mode is safe.
+            if (queue.size === 0) {
+                this.mode = 'live';
+                this.flushBackoff.reset();
+                if (flushed > 0) this.log(`Sent ${flushed} queued message(s) to Kafka; the offline queue is empty`);
+                return;
+            }
+            const entries = await queue.peek(this.cfg.batchSize);
+            if (this.flushStale(gen)) return;
+            if (entries.length === 0) {
+                await sleep(TIMEOUTS.emptyPoll); // records requested but not written yet
+                continue;
+            }
+            // Every round acks at least its first entry. Should the queue ever
+            // fail to move on, back off (flushCrashed) instead of spinning.
+            const head = `${entries[0].pos.seg}:${entries[0].pos.end}`;
+            if (head === lastHead) throw new Error('the offline queue did not advance after an acknowledgement');
+            lastHead = head;
+            const sent = await this.flushBatch(gen, queue, entries);
+            if (sent < 0) return; // stopped: connection problem
+            flushed += sent;
+            this.render(true);
+        }
+    }
+
+    /**
+     * Decode a peeked batch. Returns the entries handled in this round, in queue
+     * order: the longest prefix whose valid records share the first topic.
+     * Corrupt and expired records are marked `dead`.
+     */
+    planFlush(entries) {
+        const items = [];
+        let topic = null;
+        const now = Date.now();
+        const maxAge = this.cfg.queue.maxAgeMs;
+        for (const entry of entries) {
+            const x = { entry, dead: null, message: null, topic: null, tf: 0 };
+            if (entry.corrupt) {
+                x.dead = new MessageError('Corrupt queue record (not valid JSON)');
+                items.push(x);
+                continue;
+            }
+            const rec = entry.record;
+            try {
+                if (!rec || typeof rec !== 'object' || rec.v !== RECORD_VERSION || typeof rec.t !== 'string' ||
+                    !rec.m || typeof rec.m !== 'object') {
+                    throw new MessageError('Invalid queue record (unknown format)');
+                }
+                const problem = topicProblem(rec.t, 'Queued topic');
+                if (problem) throw new MessageError(problem);
+                const message = serialize.decodeMessage(rec.m);
+                if (message.value === undefined) throw new MessageError('Invalid queue record (no value)');
+                x.message = message;
+                x.topic = rec.t;
+                x.tf = rec.tf === 1 ? 1 : 0;
+            } catch (err) {
+                x.dead = err instanceof MessageError ? err : new MessageError(`Invalid queue record: ${err && err.message}`);
+                items.push(x);
+                continue;
+            }
+            if (maxAge > 0 && Number.isFinite(rec.ts) && now - rec.ts > maxAge) {
+                x.dead = `expired: queued longer than ${this.cfg.queue.maxAgeHours} h (queueMaxAgeHours)`;
+                items.push(x);
+                continue;
+            }
+            if (topic === null) topic = x.topic;
+            else if (x.topic !== topic) break; // next round
+            items.push(x);
+        }
+        return items;
+    }
+
+    /**
+     * Classify a flush failure. TOPIC depends on where the topic came from. An
+     * UNKNOWN error is retried like a connection problem, but when the same
+     * head record fails UNKNOWN_LIMIT times in a row it is treated as a bad
+     * message (`forced`), so one odd record cannot block the queue forever.
+     *
+     * @returns {{kind: string, forced: boolean}}
+     */
+    flushKind(err, first, unknownIsMessage) {
+        let kind = classifyError(err, { op: 'send' }).kind;
+        // A record for a configured topic that is no longer the node's Topic
+        // (fixed typo, renamed topic) is only that record's problem: retrying it
+        // forever would block every message behind it (STUCK-1).
+        if (kind === ErrorKind.TOPIC) kind = topicKind(err, !!first.tf || first.topic !== this.cfg.topic);
+        if (kind !== ErrorKind.UNKNOWN) return { kind, forced: false };
+        if (unknownIsMessage) return { kind: ErrorKind.MESSAGE, forced: true };
+        const head = `${first.entry.pos.seg}:${first.entry.pos.end}`;
+        if (this.unknownHead === head) {
+            this.unknownCount++;
+        } else {
+            this.unknownHead = head;
+            this.unknownCount = 1;
+        }
+        if (this.unknownCount >= UNKNOWN_LIMIT) return { kind: ErrorKind.MESSAGE, forced: true };
+        return { kind, forced: false };
+    }
+
+    /**
+     * Send one round of queued records, dead-letter what cannot be delivered,
+     * ack what was handled. Returns the number of messages sent, or -1 when
+     * flushing must stop (connection problem: the supervisor reconnects).
+     */
+    async flushBatch(gen, queue, entries) {
+        const producer = this.producer;
+        const items = this.planFlush(entries);
+        const valid = items.filter((x) => !x.dead);
+        let sent = 0;
+        if (valid.length > 0) {
+            const messages = valid.map((x) => x.message);
+            try {
+                const results = await this.sendWithRetry(gen, producer, valid[0].topic, messages);
+                this.unknownHead = null;
+                this.unknownCount = 0;
+                const missing = this.checkPartitions(valid, messages, results);
+                if (missing.stale) return this.stopForMetadata(queue, items, missing.records);
+                sent = valid.length - missing.records.length;
+            } catch (err) {
+                const { kind, forced } = this.flushKind(err, valid[0], false);
+                if (kind !== ErrorKind.MESSAGE) {
+                    this.markDisconnected(err, kind, 'flush', valid[0].topic);
+                    return -1;
+                }
+                return this.flushIsolated(gen, queue, producer, items, forced);
+            }
+        }
+        await this.deadLetterAll(queue, items.filter((x) => x.dead));
+        await queue.ack(items.map((x) => x.entry));
+        if (valid.length > 0) this.healthy(); // a produce request got through
+        return sent;
+    }
+
+    /**
+     * After a successful send: the records whose explicit partition kafkajs
+     * did not write (it skips partitions missing from its metadata). When the
+     * partition is really missing (partitionMissing) they are marked dead. With
+     * metadata that may be stale (PART-1) they are left alone (`stale`).
+     *
+     * @returns {{records: object[], stale: boolean}}
+     */
+    checkPartitions(valid, messages, results) {
+        const missing = this.cfg.acks === 0 ? [] : missingPartitions(messages, results, valid[0].topic);
+        const records = valid.filter((x) => x.message.partition !== undefined && missing.includes(x.message.partition));
+        if (records.length === 0) return { records, stale: false };
+        if (!this.partitionMissing(valid[0].topic, missing)) return { records, stale: true };
+        for (const x of records) {
+            x.dead = new MessageError(`Partition ${x.message.partition} does not exist for topic ${x.topic}`);
+        }
+        return { records, stale: false };
+    }
+
+    /**
+     * Records were skipped for partitions that may only be missing from stale
+     * metadata: ack what comes before the first of them (records after it
+     * are sent again: at worst duplicates) and fetch fresh metadata
+     * (refreshMetadata). Returns -1 (flushing stops).
+     */
+    async stopForMetadata(queue, items, records) {
+        const done = items.slice(0, items.indexOf(records[0]));
+        await this.deadLetterAll(queue, done.filter((x) => x.dead));
+        if (done.length > 0) await queue.ack(done.map((x) => x.entry));
+        const partitions = [...new Set(records.map((x) => x.message.partition))];
+        this.refreshMetadata(records[0].topic, partitions);
+        return -1;
+    }
+
+    /**
+     * A batch was rejected because of (at least) one bad record: send the
+     * records one at a time, dead-letter the bad ones, keep going. Stops (and
+     * returns -1) on a connection-level failure, after acking what was handled.
+     */
+    async flushIsolated(gen, queue, producer, items, forced) {
+        let handled = 0;
+        let sent = 0;
+        let stop = null;
+        for (const x of items) {
+            if (x.dead) {
+                await this.deadLetterAll(queue, [x]);
+                handled++;
+                continue;
+            }
+            if (this.closing) break;
+            try {
+                const results = await this.sendWithRetry(gen, producer, x.topic, [x.message]);
+                const missing = this.checkPartitions([x], [x.message], results);
+                if (missing.stale) {
+                    stop = { refresh: [x.message.partition], topic: x.topic };
+                    break;
+                }
+                if (x.dead) await this.deadLetterAll(queue, [x]);
+                else sent++;
+                handled++;
+            } catch (err) {
+                const { kind } = this.flushKind(err, x, forced);
+                if (kind === ErrorKind.MESSAGE) {
+                    x.dead = err;
+                    await this.deadLetterAll(queue, [x]);
+                    handled++;
+                    continue;
+                }
+                stop = { err, kind, topic: x.topic };
+                break;
+            }
+        }
+        if (handled > 0) await queue.ack(items.slice(0, handled).map((x) => x.entry));
+        if (sent > 0) this.healthy();
+        if (stop && stop.refresh) {
+            this.refreshMetadata(stop.topic, stop.refresh);
+            return -1;
+        }
+        if (stop) {
+            this.markDisconnected(stop.err, stop.kind, 'flush', stop.topic);
+            return -1;
+        }
+        return this.closing ? -1 : sent;
+    }
+
+    /** Append undeliverable records to dead-letter.jsonl. A failing write is logged, never blocks the queue. */
+    async deadLetterAll(queue, list) {
+        for (const x of list) {
+            const reason = x.dead;
+            const why = typeof reason === 'string' ? reason : describeError(reason);
+            const where = queue.dir
+                ? ` to ${path.join(queue.dir, 'dead-letter.jsonl')}`
+                : ' to the memory queue\'s dead letters (see msg.payload.deadLetters of queue-status; lost on restart)';
+            try {
+                await queue.deadLetter(x.entry, reason);
+                this.warn(`Moved a queued message${x.topic ? ` for topic ${x.topic}` : ''} that cannot be delivered` +
+                    `${where}: ${why}`);
+            } catch (err) {
+                let raw = '';
+                try {
+                    raw = truncate(JSON.stringify(x.entry.corrupt ? x.entry.raw : x.entry.record), 500);
+                } catch (_) {
+                    raw = '[unprintable]';
+                }
+                this.error(`Dropped an undeliverable queued message (${why}); writing the dead-letter file failed: ` +
+                    `${err && err.message}. Record: ${raw}`);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ control messages
+
+    control(action, msg, send, done) {
+        if (action === 'flush' || action === 'reconnect') {
+            this.backoff.reset();
+            if (this.state === 'waiting') this.connect();
+            else if (this.state === 'connected') this.maybeStartFlusher();
+            done();
+            return;
+        }
+        if (action === 'queue-status') {
+            msg.payload = this.stats();
+            send(msg);
+            done();
+            return;
+        }
+        // queue-clear
+        if (this.queueState !== 'open') {
+            done(new Error(this.queueState === 'pending'
+                ? 'The offline queue is still opening — try again'
+                : 'The offline queue is off or unavailable — nothing to clear'));
+            return;
+        }
+        this.queue.clear().then((n) => {
+            if (n > 0) this.warn(`Cleared ${n} message(s) from the offline queue (they will not be sent)`);
+            try {
+                msg.payload = this.stats();
+                send(msg);
+                done();
+            } catch (err) {
+                done(err);
+            }
+            this.maybeStartFlusher();
+            this.render();
+        }, (err) => done(err)).catch((err) => this.bug('queue-clear', err));
+    }
+
+    /** queue-status payload. */
+    stats() {
+        let base = { size: 0, bytes: 0, segments: 0, droppedTotal: 0, deadLettered: 0 };
+        try {
+            if (this.queue) base = this.queue.stats();
+        } catch (_) {
+            // keep the zero stats
+        }
+        const s = {
+            ...base,
+            state: this.state,
+            mode: this.mode,
+            queueMode: this.queueState === 'open' || this.queueState === 'pending' ? this.cfg.queue.mode : 'off',
+            queueDir: this.cfg.queue.mode === 'disk' ? this.queueDir : null,
+            pending: this.pending.length + this.early.length
+        };
+        if (this.queueState === 'failed' && this.queueError) s.queueError = this.queueError.message;
+        if (this.lastError) s.lastError = shortMessage(this.lastError, 80);
+        try {
+            // memory mode: the queue's dead letters exist nowhere else (MAINT-7)
+            if (this.queue && !this.queue.dir && typeof this.queue.getDeadLetters === 'function') {
+                s.deadLetters = this.queue.getDeadLetters();
+            }
+        } catch (_) {
+            // statistics are best effort
+        }
+        return s;
+    }
+
+    // ------------------------------------------------------------ close
+
+    /**
+     * Node-RED close handler body. Calls `done` exactly once, within
+     * TIMEOUTS.closeTotal whatever happens.
+     */
+    close(removed, done) {
+        const finish = once(() => {
+            clearTimeout(hardStop);
+            try {
+                done();
+            } catch (_) {
+                // nothing left to do
+            }
+        });
+        const hardStop = setTimeout(finish, TIMEOUTS.closeTotal);
+        if (hardStop && typeof hardStop.unref === 'function') hardStop.unref();
+        try {
+            this.shutdown(removed).then(finish, (err) => {
+                this.bug('close', err);
+                finish();
+            });
+        } catch (err) {
+            this.bug('close', err);
+            finish();
+        }
+    }
+
+    shutdown(removed) {
+        if (this.closePromise) return this.closePromise;
+        this.closing = true;
+        this.state = 'closing';
+        this.gen++;
+        this.clearRetryTimer();
+        if (this.flushRetryTimer) clearTimeout(this.flushRetryTimer);
+        this.flushRetryTimer = null;
+        this.status.dispose();
+        this.cancelOrphanScan();
+        try {
+            // a new instance (redeploy) waits for this claim instead of failing at once (see openQueue)
+            if (this.releaseQueueDir) this.releaseQueueDir.closing();
+        } catch (_) {
+            // defensive only
+        }
+        const p = this.shutdownAsync(removed).catch((err) => this.bug('close', err));
+        this.closePromise = p;
+        // whatever happened above, the queue is closed and its directory released in the end
+        p.then(() => this.closeQueue()).catch(noop);
+        return p;
+    }
+
+    /**
+     * Close the queue and release its directory, once. The directory is only
+     * released when DiskQueue.close() has really finished (every append
+     * requested before it is on disk), however long a slow disk takes, never
+     * after a mere timeout: until then a redeployed instance waits or runs
+     * without the queue instead of writing the same files (LOSS-2). Never rejects.
+     */
+    closeQueue() {
+        if (!this.queueClosed) {
+            const release = this.releaseQueueDir;
+            this.releaseQueueDir = null;
+            this.queueClosed = closeThenRelease(this.queue, release);
+        }
+        return this.queueClosed;
+    }
+
+    async shutdownAsync(removed) {
+        // 1. Let an in-flight produce request / flush batch finish (bounded).
+        const busy = [this.workerPromise, this.flushPromise].filter(Boolean);
+        if (busy.length > 0) await withTimeout(Promise.all(busy), TIMEOUTS.closeSendWait);
+        if (this.queueState === 'pending' && this.queueOpening) {
+            await withTimeout(this.queueOpening, TIMEOUTS.closeQueue);
+        }
+
+        // 2. Disconnect (bounded) while the unsent messages are persisted.
+        const producer = this.producer;
+        this.producer = null;
+        const disconnecting = this.disconnectQuietly(producer);
+
+        const chunks = [];
+        const flight = this.inFlight;
+        if (flight && !flight.persisted) {
+            // the request did not answer in time: at-least-once, it may still land (duplicate)
+            flight.persisted = true;
+            const stored = flight.queued
+                ? await withTimeout(flight.queued.stored, TIMEOUTS.closeQueue, 'slow')
+                : false;
+            if (stored === 'slow') {
+                // Its copy at the head of the queue is still being written (slow
+                // disk). Appending it again would put a duplicate at the tail, out
+                // of order: settle it by the outcome of that write instead.
+                this.settleWhenStored(flight);
+            } else {
+                for (const chunk of flight.chunks) {
+                    if (chunk.state === 'inflight') chunk.state = stored ? 'queued' : 'pending';
+                }
+                if (stored) {
+                    for (const item of itemsOf(flight.chunks)) this.checkItem(item);
+                } else {
+                    chunks.push(...flight.chunks);
+                }
+            }
+        }
+        chunks.push(...this.pending.splice(0));
+        for (const item of this.early.splice(0)) chunks.push(...item.chunks);
+        const unsent = chunks.filter((c) => !c.item.settled && c.state === 'pending');
+        if (unsent.length > 0) {
+            const count = itemsOf(unsent).length;
+            if (this.queueState === 'open' && this.cfg.queue.mode === 'disk') {
+                await withTimeout(this.enqueueChunks(unsent), TIMEOUTS.closeQueue);
+                this.logStoredOnClose(itemsOf(unsent));
+            } else {
+                this.warn(`${count} message(s) were not sent to Kafka before the node closed` +
+                    (this.cfg.queue.mode === 'memory' ? ' (the memory queue does not survive a restart)' : ''));
+                const err = new Error('The Kafka producer node closed before the message was sent');
+                for (const item of itemsOf(unsent)) this.settleFailed(item, err);
+            }
+        }
+        await disconnecting;
+
+        // 3. Close the queue. Node-RED's done() waits at most closeQueue for it;
+        //    the directory stays locked until the close has really finished.
+        const queue = this.queue;
+        if (queue && queue.dir) {
+            const left = queue.size;
+            if (removed && left > 0) {
+                this.warn(`Node removed with ${left} unsent message(s) left in ${queue.dir}`);
+            }
+            if (!removed && left > 0) leftBehind.set(this.node.id, { dir: queue.dir, left });
+            else leftBehind.delete(this.node.id);
+        }
+        await withTimeout(this.closeQueue(), TIMEOUTS.closeQueue);
+    }
+
+    /**
+     * Close gave up waiting for the queued copy of the in-flight batch (see
+     * switchToBacklog): report each message by the outcome of that write.
+     */
+    settleWhenStored(flight) {
+        flight.queued.stored.then((ok) => {
+            for (const chunk of flight.chunks) {
+                if (chunk.state === 'inflight') chunk.state = ok ? 'queued' : 'pending';
+            }
+            const err = new Error('The Kafka producer node closed before the message was sent, and storing it in ' +
+                'the offline queue failed');
+            for (const item of itemsOf(flight.chunks)) {
+                if (ok) this.checkItem(item);
+                else this.settleFailed(item, err);
+            }
+        }).catch((err) => this.bug('close', err));
+    }
+
+    /**
+     * Log what persisting the unsent messages at close achieved: some may have
+     * failed (each got done(err)) or still be on their way to a slow disk.
+     */
+    logStoredOnClose(items) {
+        let stored = 0;
+        let failed = 0;
+        for (const item of items) {
+            if (item.failed) failed++;
+            else if (item.settled) stored++;
+        }
+        const writing = items.length - stored - failed;
+        if (failed === 0 && writing === 0) {
+            this.log(`Stored ${stored} unsent message(s) in the offline queue while closing`);
+            return;
+        }
+        this.warn(`Closing: ${stored} unsent message(s) stored in the offline queue, ${failed} could not be ` +
+            `stored (they failed with an error), ${writing} still being written (slow disk)`);
+    }
+
+    /** State snapshot (tests, debugging). */
+    snapshot() {
+        return {
+            state: this.state,
+            mode: this.mode,
+            queueState: this.queueState,
+            pending: this.pending.length,
+            early: this.early.length,
+            working: this.working,
+            flushing: this.flushing,
+            gen: this.gen,
+            queued: this.queuedCount()
+        };
+    }
+}
+
+module.exports = function (RED) {
+    /**
+     * Node constructor. Registers the handlers first and never throws (a
+     * throwing constructor leaves a node whose close handler never runs).
+     *
+     * @param {object} config
+     */
+    function KafkaProducerNode(config) {
+        RED.nodes.createNode(this, config);
+        const node = this;
+        let runtime = null;
+        let startError = null;
+
+        node.on('close', function (removed, done) {
+            const finish = once(() => {
+                try {
+                    done();
+                } catch (_) {
+                    // ignore
+                }
+            });
+            try {
+                if (runtime) runtime.close(removed, finish);
+                else finish();
+            } catch (_) {
+                finish();
+            }
+        });
+
+        node.on('input', function (msg, send, done) {
+            try {
+                if (runtime) {
+                    runtime.input(msg, send, done);
+                } else {
+                    done(new Error(`The Kafka producer failed to start: ${startError && startError.message}`));
+                }
+            } catch (err) {
+                try {
+                    done(err);
+                } catch (_) {
+                    // ignore
+                }
+            }
+        });
+
+        try {
+            runtime = new ProducerRuntime(RED, node, config);
+            node.producerRuntime = runtime;
+        } catch (err) {
+            startError = err;
+            try {
+                node.error(`The Kafka producer failed to start: ${describeError(err)}`);
+                node.status({ fill: 'red', shape: 'ring', text: 'internal error' });
+            } catch (_) {
+                // ignore
+            }
+        }
+    }
+
+    RED.nodes.registerType('kafkajs-nc-producer', KafkaProducerNode, {
+        settings: {
+            kafkajsNcProducerQueueDir: { value: '', exportable: false }
+        }
+    });
+};
+
+/** Test hooks: shorten timeouts / lower limits in tests; production code never changes them. */
+module.exports.TIMEOUTS = TIMEOUTS;
+module.exports.LIMITS = LIMITS;
+/** Pure helpers, exported for unit tests. */
+module.exports._internals = {
+    parseConfig,
+    parseStaticHeaders,
+    queueDirFor,
+    buildEntries,
+    toRecord,
+    locateMessages,
+    missingPartitions,
+    topicProblem,
+    fmtDelay,
+    sendRetriable,
+    sendRetryReason,
+    configuredQueueNames,
+    ProducerRuntime,
+    UNKNOWN_LIMIT
+};
