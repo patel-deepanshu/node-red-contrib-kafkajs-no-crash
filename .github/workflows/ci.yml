@@ -12,13 +12,17 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22.x
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - name: No known vulnerability in the runtime dependencies (what users install)
+        run: npm run audit:runtime
+      - name: Registry signatures of the installed packages
+        run: npm audit signatures
 
   test:
     name: test (Node ${{ matrix.node }}, Node-RED ${{ matrix.node-red }})
@@ -34,14 +38,14 @@ jobs:
           - { node: 22.x, node-red: 5 }
           - { node: 24.x, node-red: 5 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      # always the version in the job's name, whatever devDependencies pins for local development
       - name: Use Node-RED ${{ matrix.node-red }}
-        if: matrix.node-red != 4
         run: npm install --no-save node-red@${{ matrix.node-red }}
       - run: npm test
 
@@ -52,18 +56,18 @@ jobs:
       KAFKA_VERSION: 3.9.1
       KAFKA_CACHE_DIR: ${{ github.workspace }}/.kafka-cache
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22.x
           cache: npm
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
       - run: npm ci
       - name: Cache Kafka distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .kafka-cache
           key: kafka-${{ env.KAFKA_VERSION }}

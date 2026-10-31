@@ -35,8 +35,8 @@ newer (`node-red.version` in `package.json`): 3.0 gives nodes inside subflows a 
 default queue directory and consumer group depend on.
 
 ```sh
-git clone https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git
-cd node-red-kafkajs-no-crash
+git clone https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git
+cd node-red-contrib-kafkajs-no-crash
 npm install
 npm test
 ```
@@ -45,7 +45,7 @@ To try your working copy in a real Node-RED, install it into your Node-RED user 
 
 ```sh
 cd ~/.node-red
-npm install /path/to/node-red-kafkajs-no-crash
+npm install /path/to/node-red-contrib-kafkajs-no-crash
 ```
 
 After changing a `.js` file, restart Node-RED; after changing a `.html` file, restart Node-RED and reload the editor.
@@ -247,43 +247,20 @@ former `idempotent` property), and test that such a flow still loads.
 
 ## Release process
 
-For maintainers:
+For maintainers: [docs/RELEASING.md](docs/RELEASING.md) has the complete steps. In short:
 
-1. Make sure `main` is green in CI, including the e2e job.
-2. Bump the version without tagging yet, and update the changelog:
-
-   ```sh
-   npm version minor --no-git-tag-version    # or patch / major: updates package.json and package-lock.json
-   ```
-
-   In [CHANGELOG.md](CHANGELOG.md), rename `Unreleased` to the new version with today's date, add an empty
-   `Unreleased` section above it, and update the comparison links at the bottom.
-3. Check what will be published (`nodes/`, `lib/`, `examples/`, `docs/`, `scripts/migrate-flows.js`, `README.md`,
-   `CHANGELOG.md`, `LICENSE`), and that the migration command works from the package:
-
-   ```sh
-   npm pack --dry-run
-   npm pack && npx -p ./node-red-contrib-kafkajs-no-crash-<version>.tgz kafkajs-nc-migrate-flows --help
-   ```
-
-4. Commit, tag and push:
-
-   ```sh
-   git commit -am "Release 1.1.0"
-   git tag -a v1.1.0 -m "v1.1.0"
-   git push origin main --follow-tags
-   ```
-
-5. Publish to npm: `npm publish` (with two-factor authentication).
-6. Create a GitHub release from the tag, with the changelog section as its text.
-7. **Node-RED flow library:** it does not pick up new versions automatically. For the first release, submit the
-   package at <https://flows.nodered.org/add/node>. For later releases, open the package's page on
-   flows.nodered.org and use *request refresh*. Check the scorecard shown there.
+1. `main` is green in CI (including the e2e job) and `npm run audit:runtime` reports 0 vulnerabilities.
+2. `npm version patch|minor|major --no-git-tag-version`, and the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md)
+   becomes the new version with today's date. Merge that into `main`.
+3. Publish a GitHub release with the tag `vX.Y.Z` (matching `package.json`). The
+   [release workflow](.github/workflows/release.yml) runs the checks and the tests and publishes to npm with
+   provenance (trusted publishing, no token). The very first release is published by hand.
+4. Use *request refresh* on the package's page in the Node-RED flow library.
 
 ## Reporting bugs
 
 Open an issue with the bug report template at
-<https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues>. Please include the versions of this palette,
+<https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/issues>. Please include the versions of this palette,
 Node-RED and Node.js, the platform, the broker setup (Kafka version or cloud service, listener, SASL mechanism, TLS),
 a flow export with **all secrets removed**, and the log around the problem. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#enabling-debug-logging)
 explains how to turn on debug logging.

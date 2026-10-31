@@ -123,7 +123,7 @@ describe('lib/codecs', function () {
                 assert.equal(typeof codec.compress, 'function');
                 assert.equal(typeof codec.decompress, 'function');
             }
-            assert.equal(CompressionCodecs[CompressionTypes.Snappy], require('kafkajs-snappy'));
+            assert.equal(CompressionCodecs[CompressionTypes.Snappy], codecs.snappyCodec);
             assert.equal(CompressionCodecs[CompressionTypes.LZ4], codecs.lz4Codec);
         });
 
@@ -141,12 +141,13 @@ describe('lib/codecs', function () {
             assert.throws(() => fake.CompressionCodecs[4](), /ZSTD compression not implemented/);
         });
 
-        it('keeps an already working codec (e.g. registered by the user)', function () {
-            const custom = () => ({ compress: async () => Buffer.from('c'), decompress: async () => Buffer.from('d') });
-            const fake = { CompressionTypes, CompressionCodecs: { 2: custom, 3: custom } };
+        it('replaces Snappy/LZ4 codecs registered by others (kafkajs is often shared between palettes)', function () {
+            // e.g. another palette registered kafkajs-snappy, which allocates whatever a block declares
+            const other = () => ({ compress: async () => Buffer.from('c'), decompress: async () => Buffer.from('d') });
+            const fake = { CompressionTypes, CompressionCodecs: { 2: other, 3: other } };
             assert.deepEqual(codecs.register(fake), { snappy: true, lz4: true });
-            assert.equal(fake.CompressionCodecs[2], custom);
-            assert.equal(fake.CompressionCodecs[3], custom);
+            assert.equal(fake.CompressionCodecs[2], codecs.snappyCodec);
+            assert.equal(fake.CompressionCodecs[3], codecs.lz4Codec);
         });
 
         it('never throws on bad input', function () {
@@ -284,6 +285,112 @@ describe('lib/codecs', function () {
             const frame = withBlockChecksums(codecs.lz4CompressFrame(Buffer.from('hello kafka '.repeat(100))));
             frame[12] ^= 0x01; // inside the first block's data
             await assert.rejects(codecs.lz4Codec().decompress(frame), /Invalid LZ4 data: block checksum mismatch/);
+        });
+    });
+
+    describe('Snappy decompression bombs (same class as snappy-java CVE-2023-43642)', function () {
+        /** A raw Snappy block: varint uncompressed length, then the elements. */
+        function snappyBlock(declared, elements) {
+            const out = [];
+            let n = declared;
+            while (n > 0x7f) {
+                out.push((n & 0x7f) | 0x80);
+                n = Math.floor(n / 128);
+            }
+            out.push(n);
+            return Buffer.concat([Buffer.from(out), Buffer.from(elements)]);
+        }
+        /** The xerial framing written by Kafka's Java client (SnappyOutputStream) and read by kafkajs-snappy. */
+        function xerial(blocks) {
+            const header = Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0, 0, 0, 0, 1, 0, 0, 0, 1]);
+            const parts = [header];
+            for (const b of blocks) {
+                const size = Buffer.alloc(4);
+                size.writeUInt32BE(b.length, 0);
+                parts.push(size, b);
+            }
+            return Buffer.concat(parts);
+        }
+        const LITERAL_A = [0x00, 0x41]; // a 1-byte literal 'A'
+
+        it('rejects a 49-byte batch whose 3 blocks declare 1 GiB each, before allocating (was 5 GB / 42 s)', async function () {
+            const frame = xerial(Array(3).fill(snappyBlock(1024 * 1024 * 1024, LITERAL_A)));
+            assert.equal(frame.length, 49);
+            const rssBefore = process.memoryUsage().rss;
+            const start = Date.now();
+            await assert.rejects(codecs.snappyCodec().decompress(frame), (err) => {
+                assert.match(err.message, /^Invalid Snappy data: The uncompressed length of 1073741824 is too big/);
+                assert.equal(err.retriable, false);
+                return true;
+            });
+            assert.ok(Date.now() - start < 1000, 'nothing was decoded or allocated');
+            assert.ok(process.memoryUsage().rss - rssBefore < 64 * 1024 * 1024, 'no large allocation');
+        });
+
+        it('rejects a raw block declaring 2 GiB', function () {
+            assert.throws(() => codecs.snappyDecompress(snappyBlock(0x7fffffff, LITERAL_A)), /too big/);
+        });
+
+        it('limits a block to what its compressed size can hold (64 bytes per 3-byte copy)', function () {
+            // 2 bytes of header + 2 bytes literal can hold at most ceil(4 * 64 / 3) = 86 bytes
+            assert.throws(() => codecs.snappyDecompress(snappyBlock(87, LITERAL_A)), /too big/);
+            // a legitimate block at the densest ratio still decodes: literal 'A' + 3-byte copies of 64 bytes
+            const copies = [];
+            for (let i = 0; i < 100; i++) copies.push(0xfe, 0x01, 0x00); // copy 64 bytes from offset 1
+            const dense = snappyBlock(1 + 6400, [...LITERAL_A, ...copies]);
+            assert.equal(codecs.snappyDecompress(dense).toString(), 'A'.repeat(6401));
+        });
+
+        it(`rejects a batch whose blocks add up to more than ${codecs.SNAPPY_MAX_OUTPUT / 1048576} MiB`, function () {
+            assert.equal(codecs.SNAPPY_MAX_OUTPUT, 256 * 1024 * 1024);
+            const block = Buffer.from(require('snappyjs').compress(Buffer.alloc(3000, 0x61)));
+            const frame = xerial(Array(4).fill(block));
+            assert.equal(codecs.snappyDecompress(frame).length, 12000);
+            assert.throws(() => codecs.snappyDecompress(frame, { maxOutput: 10000 }), /at most 10000 bytes per batch/);
+        });
+
+        it('decodes xerial frames (Java client, kafkajs-snappy) and raw blocks', function () {
+            const snappyjs = require('snappyjs');
+            const parts = ['hello kafka '.repeat(500), 'second block', crypto.randomBytes(5000).toString('hex')];
+            const frame = xerial(parts.map((t) => Buffer.from(snappyjs.compress(Buffer.from(t)))));
+            assert.equal(codecs.snappyDecompress(frame).toString(), parts.join(''));
+            assert.equal(codecs.snappyDecompress(Buffer.from(snappyjs.compress(Buffer.from('raw')))).toString(), 'raw');
+            assert.equal(codecs.snappyDecompress(new Uint8Array(snappyjs.compress(Buffer.from('u8')))).toString(), 'u8');
+        });
+
+        it('rejects damaged frames with a catchable error', async function () {
+            const good = xerial([Buffer.from(require('snappyjs').compress(Buffer.from('abc'.repeat(30))))]);
+            const cases = {
+                'truncated size word': Buffer.concat([good, Buffer.from([0, 0])]),
+                'block runs past the end': good.subarray(0, good.length - 3),
+                'garbage block': xerial([Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])]),
+                'empty block': xerial([Buffer.alloc(0)])
+            };
+            for (const [name, frame] of Object.entries(cases)) {
+                await assert.rejects(codecs.snappyCodec().decompress(frame), /^Error: Invalid Snappy data: /, name);
+            }
+        });
+
+        it('never throws anything else and never hangs on damaged input (fuzz)', function () {
+            const snappyjs = require('snappyjs');
+            const base = xerial([Buffer.from(snappyjs.compress(Buffer.from('fuzz me '.repeat(200))))]);
+            let seed = 7;
+            const rnd = () => {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+                return seed;
+            };
+            const start = Date.now();
+            for (let i = 0; i < 3000; i++) {
+                const f = Buffer.from(base);
+                for (let j = 0; j < 1 + (rnd() % 4); j++) f[rnd() % f.length] = rnd() & 0xff;
+                try {
+                    const out = codecs.snappyDecompress(f);
+                    assert.ok(out.length <= codecs.SNAPPY_MAX_OUTPUT);
+                } catch (err) {
+                    assert.ok(err instanceof Error && /^Invalid Snappy data: /.test(err.message), String(err && err.message));
+                }
+            }
+            assert.ok(Date.now() - start < 10000);
         });
     });
 

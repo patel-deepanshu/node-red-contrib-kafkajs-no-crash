@@ -24,7 +24,7 @@ A clear description of the problem. If Node-RED crashed, paste the full log outp
 
 **Logs**
 Turn on debug logging as described in
-[docs/TROUBLESHOOTING.md](https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/blob/main/docs/TROUBLESHOOTING.md#enabling-debug-logging):
+[docs/TROUBLESHOOTING.md](https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/blob/main/docs/TROUBLESHOOTING.md#enabling-debug-logging):
 set the broker node's *kafkajs log level* (Advanced tab) to `debug`, **and** set `logging.console.level` to `'debug'`
 in Node-RED's `settings.js` (restart Node-RED), otherwise debug lines are not printed. Reproduce, and paste the
 relevant part of the Node-RED log, **with secrets removed**. For the producer, the output of

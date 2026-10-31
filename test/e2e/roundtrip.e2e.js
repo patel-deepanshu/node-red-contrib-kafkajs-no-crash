@@ -50,6 +50,22 @@ function javaConsume(topic, count) {
     return out.split('\n').filter((l) => l !== '');
 }
 
+/** Write lines to a topic with Kafka's Java console producer (an independent encoder). */
+function javaProduce(topic, lines, compression) {
+    const bin = path.join(E2E.kafkaHome, 'bin', 'kafka-console-producer.sh');
+    execFileSync(bin, [
+        '--bootstrap-server', E2E.brokers.join(','), '--topic', topic, '--compression-codec', compression,
+        // one batch for all lines, so the batch really is compressed as a whole
+        '--producer-property', 'linger.ms=1000', '--producer-property', 'batch.size=1048576'
+    ], {
+        input: `${lines.join('\n')}\n`,
+        encoding: 'utf8',
+        timeout: 90000,
+        env: { ...process.env, KAFKA_HEAP_OPTS: '-Xmx256m' },
+        stdio: ['pipe', 'pipe', 'pipe']
+    });
+}
+
 describe('e2e: producer node → Kafka → consumer node', function () {
     this.timeout(180000);
 
@@ -121,6 +137,26 @@ describe('e2e: producer node → Kafka → consumer node', function () {
                 assert.equal(lines[3], list[3].value);
                 assert.deepEqual(lines.slice(5), list.slice(5).map((x) => x.value));
             }
+        });
+    }
+
+    for (const compression of ['gzip', 'snappy', 'lz4']) {
+        it(`Kafka's Java producer (${compression}) → consumer node: decoded like the Java client wrote it`, async function () {
+            if (!E2E.kafkaHome) this.skip(); // needs Kafka's command line tools
+            const topic = uniqueName(`java-${compression}`);
+            await createTopic(topic, 1);
+            const lines = ['first', 'hello kafka '.repeat(300), ...Array.from({ length: 40 }, (_, i) => `line-${i}`), 'last'];
+            javaProduce(topic, lines, compression);
+            if (E2E.control) {
+                const codecs = storedCodecs(topic);
+                assert.ok(codecs.length > 0 && codecs.every((c) => c === compression), `stored codecs: ${codecs}`);
+            }
+            await helper.load([brokerNode, producerNode, consumerNode], roundTripFlow(topic, {}, { payloadFormat: 'string' }));
+            const out = collect('out');
+            const caught = collect('caught');
+            await waitFor(() => out.length === lines.length, { timeout: 60000, message: `consumed ${out.length}/${lines.length}` });
+            assert.deepEqual(out.map((m) => m.payload), lines);
+            assert.deepEqual(caught.map((m) => m.error.message), []);
         });
     }
 

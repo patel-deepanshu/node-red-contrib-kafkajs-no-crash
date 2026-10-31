@@ -13,7 +13,9 @@
         "test:e2e": "mocha --timeout 240000 \"test/e2e/**/*.e2e.js\"",
         "lint": "eslint .",
         "kafka:start": "bash scripts/kafka/kafka-start.sh",
-        "kafka:stop": "bash scripts/kafka/kafka-stop.sh"
+        "kafka:stop": "bash scripts/kafka/kafka-stop.sh",
+        "prepublishOnly": "npm run lint && npm test",
+        "audit:runtime": "npm audit --omit=dev --audit-level=low"
     },
     "keywords": [
         "node-red",
@@ -54,27 +56,30 @@
         "CHANGELOG.md",
         "LICENSE"
     ],
+    "publishConfig": {
+        "access": "public"
+    },
     "dependencies": {
         "kafkajs": "2.2.4",
-        "kafkajs-snappy": "^1.1.0",
-        "lz4js": "^0.2.0"
+        "lz4js": "^0.2.0",
+        "snappyjs": "^0.7.0"
     },
     "devDependencies": {
         "@eslint/js": "^9.39.0",
-        "eslint": "^9.39.0",
-        "globals": "^16.5.0",
+        "eslint": "^10.13.0",
+        "globals": "^17.13.0",
         "mocha": "^11.7.0",
         "node-red": "^4.1.17",
         "node-red-node-test-helper": "^0.3.6"
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/patel-deepanshu/node-red-kafkajs-no-crash.git"
+        "url": "git+https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash.git"
     },
     "bugs": {
-        "url": "https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/issues"
+        "url": "https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/issues"
     },
-    "homepage": "https://github.com/patel-deepanshu/node-red-kafkajs-no-crash#readme",
+    "homepage": "https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash#readme",
     "author": "Deepanshu Patel",
     "license": "MIT"
 }

@@ -32,7 +32,7 @@ So everything here follows from a few rules:
 3. **Never lose a message silently.** A message is either delivered, stored in the offline queue, or failed with
    `done(err)` so that a *catch* node sees it. The only exceptions are the limits the user configures.
 4. **Say what is wrong.** One clear status text and one log line per problem, not hundreds.
-5. **Install anywhere.** Only pure JavaScript dependencies (kafkajs 2.2.4 pinned exactly, kafkajs-snappy, lz4js),
+5. **Install anywhere.** Only pure JavaScript dependencies (kafkajs 2.2.4 pinned exactly, snappyjs, lz4js),
    Node.js 18.5 or newer, Node-RED 3.1 or newer (3.0 gives nodes inside subflows a new id on every start, and the
    default queue directory and consumer group are derived from the id).
 
@@ -52,7 +52,7 @@ otherwise. They are used inside timers, event handlers and close handlers, where
 | [`status.js`](../lib/status.js) | Crash-proof `node.status()` with throttling and a `dispose()` for close | `StatusReporter`, `MAX_TEXT` (48) |
 | [`logger.js`](../lib/logger.js) | kafkajs `logCreator` that writes into the Node-RED log, never throws and suppresses repeated lines | `createLogCreator`, `toKafkaLogLevel` |
 | [`kafka-factory.js`](../lib/kafka-factory.js) | The only place that `require`s kafkajs. Tests inject a fake here. Registers the compression codecs once. | `getKafkajs`, `setKafkajs`, `getCodecSupport` |
-| [`codecs.js`](../lib/codecs.js) | Snappy (kafkajs-snappy) and LZ4: its own frame writer on top of lz4js (so that Java consumers can read it) and its own bounded frame and block decoder (block checksums verified; a batch that could decompress to more than 256 MiB is rejected before anything is allocated) | `register`, `lz4CompressFrame`, `lz4DecompressFrame`, `LZ4_MAX_OUTPUT` |
+| [`codecs.js`](../lib/codecs.js) | Snappy: snappyjs, with the xerial framing read here and every block's declared size checked before snappyjs allocates (at most 64/3 times its compressed size, at most 256 MiB per batch). LZ4: its own frame writer on top of lz4js (so that Java consumers can read it) and its own bounded frame and block decoder (block checksums verified; a batch that could decompress to more than 256 MiB is rejected before anything is allocated). Both replace any other Snappy/LZ4 codec in the (often shared) kafkajs module | `register`, `snappyDecompress`, `lz4CompressFrame`, `lz4DecompressFrame`, `SNAPPY_MAX_OUTPUT`, `LZ4_MAX_OUTPUT` |
 | [`socket-factory.js`](../lib/socket-factory.js) | kafkajs' default socket factory plus a fix for leaked sockets | `createSocketFactory` |
 | [`serialize.js`](../lib/serialize.js) | `msg` values ↔ kafkajs messages (strings, Buffers, JSON, tombstones, headers, partitions, timestamps), and the JSON-safe encoding used by the queue | `toKafkaValue`, `toKafkaKey`, `toKafkaHeaders`, `toKafkaPartition`, `toKafkaTimestamp`, `decodeValue`, `fromKafkaHeaders`, `encodeMessage`, `decodeMessage` |
 | [`disk-queue.js`](../lib/disk-queue.js) | The durable store-and-forward queue (segments, cursor, group commit, crash recovery, dead letters) | `DiskQueue` |
