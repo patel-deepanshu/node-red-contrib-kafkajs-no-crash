@@ -72,8 +72,11 @@ subflows a new id on every start, which would change their default queue directo
 - Reconnects forever with exponential backoff and jitter; clear status texts (`ECONNREFUSED broker:9092 · retry 8s`,
   `auth failed`, `TLS: self-signed cert`, `offline · 57 queued`); one log line per outage instead of hundreds;
   kafkajs log lines in the Node-RED log, labelled with their node and de-duplicated.
-- Snappy (kafkajs-snappy) and LZ4 compression, pure JavaScript. LZ4 is compressed with lz4js in a Kafka-compatible
-  frame format and decompressed by a bounded decoder of this palette that verifies block checksums.
+- Snappy (snappyjs) and LZ4 compression, pure JavaScript. LZ4 is compressed with lz4js in a Kafka-compatible
+  frame format and decompressed by a bounded decoder of this palette that verifies block checksums. Snappy and LZ4
+  batches that claim more than their compressed size can hold, or more than 256 MiB, are refused before anything is
+  allocated (kafkajs-snappy, used during development, let a 49-byte Snappy batch allocate gigabytes; the same class
+  of problem as snappy-java's CVE-2023-43642). Interoperability with Kafka's Java client is tested both ways.
 - Nine example flows (*Import → Examples*), detailed help for every node, and the guides
   [ARCHITECTURE](docs/ARCHITECTURE.md), [OFFLINE-QUEUE](docs/OFFLINE-QUEUE.md), [MIGRATION](docs/MIGRATION.md) and
   [TROUBLESHOOTING](docs/TROUBLESHOOTING.md).
@@ -129,5 +132,5 @@ version that do not exist in this palette:
 - The crash safety net only swallows rejections of kafkajs and of this palette, so bugs of other nodes are not
   hidden; a Node-RED installed under a folder named `kafkajs` does not change that.
 
-[Unreleased]: https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/patel-deepanshu/node-red-kafkajs-no-crash/releases/tag/v1.0.0
+[Unreleased]: https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/patel-deepanshu/node-red-contrib-kafkajs-no-crash/releases/tag/v1.0.0
