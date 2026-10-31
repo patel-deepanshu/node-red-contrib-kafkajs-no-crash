@@ -249,8 +249,8 @@ describe('lib/util', function () {
 
     describe('resolveDir', function () {
         it('normalises absolute paths', function () {
-            const abs = path.resolve('/tmp/a/../b');
-            assert.equal(util.resolveDir(path.join(path.sep, 'tmp', 'a', '..', 'b'), '/base'), abs);
+            const abs = path.join(path.sep, 'tmp', 'a', '..', 'b');
+            assert.equal(util.resolveDir(abs, '/base'), path.normalize(abs));
         });
         it('resolves relative paths against baseDir', function () {
             assert.equal(util.resolveDir('queue', '/data/nr'), path.resolve('/data/nr', 'queue'));

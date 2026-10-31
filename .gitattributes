@@ -1,0 +1,3 @@
+# Check every text file out with LF, whatever the contributor's core.autocrlf is:
+# tests match file contents against \n (help markdown, doc snippets, the bin shebang).
+* text=auto eol=lf

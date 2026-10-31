@@ -2591,9 +2591,9 @@ describe('kafka producer internals', function () {
     it('queueDirFor resolves against the user directory', function () {
         const cfg = parseConfig({});
         const RED = { settings: { userDir: '/data/nr' } };
-        assert.equal(queueDirFor(cfg, RED, 'abc.123').dir, path.join('/data/nr', 'kafkajs-nc-queue', 'abc.123'));
+        assert.equal(queueDirFor(cfg, RED, 'abc.123').dir, path.join(path.resolve('/data/nr', 'kafkajs-nc-queue'), 'abc.123'));
         assert.equal(queueDirFor(parseConfig({ queueDir: '/var/q', queueName: 'line 1' }), RED, 'x').dir, path.join('/var/q', 'line_1'));
-        assert.equal(queueDirFor(parseConfig({ queueDir: 'rel' }), RED, 'x').dir, path.join('/data/nr', 'rel', 'x'));
+        assert.equal(queueDirFor(parseConfig({ queueDir: 'rel' }), RED, 'x').dir, path.join(path.resolve('/data/nr', 'rel'), 'x'));
         assert.equal(queueDirFor(cfg, { settings: { userDir: '/u', kafkajsNcProducerQueueDir: '/srv/q' } }, 'n').dir, path.join('/srv/q', 'n'));
         assert.match(queueDirFor(parseConfig({ queueName: '${N}' }), RED, 'x').error, /environment variable N is not set/);
         const hostile = { get settings() { throw new Error('boom'); } };
